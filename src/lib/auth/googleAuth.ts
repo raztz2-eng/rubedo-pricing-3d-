@@ -16,6 +16,7 @@ export class AuthError extends Error {
 }
 
 type Listener = (signedIn: boolean) => void
+type GoogleOAuth2 = NonNullable<NonNullable<Window['google']>['accounts']>['oauth2']
 
 const EXPIRY_MARGIN_MS = 60_000
 
@@ -23,6 +24,7 @@ export const POPUP_BLOCKED_MESSAGE = "החלון הקופץ נחסם — לחצ�
 export const POPUP_CLOSED_MESSAGE = "חלון ההתחברות נסגר לפני שהסתיים — לחצו שוב על 'התחברות עם Google'."
 export const AUTH_FAILED_MESSAGE = 'ההתחברות ל-Google נכשלה. נסו שוב.'
 export const RECONNECT_MESSAGE = "החיבור ל-Google פג — לחצו 'התחבר מחדש' כדי להמשיך."
+export const SIGNED_OUT_MESSAGE = 'התנתקת.'
 export const TIMEOUT_MESSAGE = 'Google לא הגיב לבקשת ההתחברות. לחצו שוב על כפתור ההתחברות.'
 
 /** A token request that never calls back is rejected after this long. */
@@ -43,8 +45,13 @@ export function gisErrorMessage(type: string): string {
  */
 export class GoogleAuth {
   private readonly clientId: string
-  private client: GoogleTokenClient | null = null
-  private clientLoading: Promise<GoogleTokenClient> | null = null
+  /** GIS oauth2 namespace once the script is loaded (a token client is created per popup attempt). */
+  private oauth2: GoogleOAuth2 | null = null
+  private loading: Promise<GoogleOAuth2> | null = null
+  /** Bumped on sign-out: callbacks from requests of an older generation are ignored. */
+  private generation = 0
+  /** Id of the latest popup attempt of the pending request; errors from replaced attempts are ignored. */
+  private attempt = 0
   private token: string | null = null
   private expiresAt = 0
   private hadToken = false
@@ -78,13 +85,17 @@ export class GoogleAuth {
    * Preloads the GIS script and creates the token client. Call at app start so that a later
    * sign-in click can open the popup synchronously (mobile Safari blocks popups opened after an await).
    */
-  init(): Promise<GoogleTokenClient> {
-    if (this.client) return Promise.resolve(this.client)
-    this.clientLoading ??= this.loadClient().catch((e: unknown) => {
-      this.clientLoading = null
+  init(): Promise<void> {
+    return this.loadGis().then(() => undefined)
+  }
+
+  private loadGis(): Promise<GoogleOAuth2> {
+    if (this.oauth2) return Promise.resolve(this.oauth2)
+    this.loading ??= this.loadOAuth2().catch((e: unknown) => {
+      this.loading = null
       throw e
     })
-    return this.clientLoading
+    return this.loading
   }
 
   /**
@@ -93,8 +104,8 @@ export class GoogleAuth {
    * the popup is opened again; everyone waiting on the old request gets the new token.
    */
   signIn(): Promise<void> {
-    if (this.inflight && this.client && Date.now() - this.inflightStartedAt > STALE_REQUEST_MS) {
-      this.fire(this.client)
+    if (this.inflight && this.oauth2 && Date.now() - this.inflightStartedAt > STALE_REQUEST_MS) {
+      this.fire(this.oauth2)
       return this.inflight.then(() => undefined)
     }
     return this.request().then(() => undefined)
@@ -113,6 +124,9 @@ export class GoogleAuth {
   }
 
   signOut(): void {
+    // Invalidate any pending request: late callbacks are ignored and waiting callers are rejected.
+    this.generation += 1
+    this.finish(new AuthError('signed out', SIGNED_OUT_MESSAGE))
     const t = this.token
     this.token = null
     this.expiresAt = 0
@@ -137,7 +151,7 @@ export class GoogleAuth {
     })
   }
 
-  private async loadClient(): Promise<GoogleTokenClient> {
+  private async loadOAuth2(): Promise<GoogleOAuth2> {
     try {
       await loadScript(GIS_SRC)
     } catch {
@@ -145,17 +159,12 @@ export class GoogleAuth {
     }
     const oauth2 = window.google?.accounts?.oauth2
     if (!oauth2) throw new AuthError('gis missing', 'שירות ההתחברות של Google לא זמין.')
-    this.client = oauth2.initTokenClient({
-      client_id: this.clientId,
-      scope: DRIVE_SCOPE,
-      callback: (resp) => this.onToken(resp),
-      error_callback: (err) => this.finish(new AuthError(`gis error: ${err.type}`, gisErrorMessage(err.type))),
-    })
-    return this.client
+    this.oauth2 = oauth2
+    return oauth2
   }
 
   /**
-   * Starts (or joins) the single token request. If the client is ready, requestAccessToken is called
+   * Starts (or joins) the single token request. If GIS is loaded, requestAccessToken is called
    * synchronously — inside the caller's click handler.
    */
   private request(): Promise<string> {
@@ -164,21 +173,45 @@ export class GoogleAuth {
       this.settle = { resolve, reject }
     })
     this.inflight = p
-    if (this.client) this.fire(this.client)
-    else
-      this.init().then(
-        (c) => this.fire(c),
-        (e: unknown) => this.finish(e instanceof Error ? e : new AuthError(String(e), AUTH_FAILED_MESSAGE)),
+    if (this.oauth2) this.fire(this.oauth2)
+    else {
+      const gen = this.generation
+      this.loadGis().then(
+        (o) => {
+          if (gen === this.generation && this.inflight === p) this.fire(o)
+        },
+        (e: unknown) => {
+          if (gen === this.generation) this.finish(e instanceof Error ? e : new AuthError(String(e), AUTH_FAILED_MESSAGE))
+        },
       )
+    }
     return p
   }
 
-  /** Opens the GIS request for the pending promise and (re)starts its timeout. */
-  private fire(client: GoogleTokenClient): void {
+  /**
+   * One popup attempt for the pending request, with its own token client so its callbacks are tagged.
+   * A token from any attempt of the current generation is accepted (it is valid); an ERROR from an attempt
+   * that was replaced by a newer one (e.g. the lost first popup reporting popup_closed) is ignored.
+   */
+  private fire(oauth2: GoogleOAuth2): void {
+    const id = ++this.attempt
+    const gen = this.generation
     this.inflightStartedAt = Date.now()
     if (this.timeoutId !== null) clearTimeout(this.timeoutId)
     this.timeoutId = setTimeout(() => this.finish(new AuthError('token request timed out', TIMEOUT_MESSAGE)), REQUEST_TIMEOUT_MS)
     try {
+      const client = oauth2.initTokenClient({
+        client_id: this.clientId,
+        scope: DRIVE_SCOPE,
+        callback: (resp) => {
+          if (gen === this.generation) this.onToken(resp)
+        },
+        error_callback: (err) => {
+          if (gen === this.generation && id === this.attempt) {
+            this.finish(new AuthError(`gis error: ${err.type}`, gisErrorMessage(err.type)))
+          }
+        },
+      })
       client.requestAccessToken({ prompt: '' })
     } catch (e) {
       this.finish(new AuthError(`requestAccessToken threw: ${String(e)}`, AUTH_FAILED_MESSAGE))

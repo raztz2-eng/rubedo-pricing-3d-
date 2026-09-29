@@ -6,6 +6,7 @@ import {
   POPUP_CLOSED_MESSAGE,
   RECONNECT_MESSAGE,
   REQUEST_TIMEOUT_MS,
+  SIGNED_OUT_MESSAGE,
   STALE_REQUEST_MS,
   TIMEOUT_MESSAGE,
 } from '../../src/lib/auth/googleAuth'
@@ -257,5 +258,84 @@ describe('GoogleAuth — hung requests', () => {
     // The timeout was restarted by the second popup and cleared on success: nothing fires later.
     await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS * 2)
     expect(auth.signedIn).toBe(true)
+  })
+})
+
+describe('GoogleAuth — stale callbacks (fix round 3)', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function installRecordingGis() {
+    const configs: GoogleTokenClientConfig[] = []
+    const requestAccessToken = vi.fn()
+    window.google = {
+      accounts: {
+        oauth2: {
+          initTokenClient: (c) => {
+            configs.push(c)
+            return { requestAccessToken }
+          },
+          revoke: vi.fn(),
+        },
+      },
+    }
+    return { configs, requestAccessToken }
+  }
+
+  it('after a stale re-open, a late popup_closed from the FIRST popup does not reject the shared request', async () => {
+    const gis = installRecordingGis()
+    const auth = new GoogleAuth('client-id')
+    await auth.init()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const first = auth.signIn()
+    await vi.advanceTimersByTimeAsync(STALE_REQUEST_MS + 1)
+    const second = auth.signIn()
+    expect(gis.configs).toHaveLength(2)
+
+    let rejected = false
+    void Promise.all([first, second]).catch(() => (rejected = true))
+    gis.configs[0].error_callback?.({ type: 'popup_closed' }) // replaced attempt → ignored
+    await vi.advanceTimersByTimeAsync(0)
+    expect(rejected).toBe(false)
+
+    gis.configs[1].callback({ access_token: 'OK', expires_in: 3600, scope: DRIVE_SCOPE })
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined])
+    expect(auth.signedIn).toBe(true)
+  })
+
+  it('an error from the CURRENT attempt still rejects', async () => {
+    const gis = installRecordingGis()
+    const auth = new GoogleAuth('client-id')
+    await auth.init()
+    const p = auth.signIn().catch((e: unknown) => e)
+    gis.configs[0].error_callback?.({ type: 'popup_closed' })
+    expect(((await p) as AuthError).userMessage).toBe(POPUP_CLOSED_MESSAGE)
+  })
+
+  it('sign-out while a request is pending rejects waiting callers ("התנתקת") and ignores the late token', async () => {
+    const gis = installRecordingGis()
+    const auth = new GoogleAuth('client-id')
+    await auth.init()
+    const states: boolean[] = []
+    auth.subscribe((s) => states.push(s))
+    const pending = auth.signIn().catch((e: unknown) => e)
+    auth.signOut()
+    const err = (await pending) as AuthError
+    expect(err).toBeInstanceOf(AuthError)
+    expect(err.userMessage).toBe(SIGNED_OUT_MESSAGE)
+    expect(SIGNED_OUT_MESSAGE).toContain('התנתקת')
+
+    gis.configs[0].callback({ access_token: 'LATE', expires_in: 3600, scope: DRIVE_SCOPE })
+    await Promise.resolve()
+    expect(auth.signedIn).toBe(false)
+    expect(states).not.toContain(true)
+    await expect(auth.getToken()).rejects.toThrow(/not signed in/)
+
+    // A new sign-in afterwards works normally.
+    const again = auth.signIn()
+    gis.configs[1].callback({ access_token: 'NEW', expires_in: 3600, scope: DRIVE_SCOPE })
+    await again
+    expect(await auth.getToken()).toBe('NEW')
   })
 })

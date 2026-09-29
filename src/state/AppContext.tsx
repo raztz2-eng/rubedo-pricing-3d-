@@ -12,7 +12,10 @@ export interface AppState {
   /** Signed in, or temporarily disconnected (needs reconnect). Pages are gated on this, not on signedIn. */
   sessionActive: boolean
   folderId: string | null
+  /** Settings of the CURRENT models folder only (null while another folder's settings are all we have). */
   settings: AppSettings | null
+  /** Folder the settings above were loaded from (always === folderId when settings is non-null). */
+  settingsFolderId: string | null
   settingsLoading: boolean
   settingsError: string | null
   signIn: () => Promise<void>
@@ -27,9 +30,11 @@ const Ctx = createContext<AppState | null>(null)
 export function AppProvider({ services, children }: { services: AppServices; children: ReactNode }) {
   const [signedIn, setSignedIn] = useState(services.auth?.signedIn ?? false)
   const [folderId, setFolderId] = useState<string | null>(() => services.folderPointer.get())
-  const [settings, setSettings] = useState<AppSettings | null>(null)
-  const [settingsLoading, setSettingsLoading] = useState(false)
-  const [settingsError, setSettingsError] = useState<string | null>(null)
+  // Loaded settings / load errors are tagged with the folder they belong to, so a folder switch can never
+  // show (or save) the previous folder's values.
+  const [loaded, setLoaded] = useState<{ folderId: string; settings: AppSettings } | null>(null)
+  const [loadError, setLoadError] = useState<{ folderId: string; message: string } | null>(null)
+  const [loadingFor, setLoadingFor] = useState<string | null>(null)
   const [reloadTick, setReloadTick] = useState(0)
 
   const [needsReconnect, setNeedsReconnect] = useState(services.auth?.needsReconnect ?? false)
@@ -47,29 +52,36 @@ export function AppProvider({ services, children }: { services: AppServices; chi
   const drive = services.drive
   useEffect(() => {
     if (!drive || !sessionActive || !folderId) {
-      setSettings(null)
+      setLoaded(null)
+      setLoadError(null)
+      setLoadingFor(null)
       return
     }
     let cancelled = false
-    setSettingsLoading(true)
-    setSettingsError(null)
+    setLoadingFor(folderId)
+    setLoadError(null)
     loadSettings(drive, folderId)
       .then((s) => {
-        if (!cancelled) setSettings(s)
+        if (!cancelled) setLoaded({ folderId, settings: s })
       })
       .catch((e: unknown) => {
-        if (!cancelled) {
-          setSettings(null)
-          setSettingsError(errorMessage(e, 'טעינת ההגדרות מ-Drive נכשלה.'))
-        }
+        if (!cancelled) setLoadError({ folderId, message: errorMessage(e, 'טעינת ההגדרות מ-Drive נכשלה.') })
       })
       .finally(() => {
-        if (!cancelled) setSettingsLoading(false)
+        if (!cancelled) setLoadingFor(null)
       })
     return () => {
       cancelled = true
     }
   }, [drive, sessionActive, folderId, reloadTick])
+
+  const current = loaded && loaded.folderId === folderId ? loaded : null
+  const settings = current?.settings ?? null
+  const settingsFolderId = current?.folderId ?? null
+  const settingsError = loadError && loadError.folderId === folderId ? loadError.message : null
+  // Loading whenever the current folder's settings are not in yet (covers the render right after a switch).
+  const settingsLoading =
+    loadingFor !== null || (!!drive && sessionActive && !!folderId && !current && settingsError === null)
 
   const signIn = useCallback(async () => {
     if (!services.auth) return
@@ -91,7 +103,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
     async (s: AppSettings) => {
       if (!drive || !folderId) throw new Error('no folder')
       await saveSettingsFile(drive, folderId, s)
-      setSettings(s)
+      setLoaded({ folderId, settings: s })
     },
     [drive, folderId],
   )
@@ -106,6 +118,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       sessionActive,
       folderId,
       settings,
+      settingsFolderId,
       settingsLoading,
       settingsError,
       signIn,
@@ -114,7 +127,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       reloadSettings,
       saveSettings,
     }),
-    [services, signedIn, needsReconnect, sessionActive, folderId, settings, settingsLoading, settingsError, signIn, signOut, pickFolder, reloadSettings, saveSettings],
+    [services, signedIn, needsReconnect, sessionActive, folderId, settings, settingsFolderId, settingsLoading, settingsError, signIn, signOut, pickFolder, reloadSettings, saveSettings],
   )
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>

@@ -35,13 +35,15 @@ export interface DriveContext {
  * Only an explicit sign-out or a different models folder unmounts them.
  */
 export function RequireDrive({ children }: { children: (ctx: DriveContext) => ReactNode }) {
-  const { services, sessionActive, signIn, folderId, settings, settingsLoading, settingsError, reloadSettings } = useApp()
+  const { services, sessionActive, signIn, folderId, settings, settingsFolderId, settingsLoading, settingsError, reloadSettings } =
+    useApp()
   const [error, setError] = useState<string | null>(null)
   const lastCtx = useRef<DriveContext | null>(null)
 
   if (services.mode === 'unconfigured' || !services.drive) return <NotConfiguredNotice />
 
-  if (sessionActive && folderId && settings && !settingsError) {
+  // Fresh render only with the CURRENT folder's settings, fully loaded.
+  if (sessionActive && folderId && settings && settingsFolderId === folderId && !settingsLoading && !settingsError) {
     const ctx = lastCtx.current
     if (!ctx || ctx.drive !== services.drive || ctx.folderId !== folderId || ctx.settings !== settings) {
       lastCtx.current = { drive: services.drive, folderId, settings }

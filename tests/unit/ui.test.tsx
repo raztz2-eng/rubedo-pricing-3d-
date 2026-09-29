@@ -382,3 +382,84 @@ describe('Fix round 2 — Settings validation', () => {
     expect(save.disabled).toBe(false)
   })
 })
+
+describe('Fix round 3 — switching the models folder', () => {
+  /** MemoryDrive whose reads of chosen files wait until released (to observe the in-between render). */
+  class GatedDrive extends MemoryDrive {
+    gated = new Set<string>()
+    private waiters: (() => void)[] = []
+    release() {
+      this.gated.clear()
+      for (const w of this.waiters.splice(0)) w()
+    }
+    async readText(fileId: string): Promise<string> {
+      if (this.gated.has(fileId)) await new Promise<void>((r) => this.waiters.push(r))
+      return super.readText(fileId)
+    }
+  }
+
+  async function settingsFile(drive: MemoryDrive, folderId: string) {
+    const { SETTINGS_FILE_NAME } = await import('../../src/lib/bid')
+    const f = (await drive.listChildren(folderId, { name: SETTINGS_FILE_NAME }))[0]
+    return f ? (JSON.parse(await drive.readText(f.id)) as { pricing: { laborRate: number } }) : null
+  }
+
+  it("the form shows the NEW folder's values (never the old ones) and nothing is written until Save", async () => {
+    const { saveSettings } = await import('../../src/lib/drive/bidRepository')
+    const { defaultAppSettings } = await import('../../src/lib/bid')
+    const drive = new GatedDrive()
+    const services = createMemoryServices(drive)
+    const folderA = services.folderPointer.get() as string
+    const folderB = drive.createRootFolder('models-B')
+    const custom = (laborRate: number) => ({ ...defaultAppSettings(), pricing: { ...defaultAppSettings().pricing, laborRate } })
+    await saveSettings(drive, folderA, custom(100))
+    await saveSettings(drive, folderB, custom(120))
+    const bSettingsId = (await drive.listChildren(folderB)).find((f) => f.name.startsWith('_rubedo-settings'))!.id
+    services.pickFolder = async () => ({ id: folderB, name: 'models-B' })
+
+    const user = userEvent.setup()
+    renderApp(services, '/settings')
+    expect(((await screen.findByLabelText('תעריף עבודה')) as HTMLInputElement).value).toBe('100')
+
+    const writesBefore = drive.writeLog.length
+    drive.gated.add(bSettingsId)
+    await user.click(screen.getByRole('button', { name: 'החלפת תיקייה' }))
+    // While B's settings are loading, the old folder's form must be gone (no stale values, no Save button).
+    await waitFor(() => expect(screen.queryByLabelText('תעריף עבודה')).toBeNull())
+    expect(screen.queryByRole('button', { name: 'שמירת הגדרות' })).toBeNull()
+    expect(screen.getByRole('status').textContent).toMatch(/טוען/)
+
+    drive.release()
+    await waitFor(() => expect((screen.getByLabelText('תעריף עבודה') as HTMLInputElement).value).toBe('120'))
+    expect(drive.writeLog.length).toBe(writesBefore) // nothing written by switching
+    expect((await settingsFile(drive, folderB))?.pricing.laborRate).toBe(120)
+    expect((await settingsFile(drive, folderA))?.pricing.laborRate).toBe(100)
+
+    const labor = screen.getByLabelText('תעריף עבודה')
+    await user.clear(labor)
+    await user.type(labor, '130')
+    await user.click(screen.getByRole('button', { name: 'שמירת הגדרות' }))
+    await screen.findByText(/^נשמר\. ההגדרות/)
+    expect((await settingsFile(drive, folderB))?.pricing.laborRate).toBe(130)
+    expect((await settingsFile(drive, folderA))?.pricing.laborRate).toBe(100)
+  })
+
+  it("switching to an empty folder shows defaults there; the old folder's custom values are not copied", async () => {
+    const { saveSettings } = await import('../../src/lib/drive/bidRepository')
+    const { defaultAppSettings } = await import('../../src/lib/bid')
+    const drive = new MemoryDrive()
+    const services = createMemoryServices(drive)
+    const folderA = services.folderPointer.get() as string
+    const folderB = drive.createRootFolder('empty')
+    await saveSettings(drive, folderA, { ...defaultAppSettings(), pricing: { ...defaultAppSettings().pricing, laborRate: 100 } })
+    services.pickFolder = async () => ({ id: folderB, name: 'empty' })
+
+    const user = userEvent.setup()
+    renderApp(services, '/settings')
+    expect(((await screen.findByLabelText('תעריף עבודה')) as HTMLInputElement).value).toBe('100')
+    await user.click(screen.getByRole('button', { name: 'החלפת תיקייה' }))
+    await waitFor(() => expect((screen.getByLabelText('תעריף עבודה') as HTMLInputElement).value).toBe('80'))
+    // First run in B creates the defaults file (brief §4) — never folder A's values.
+    expect((await settingsFile(drive, folderB))?.pricing.laborRate).toBe(80)
+  })
+})

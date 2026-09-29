@@ -21,11 +21,11 @@ const PRICING_FIELDS: { key: keyof PricingSettings; label: string; suffix?: stri
 ]
 
 export function SettingsPage() {
-  const { services, signedIn, folderId, pickFolder } = useApp()
+  const { services, sessionActive, folderId, pickFolder } = useApp()
   const [pickError, setPickError] = useState<string | null>(null)
 
   if (services.mode === 'unconfigured') return <NotConfiguredNotice />
-  if (!signedIn) return <RequireDrive>{() => null}</RequireDrive>
+  if (!sessionActive) return <RequireDrive>{() => null}</RequireDrive>
 
   const onPick = async () => {
     setPickError(null)
