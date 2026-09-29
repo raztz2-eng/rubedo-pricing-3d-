@@ -4,13 +4,15 @@ import { errorMessage } from '../lib/errors'
 import { useApp } from '../state/AppContext'
 
 export function Layout() {
-  const { services, signedIn, signIn, signOut } = useApp()
+  const { services, signedIn, needsReconnect, signIn, signOut } = useApp()
   const [authError, setAuthError] = useState<string | null>(null)
 
+  // signIn() is called first thing in the click (no await before it) so the popup is not blocked.
   const onSignIn = async () => {
+    const pending = signIn()
     setAuthError(null)
     try {
-      await signIn()
+      await pending
     } catch (e) {
       setAuthError(errorMessage(e, 'ההתחברות ל-Google נכשלה.'))
     }
@@ -44,7 +46,12 @@ export function Layout() {
           </nav>
           <div className="ms-auto flex items-center gap-2 text-sm">
             {services.mode === 'google' &&
-              (signedIn ? (
+              (needsReconnect ? (
+                <span className="flex items-center gap-1 text-amber-800">
+                  <span className="h-2 w-2 rounded-full bg-amber-500" aria-hidden="true" />
+                  נדרש חיבור מחדש
+                </span>
+              ) : signedIn ? (
                 <>
                   <span className="flex items-center gap-1 text-stone-600">
                     <span className="h-2 w-2 rounded-full bg-emerald-500" aria-hidden="true" />
@@ -62,6 +69,14 @@ export function Layout() {
             {services.mode === 'demo' && <span className="text-stone-500">הדגמה</span>}
           </div>
         </div>
+        {needsReconnect && (
+          <div role="alert" className="flex flex-wrap items-center justify-center gap-3 bg-amber-50 px-4 py-2 text-sm text-amber-900">
+            <span>החיבור ל-Google פג — לחצו „התחבר מחדש” כדי להמשיך. הנתונים שבטופס נשמרים.</span>
+            <button type="button" className="btn btn-primary px-3 py-1" onClick={onSignIn}>
+              התחבר מחדש
+            </button>
+          </div>
+        )}
         {authError && (
           <div role="alert" className="bg-red-50 px-4 py-2 text-center text-sm text-red-800">
             {authError}

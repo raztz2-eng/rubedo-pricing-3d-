@@ -27,14 +27,24 @@ export function formatDate(iso: string): string {
 }
 
 /**
- * Parses a user-entered number. Empty → 0; anything non-numeric → NaN (never silently 0).
- * A single comma is accepted as the decimal separator ("1,5" → 1.5).
+ * Parses a user-entered number. Empty → 0; anything malformed → NaN (never silently 0).
+ * Dot is the decimal point. A comma is accepted ONLY as a thousands separator in the exact pattern
+ * 1–3 digits then groups of ",ddd" ("4,200" → 4200, "1,250.5" → 1250.5). Any other comma ("1,5") → NaN.
  */
 export function parseNumber(text: string): number {
   let t = text.trim()
   if (t === '') return 0
-  if (/^[+-]?\d*,\d+$/.test(t)) t = t.replace(',', '.')
+  if (t.includes(',')) {
+    if (!/^[+-]?\d{1,3}(,\d{3})+(\.\d+)?$/.test(t)) return NaN
+    t = t.replace(/,/g, '')
+  }
   if (!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(t)) return NaN
   const n = Number(t)
   return Number.isFinite(n) ? n : NaN
+}
+
+/** Shared field rule (bid form + settings): a parseable number that is not negative. */
+export function isValidAmount(text: string): boolean {
+  const n = parseNumber(text)
+  return !Number.isNaN(n) && n >= 0
 }

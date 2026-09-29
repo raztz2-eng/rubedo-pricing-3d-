@@ -9,6 +9,8 @@ import type { DriveStore } from '../lib/drive/types'
 
 export interface AuthLike {
   readonly signedIn: boolean
+  /** A renewal failed while working: keep pages mounted and offer "reconnect". Optional (false if absent). */
+  readonly needsReconnect?: boolean
   signIn(): Promise<void>
   signOut(): void
   subscribe(listener: (signedIn: boolean) => void): () => void

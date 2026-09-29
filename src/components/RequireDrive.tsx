@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from 'react'
+import { useRef, useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import type { AppSettings } from '../lib/bid'
 import type { DriveStore } from '../lib/drive/types'
@@ -29,16 +29,32 @@ export interface DriveContext {
 }
 
 /**
- * Renders children only when: Google is configured, the user is signed in, the models folder is chosen,
- * and settings loaded. Otherwise shows what is missing, in Hebrew.
+ * Gates the FIRST render: children appear only when Google is configured, a session exists, the models folder
+ * is chosen and settings are loaded. Once rendered, children stay mounted through a lost connection
+ * ("needs reconnect") or a settings reload, so form data, attached files and save sessions are never lost.
+ * Only an explicit sign-out or a different models folder unmounts them.
  */
 export function RequireDrive({ children }: { children: (ctx: DriveContext) => ReactNode }) {
-  const { services, signedIn, signIn, folderId, settings, settingsLoading, settingsError, reloadSettings } = useApp()
+  const { services, sessionActive, signIn, folderId, settings, settingsLoading, settingsError, reloadSettings } = useApp()
   const [error, setError] = useState<string | null>(null)
+  const lastCtx = useRef<DriveContext | null>(null)
 
   if (services.mode === 'unconfigured' || !services.drive) return <NotConfiguredNotice />
 
-  if (!signedIn) {
+  if (sessionActive && folderId && settings && !settingsError) {
+    const ctx = lastCtx.current
+    if (!ctx || ctx.drive !== services.drive || ctx.folderId !== folderId || ctx.settings !== settings) {
+      lastCtx.current = { drive: services.drive, folderId, settings }
+    }
+    return <>{children(lastCtx.current as DriveContext)}</>
+  }
+  // Already rendered for this folder and the session is still alive → keep content mounted.
+  if (sessionActive && lastCtx.current && lastCtx.current.folderId === folderId) {
+    return <>{children(lastCtx.current)}</>
+  }
+  if (!sessionActive) lastCtx.current = null
+
+  if (!sessionActive) {
     return (
       <div className="card flex flex-col items-start gap-3">
         <p>כדי לעבוד עם הדגמים יש להתחבר לחשבון Google (גישה רק לקבצים שהאפליקציה יוצרת).</p>
@@ -46,9 +62,10 @@ export function RequireDrive({ children }: { children: (ctx: DriveContext) => Re
           type="button"
           className="btn btn-primary"
           onClick={async () => {
+            const pending = signIn()
             setError(null)
             try {
-              await signIn()
+              await pending
             } catch (e) {
               setError(errorMessage(e, 'ההתחברות ל-Google נכשלה.'))
             }
@@ -74,6 +91,5 @@ export function RequireDrive({ children }: { children: (ctx: DriveContext) => Re
 
   if (settingsError) return <ErrorBox onRetry={reloadSettings}>{settingsError}</ErrorBox>
   if (settingsLoading || !settings) return <Spinner label="טוען הגדרות…" />
-
-  return <>{children({ drive: services.drive, folderId, settings })}</>
+  return <Spinner label="טוען…" />
 }

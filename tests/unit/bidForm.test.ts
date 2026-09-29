@@ -111,20 +111,21 @@ describe('draftToContent / filesToUpload', () => {
 })
 
 describe('invalidFields — malformed and negative numbers', () => {
-  it('flags malformed text and negative values; comma decimals are valid', () => {
+  it('flags malformed text, "1,5" and negative values; "4,200" is a valid thousands value', () => {
     const base = { ...emptyDraft(DEFAULT_MATERIALS), name: 'x' }
     const d = {
       ...base,
       laborMinutes: '-5',
       parts: [{ ...emptyPart(), grams: '1,5,2', hours: '1,5' }],
+      pricePerKg: '4,200',
       hardware: [{ key: 'h', name: 'screw', qty: '2', unitCost: '-1' }],
     }
     const bad = invalidFields(d)
-    expect(bad).toEqual(expect.arrayContaining(['דקות עבודה', 'חלק 1 — גרמים', 'חומרה 1 — מחיר']))
-    expect(bad).not.toContain('חלק 1 — שעות')
+    expect(bad).toEqual(expect.arrayContaining(['דקות עבודה', 'חלק 1 — גרמים', 'חלק 1 — שעות', 'חומרה 1 — מחיר']))
+    expect(bad).not.toContain('מחיר חומר')
     expect(canSave(d)).toBe(false)
-    const ok = { ...base, parts: [{ ...emptyPart(), grams: '1,5' }] }
+    const ok = { ...base, parts: [{ ...emptyPart(), grams: '1,250.5' }] }
     expect(invalidFields(ok)).toEqual([])
-    expect(draftToPricingInput(ok).parts[0].grams).toBe(1.5)
+    expect(draftToPricingInput(ok).parts[0].grams).toBe(1250.5)
   })
 })

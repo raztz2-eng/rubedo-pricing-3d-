@@ -22,6 +22,13 @@ const EXPIRY_MARGIN_MS = 60_000
 export const POPUP_BLOCKED_MESSAGE = "החלון הקופץ נחסם — לחצו שוב על 'התחברות עם Google'."
 export const POPUP_CLOSED_MESSAGE = "חלון ההתחברות נסגר לפני שהסתיים — לחצו שוב על 'התחברות עם Google'."
 export const AUTH_FAILED_MESSAGE = 'ההתחברות ל-Google נכשלה. נסו שוב.'
+export const RECONNECT_MESSAGE = "החיבור ל-Google פג — לחצו 'התחבר מחדש' כדי להמשיך."
+export const TIMEOUT_MESSAGE = 'Google לא הגיב לבקשת ההתחברות. לחצו שוב על כפתור ההתחברות.'
+
+/** A token request that never calls back is rejected after this long. */
+export const REQUEST_TIMEOUT_MS = 120_000
+/** An explicit sign-in click may re-open the popup if the pending request is older than this. */
+export const STALE_REQUEST_MS = 10_000
 
 export function gisErrorMessage(type: string): string {
   if (type === 'popup_failed_to_open') return POPUP_BLOCKED_MESSAGE
@@ -29,6 +36,11 @@ export function gisErrorMessage(type: string): string {
   return AUTH_FAILED_MESSAGE
 }
 
+/**
+ * States: signed out · signed in (valid token) · needs reconnect (a renewal failed while working).
+ * "Needs reconnect" keeps the session alive for the UI (pages stay mounted, form data kept) but no token
+ * is handed out until the user clicks "reconnect" (an interactive signIn()).
+ */
 export class GoogleAuth {
   private readonly clientId: string
   private client: GoogleTokenClient | null = null
@@ -36,8 +48,11 @@ export class GoogleAuth {
   private token: string | null = null
   private expiresAt = 0
   private hadToken = false
-  /** One shared in-flight token request: parallel callers all wait on it (never cancelled). */
+  private reconnect = false
+  /** One shared in-flight token request: parallel callers all wait on it. */
   private inflight: Promise<string> | null = null
+  private inflightStartedAt = 0
+  private timeoutId: ReturnType<typeof setTimeout> | null = null
   private settle: { resolve: (t: string) => void; reject: (e: Error) => void } | null = null
   private listeners = new Set<Listener>()
 
@@ -47,6 +62,11 @@ export class GoogleAuth {
 
   get signedIn(): boolean {
     return this.token !== null
+  }
+
+  /** True after a failed renewal: the user must click "reconnect"; the app keeps its pages and data. */
+  get needsReconnect(): boolean {
+    return this.reconnect
   }
 
   subscribe(listener: Listener): () => void {
@@ -67,46 +87,54 @@ export class GoogleAuth {
     return this.clientLoading
   }
 
-  /** Interactive sign-in. Call directly from a click handler (no await before it). */
+  /**
+   * Interactive sign-in / reconnect. Call directly from a click handler (no await before it).
+   * If a request is already pending for more than STALE_REQUEST_MS (e.g. its popup was lost),
+   * the popup is opened again; everyone waiting on the old request gets the new token.
+   */
   signIn(): Promise<void> {
+    if (this.inflight && this.client && Date.now() - this.inflightStartedAt > STALE_REQUEST_MS) {
+      this.fire(this.client)
+      return this.inflight.then(() => undefined)
+    }
     return this.request().then(() => undefined)
   }
 
   /** Returns a valid access token, requesting a new one if it expired. Parallel calls share one request. */
   getToken(): Promise<string> {
     if (this.token && Date.now() < this.expiresAt - EXPIRY_MARGIN_MS) return Promise.resolve(this.token)
-    if (!this.hadToken) return Promise.reject(new AuthError('not signed in', 'יש להתחבר עם Google תחילה.'))
     return this.renew()
   }
 
   /** Forces a new token (e.g. after a 401). */
   refresh(): Promise<string> {
-    if (!this.hadToken) return Promise.reject(new AuthError('not signed in', 'יש להתחבר עם Google תחילה.'))
     this.token = null
     return this.renew()
   }
 
   signOut(): void {
     const t = this.token
-    this.clearToken()
+    this.token = null
+    this.expiresAt = 0
+    this.hadToken = false
+    this.reconnect = false
     if (t) window.google?.accounts?.oauth2.revoke(t)
     this.emit()
   }
 
-  /** Renewal of an existing session; on failure the session ends so the header offers sign-in again. */
+  /** Non-interactive renewal of an existing session. On failure → "needs reconnect" (no sign-out). */
   private renew(): Promise<string> {
+    if (this.reconnect) return Promise.reject(new AuthError('reconnect needed', RECONNECT_MESSAGE))
+    if (!this.hadToken) return Promise.reject(new AuthError('not signed in', 'יש להתחבר עם Google תחילה.'))
     return this.request().catch((e: unknown) => {
-      const wasSignedIn = this.signedIn || this.hadToken
-      this.clearToken()
-      if (wasSignedIn) this.emit()
-      throw e
+      if (this.hadToken && !this.reconnect) {
+        this.token = null
+        this.expiresAt = 0
+        this.reconnect = true
+        this.emit()
+      }
+      throw new AuthError(`renewal failed: ${e instanceof Error ? e.message : String(e)}`, RECONNECT_MESSAGE)
     })
-  }
-
-  private clearToken(): void {
-    this.token = null
-    this.expiresAt = 0
-    this.hadToken = false
   }
 
   private async loadClient(): Promise<GoogleTokenClient> {
@@ -136,22 +164,30 @@ export class GoogleAuth {
       this.settle = { resolve, reject }
     })
     this.inflight = p
-    const fire = (client: GoogleTokenClient) => {
-      try {
-        client.requestAccessToken({ prompt: '' })
-      } catch (e) {
-        this.finish(new AuthError(`requestAccessToken threw: ${String(e)}`, AUTH_FAILED_MESSAGE))
-      }
-    }
-    if (this.client) fire(this.client)
+    if (this.client) this.fire(this.client)
     else
-      this.init().then(fire, (e: unknown) =>
-        this.finish(e instanceof Error ? e : new AuthError(String(e), AUTH_FAILED_MESSAGE)),
+      this.init().then(
+        (c) => this.fire(c),
+        (e: unknown) => this.finish(e instanceof Error ? e : new AuthError(String(e), AUTH_FAILED_MESSAGE)),
       )
     return p
   }
 
+  /** Opens the GIS request for the pending promise and (re)starts its timeout. */
+  private fire(client: GoogleTokenClient): void {
+    this.inflightStartedAt = Date.now()
+    if (this.timeoutId !== null) clearTimeout(this.timeoutId)
+    this.timeoutId = setTimeout(() => this.finish(new AuthError('token request timed out', TIMEOUT_MESSAGE)), REQUEST_TIMEOUT_MS)
+    try {
+      client.requestAccessToken({ prompt: '' })
+    } catch (e) {
+      this.finish(new AuthError(`requestAccessToken threw: ${String(e)}`, AUTH_FAILED_MESSAGE))
+    }
+  }
+
   private finish(result: Error | string): void {
+    if (this.timeoutId !== null) clearTimeout(this.timeoutId)
+    this.timeoutId = null
     const s = this.settle
     this.settle = null
     this.inflight = null
@@ -174,6 +210,7 @@ export class GoogleAuth {
     this.token = resp.access_token
     this.expiresAt = Date.now() + Number(resp.expires_in ?? 3600) * 1000
     this.hadToken = true
+    this.reconnect = false
     this.emit()
     this.finish(resp.access_token)
   }

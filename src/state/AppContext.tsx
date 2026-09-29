@@ -7,6 +7,10 @@ import type { AppServices } from './services'
 export interface AppState {
   services: AppServices
   signedIn: boolean
+  /** Token renewal failed; pages stay mounted and a reconnect prompt is shown. */
+  needsReconnect: boolean
+  /** Signed in, or temporarily disconnected (needs reconnect). Pages are gated on this, not on signedIn. */
+  sessionActive: boolean
   folderId: string | null
   settings: AppSettings | null
   settingsLoading: boolean
@@ -28,11 +32,21 @@ export function AppProvider({ services, children }: { services: AppServices; chi
   const [settingsError, setSettingsError] = useState<string | null>(null)
   const [reloadTick, setReloadTick] = useState(0)
 
-  useEffect(() => services.auth?.subscribe(setSignedIn), [services.auth])
+  const [needsReconnect, setNeedsReconnect] = useState(services.auth?.needsReconnect ?? false)
+  const sessionActive = signedIn || needsReconnect
+
+  useEffect(() => {
+    const auth = services.auth
+    if (!auth) return
+    return auth.subscribe((s) => {
+      setSignedIn(s)
+      setNeedsReconnect(auth.needsReconnect ?? false)
+    })
+  }, [services.auth])
 
   const drive = services.drive
   useEffect(() => {
-    if (!drive || !signedIn || !folderId) {
+    if (!drive || !sessionActive || !folderId) {
       setSettings(null)
       return
     }
@@ -55,7 +69,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
     return () => {
       cancelled = true
     }
-  }, [drive, signedIn, folderId, reloadTick])
+  }, [drive, sessionActive, folderId, reloadTick])
 
   const signIn = useCallback(async () => {
     if (!services.auth) return
@@ -88,6 +102,8 @@ export function AppProvider({ services, children }: { services: AppServices; chi
     () => ({
       services,
       signedIn,
+      needsReconnect,
+      sessionActive,
       folderId,
       settings,
       settingsLoading,
@@ -98,7 +114,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       reloadSettings,
       saveSettings,
     }),
-    [services, signedIn, folderId, settings, settingsLoading, settingsError, signIn, signOut, pickFolder, reloadSettings, saveSettings],
+    [services, signedIn, needsReconnect, sessionActive, folderId, settings, settingsLoading, settingsError, signIn, signOut, pickFolder, reloadSettings, saveSettings],
   )
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>

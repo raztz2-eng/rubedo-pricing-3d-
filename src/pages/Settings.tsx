@@ -3,7 +3,7 @@ import { NotConfiguredNotice, RequireDrive, type DriveContext } from '../compone
 import { ErrorBox, Field } from '../components/ui'
 import type { AppSettings } from '../lib/bid'
 import { errorMessage, logError } from '../lib/errors'
-import { formatNumber, parseNumber } from '../lib/format'
+import { formatNumber, isValidAmount, parseNumber } from '../lib/format'
 import { computePrinterRate, DEFAULT_PRICING_SETTINGS, type PricingSettings } from '../lib/pricing'
 import { useApp } from '../state/AppContext'
 
@@ -84,10 +84,17 @@ function SettingsForm({ ctx }: { ctx: DriveContext }) {
   const [saved, setSaved] = useState(false)
 
   const parsed = Object.fromEntries(Object.entries(pricing).map(([k, v]) => [k, parseNumber(v)])) as unknown as PricingSettings
-  const badPricing = PRICING_FIELDS.filter((f) => !Number.isFinite(parsed[f.key]) || pricing[f.key].trim() === '')
-  const badMaterials = materials.filter((m) => m.name.trim() === '' || !Number.isFinite(parseNumber(m.pricePerKg)) || m.pricePerKg.trim() === '')
+  // Same rule as the bid form (isValidAmount: a number, not negative) + settings may not be left empty.
+  const badPricing = PRICING_FIELDS.filter((f) => pricing[f.key].trim() === '' || !isValidAmount(pricing[f.key]))
+  const badMaterials = materials.filter((m) => m.name.trim() === '' || m.pricePerKg.trim() === '' || !isValidAmount(m.pricePerKg))
   const rate = computePrinterRate(parsed)
-  const valid = badPricing.length === 0 && badMaterials.length === 0 && materials.length > 0 && Number.isFinite(rate)
+  const rateValid = Number.isFinite(rate) && rate >= 0
+  const invalidLabels = [
+    ...badPricing.map((f) => f.label),
+    ...badMaterials.map((m) => `חומר ${materials.indexOf(m) + 1}`),
+    ...(badPricing.length === 0 && !rateValid ? ['תעריף מדפסת (בדקו אורך חיים וניצולת)'] : []),
+  ]
+  const valid = invalidLabels.length === 0 && materials.length > 0
 
   const onSave = async () => {
     if (!valid) return
@@ -209,7 +216,11 @@ function SettingsForm({ ctx }: { ctx: DriveContext }) {
           {saving ? 'שומר…' : 'שמירת הגדרות'}
         </button>
         {saved && <span className="text-sm text-emerald-700">נשמר. ההגדרות חלות על הצעות חדשות בלבד.</span>}
-        {!valid && <span className="text-sm text-red-700">יש שדות ריקים או לא תקינים.</span>}
+        {!valid && (
+          <span role="alert" className="text-sm text-red-700" data-testid="settings-invalid">
+            ערכים לא תקינים (ריקים, לא מספר או שליליים): {invalidLabels.join(', ')}
+          </span>
+        )}
       </div>
       {error && <ErrorBox>{error}</ErrorBox>}
     </>

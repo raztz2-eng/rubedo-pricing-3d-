@@ -1,6 +1,6 @@
 import type { Bid, BidFile, Material, PartSource } from './bid'
 import type { BidContent, LocalFile } from './drive/bidRepository'
-import { formatNumber, parseNumber } from './format'
+import { formatNumber, isValidAmount, parseNumber } from './format'
 import type { PricingInput, PricingSettings } from './pricing'
 import type { SlicedFileInfo } from './threemf'
 
@@ -116,8 +116,7 @@ export function draftToPricingInput(d: BidDraft): PricingInput {
 export function invalidFields(d: BidDraft): string[] {
   const bad: string[] = []
   const check = (label: string, v: string) => {
-    const n = parseNumber(v)
-    if (Number.isNaN(n) || n < 0) bad.push(label)
+    if (!isValidAmount(v)) bad.push(label)
   }
   check('מחיר חומר', d.pricePerKg)
   check('דקות עבודה', d.laborMinutes)

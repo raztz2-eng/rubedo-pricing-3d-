@@ -3,10 +3,19 @@ import { resolve } from 'node:path'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { App } from '../../src/App'
 import { BID_FILE_NAME } from '../../src/lib/bid'
-import { createMemoryServices, createUnconfiguredServices, type AppServices } from '../../src/state/services'
+import { GoogleAuth } from '../../src/lib/auth/googleAuth'
+import { DRIVE_SCOPE } from '../../src/lib/config'
+import { MemoryDrive } from '../../src/lib/drive/memoryDrive'
+import type { DriveFile, DriveStore, ListOptions } from '../../src/lib/drive/types'
+import {
+  createMemoryServices,
+  createUnconfiguredServices,
+  memoryFolderPointer,
+  type AppServices,
+} from '../../src/state/services'
 
 function renderApp(services: AppServices, path = '/') {
   return render(
@@ -128,7 +137,7 @@ describe('Library', () => {
 })
 
 describe('Fix round 1 — form robustness', () => {
-  it('number fields are text inputs with a decimal keyboard; "1,5" counts as 1.5 and "1,5,2" is flagged', async () => {
+  it('number fields are text inputs with a decimal keyboard; "4,200" is 4200, "1,5" and "-3" are flagged', async () => {
     const user = userEvent.setup()
     renderApp(createMemoryServices(), '/new')
     await user.click(await screen.findByRole('button', { name: /הוספת חלק ידנית/ }))
@@ -138,15 +147,15 @@ describe('Fix round 1 — form robustness', () => {
     expect(grams.getAttribute('dir')).toBe('ltr')
 
     await user.type(screen.getByLabelText(/^שם\s*\*$/), 'X')
-    await user.type(grams, '1000')
-    await user.type(screen.getByLabelText('זמן הדפסה'), '1,5')
+    await user.type(grams, '1,000')
+    await user.type(screen.getByLabelText('זמן הדפסה'), '1.5')
     // filament 1000 g → 93.50; machine 1.5 h × 0.66498 = 0.99747 → landed 94.49747
     expect(screen.getByTestId('cost-landed').textContent).toContain('₪94.50')
     expect(screen.queryByText(/ערכים לא תקינים/)).toBeNull()
 
     await user.clear(grams)
-    await user.type(grams, '1,5,2')
-    expect(grams.value).toBe('1,5,2')
+    await user.type(grams, '1,5')
+    expect(grams.value).toBe('1,5')
     expect(screen.getByText(/ערכים לא תקינים: .*חלק 1 — גרמים/)).toBeTruthy()
     expect((screen.getByRole('button', { name: 'שמירה' }) as HTMLButtonElement).disabled).toBe(true)
 
@@ -216,5 +225,160 @@ describe('Fix round 1 — form robustness', () => {
     await user.type(name, 'ALPHA')
     await user.click(screen.getByRole('button', { name: 'שמירה' }))
     expect(await screen.findByRole('heading', { name: 'ALPHA' })).toBeTruthy()
+  })
+})
+
+/** MemoryDrive that needs a token for every call, like the real Drive store (401 → refresh). */
+class TokenGatedDrive implements DriveStore {
+  /** When set, the upload of this file name first gets a 401 → auth.refresh(). */
+  refreshBeforeUploadOf: string | null = null
+  constructor(
+    readonly inner: MemoryDrive,
+    private readonly auth: GoogleAuth,
+  ) {}
+  private async token() {
+    await this.auth.getToken()
+  }
+  async listChildren(id: string, o?: ListOptions): Promise<DriveFile[]> {
+    await this.token()
+    return this.inner.listChildren(id, o)
+  }
+  async createFolder(p: string, n: string) {
+    await this.token()
+    return this.inner.createFolder(p, n)
+  }
+  async uploadFile(p: string, n: string, d: Blob, m: string) {
+    await this.token()
+    if (this.refreshBeforeUploadOf === n) {
+      this.refreshBeforeUploadOf = null
+      await this.auth.refresh()
+    }
+    return this.inner.uploadFile(p, n, d, m)
+  }
+  async updateFileContent(id: string, d: Blob, m: string) {
+    await this.token()
+    return this.inner.updateFileContent(id, d, m)
+  }
+  async readText(id: string) {
+    await this.token()
+    return this.inner.readText(id)
+  }
+  async readBlob(id: string) {
+    await this.token()
+    return this.inner.readBlob(id)
+  }
+  folderUrl(id: string) {
+    return this.inner.folderUrl(id)
+  }
+}
+
+describe('Fix round 2 — lost Google connection during a save', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+    delete (window as Window).google
+  })
+
+  it('renewal fails mid-save → error + reconnect prompt, form kept; after reconnect the retry completes into the SAME folder', async () => {
+    let gisMode: 'grant' | 'fail' = 'grant'
+    let n = 0
+    window.google = {
+      accounts: {
+        oauth2: {
+          initTokenClient: (c) => ({
+            requestAccessToken: () =>
+              setTimeout(() => {
+                n += 1
+                if (gisMode === 'grant') c.callback({ access_token: `T${n}`, expires_in: 3600, scope: DRIVE_SCOPE })
+                else c.error_callback?.({ type: 'popup_failed_to_open' })
+              }, 0),
+          }),
+          revoke: vi.fn(),
+        },
+      },
+    }
+    vi.spyOn(document.head, 'appendChild').mockImplementation((el) => {
+      queueMicrotask(() => (el as HTMLScriptElement).onload?.(new Event('load')))
+      return el
+    })
+    const auth = new GoogleAuth('cid')
+    await auth.init()
+    const mem = new MemoryDrive()
+    const root = mem.createRootFolder('models')
+    const drive = new TokenGatedDrive(mem, auth)
+    const services: AppServices = {
+      mode: 'google',
+      drive,
+      auth,
+      folderPointer: memoryFolderPointer(root),
+      pickFolder: async () => null,
+    }
+    const user = userEvent.setup()
+    renderApp(services, '/new')
+    await user.click(within(screen.getByRole('banner')).getByRole('button', { name: 'התחברות עם Google' }))
+    await screen.findByText('מחובר ל-Google')
+
+    const name = (await screen.findByLabelText(/^שם\s*\*$/)) as HTMLInputElement
+    await user.type(name, 'Stand')
+    await user.upload(screen.getByLabelText('העלאת קובץ פרוס'), fixtureFile('rooting-stand.gcode.3mf'))
+    await screen.findAllByTestId('part-row')
+    await user.type(screen.getByLabelText('זמן עבודה'), '15')
+
+    // The token "expires" while uploading the sliced file; the silent renewal popup is blocked.
+    drive.refreshBeforeUploadOf = 'rooting-stand.gcode.3mf'
+    gisMode = 'fail'
+    await user.click(screen.getByRole('button', { name: 'שמירה' }))
+
+    expect(await screen.findByText(/החיבור ל-Google פג — לחצו 'התחבר מחדש'/)).toBeTruthy()
+    const reconnect = screen.getByRole('button', { name: 'התחבר מחדש' })
+    expect(screen.getByText('נדרש חיבור מחדש')).toBeTruthy()
+    // Form is still mounted with everything in it.
+    expect((screen.getByLabelText(/^שם\s*\*$/) as HTMLInputElement).value).toBe('Stand')
+    expect((screen.getByLabelText(/^שם\s*\*$/) as HTMLInputElement).disabled).toBe(true)
+    expect((screen.getByLabelText('משקל') as HTMLInputElement).value).toBe('55.94')
+    expect((screen.getByLabelText('זמן עבודה') as HTMLInputElement).value).toBe('15')
+    expect(screen.getByText('rooting-stand.gcode.3mf')).toBeTruthy()
+    expect(screen.getByText(/להשתמש בתמונת הפלטה 1/)).toBeTruthy()
+    const foldersAfterFailure = await mem.listChildren(root, { foldersOnly: true })
+    expect(foldersAfterFailure.map((f) => f.name)).toEqual(['Stand'])
+
+    gisMode = 'grant'
+    await user.click(reconnect)
+    await screen.findByText('מחובר ל-Google')
+    expect(screen.queryByRole('button', { name: 'התחבר מחדש' })).toBeNull()
+
+    await user.click(screen.getByRole('button', { name: 'שמירה' }))
+    expect(await screen.findByRole('heading', { name: 'Stand' })).toBeTruthy()
+    const folders = await mem.listChildren(root, { foldersOnly: true })
+    expect(folders.map((f) => f.id)).toEqual([foldersAfterFailure[0].id])
+    expect((await mem.listChildren(folders[0].id)).map((f) => f.name)).toEqual([
+      'Stand-plate-1.png',
+      'rooting-stand.gcode.3mf',
+      BID_FILE_NAME,
+    ])
+  })
+})
+
+describe('Fix round 2 — Settings validation', () => {
+  it('negative or malformed values are listed and block saving', async () => {
+    const user = userEvent.setup()
+    renderApp(createMemoryServices(), '/settings')
+    const labor = await screen.findByLabelText('תעריף עבודה')
+    const save = screen.getByRole('button', { name: 'שמירת הגדרות' }) as HTMLButtonElement
+    expect(save.disabled).toBe(false)
+    await user.clear(labor)
+    await user.type(labor, '-80')
+    expect(screen.getByTestId('settings-invalid').textContent).toContain('תעריף עבודה')
+    expect(save.disabled).toBe(true)
+    await user.clear(labor)
+    await user.type(labor, '80')
+    const price = screen.getAllByLabelText('מחיר')[0]
+    await user.clear(price)
+    await user.type(price, '1,5')
+    expect(screen.getByTestId('settings-invalid').textContent).toContain('חומר 1')
+    expect(save.disabled).toBe(true)
+    await user.clear(price)
+    await user.type(price, '4,200')
+    expect(screen.queryByTestId('settings-invalid')).toBeNull()
+    expect(save.disabled).toBe(false)
   })
 })

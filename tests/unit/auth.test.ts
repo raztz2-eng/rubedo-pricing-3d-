@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { AuthError, GoogleAuth, POPUP_BLOCKED_MESSAGE, POPUP_CLOSED_MESSAGE } from '../../src/lib/auth/googleAuth'
+import {
+  AuthError,
+  GoogleAuth,
+  POPUP_BLOCKED_MESSAGE,
+  POPUP_CLOSED_MESSAGE,
+  RECONNECT_MESSAGE,
+  REQUEST_TIMEOUT_MS,
+  STALE_REQUEST_MS,
+  TIMEOUT_MESSAGE,
+} from '../../src/lib/auth/googleAuth'
 import { DRIVE_SCOPE } from '../../src/lib/config'
 
 type Respond = (c: GoogleTokenClientConfig) => void
@@ -124,29 +133,36 @@ describe('GoogleAuth — error callback paths', () => {
     expect((err as AuthError).userMessage).toMatch(/[א-ת]/)
   })
 
-  it('a failed renewal after expiry clears the token and emits signed-out', async () => {
+  it('a failed renewal after expiry → "needs reconnect" (not signed out); reconnect restores the session', async () => {
     let n = 0
     installGis((c) => {
       n += 1
       if (n === 1) c.callback({ access_token: 'T1', expires_in: 30, scope: DRIVE_SCOPE })
-      else c.error_callback?.({ type: 'popup_failed_to_open' })
+      else if (n === 2) c.error_callback?.({ type: 'popup_failed_to_open' })
+      else c.callback({ access_token: 'T3', expires_in: 3600, scope: DRIVE_SCOPE })
     })
     const auth = new GoogleAuth('client-id')
-    const states: boolean[] = []
-    auth.subscribe((s) => states.push(s))
+    const events: [boolean, boolean][] = []
+    auth.subscribe((s) => events.push([s, auth.needsReconnect]))
     await auth.signIn()
-    expect(states).toEqual([true])
+    expect(events).toEqual([[true, false]])
 
     const err = await auth.getToken().catch((e: unknown) => e)
-    expect((err as AuthError).userMessage).toBe(POPUP_BLOCKED_MESSAGE)
+    expect((err as AuthError).userMessage).toBe(RECONNECT_MESSAGE)
     expect(auth.signedIn).toBe(false)
-    expect(states).toEqual([true, false])
-    // No silent retry loop: the user must sign in again.
+    expect(auth.needsReconnect).toBe(true)
+    expect(events).toEqual([[true, false], [false, true]])
+    // No silent popup loop: further calls fail fast until the user reconnects.
     await expect(auth.getToken()).rejects.toThrow(AuthError)
     expect(n).toBe(2)
+
+    await auth.signIn() // the "reconnect" click
+    expect(auth.needsReconnect).toBe(false)
+    expect(await auth.getToken()).toBe('T3')
+    expect(events.at(-1)).toEqual([true, false])
   })
 
-  it('refresh() after a 401 that fails also signs out', async () => {
+  it('a failed refresh() after a 401 → needs reconnect', async () => {
     let n = 0
     installGis((c) => {
       n += 1
@@ -157,6 +173,22 @@ describe('GoogleAuth — error callback paths', () => {
     await auth.signIn()
     await expect(auth.refresh()).rejects.toThrow(AuthError)
     expect(auth.signedIn).toBe(false)
+    expect(auth.needsReconnect).toBe(true)
+  })
+
+  it('explicit sign-out clears "needs reconnect"', async () => {
+    let n = 0
+    installGis((c) => {
+      n += 1
+      if (n === 1) c.callback({ access_token: 'T1', expires_in: 30, scope: DRIVE_SCOPE })
+      else c.error_callback?.({ type: 'popup_closed' })
+    })
+    const auth = new GoogleAuth('client-id')
+    await auth.signIn()
+    await auth.getToken().catch(() => {})
+    auth.signOut()
+    expect(auth.needsReconnect).toBe(false)
+    await expect(auth.getToken()).rejects.toThrow(/not signed in/)
   })
 
   it('a valid unexpired token is returned without a new request', async () => {
@@ -165,5 +197,65 @@ describe('GoogleAuth — error callback paths', () => {
     await auth.signIn()
     expect(await auth.getToken()).toBe('T')
     expect(gis.requestAccessToken).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('GoogleAuth — hung requests', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('a request GIS never answers is rejected after 120 s with a Hebrew message', async () => {
+    installGis(() => {}) // never calls back
+    const auth = new GoogleAuth('client-id')
+    await auth.init()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const p = auth.signIn().catch((e: unknown) => e)
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS - 1)
+    let settled = false
+    void p.then(() => (settled = true))
+    await Promise.resolve()
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(2)
+    const err = await p
+    expect(err).toBeInstanceOf(AuthError)
+    expect((err as AuthError).userMessage).toBe(TIMEOUT_MESSAGE)
+    // A new click can start a fresh request afterwards.
+    expect(window.google?.accounts?.oauth2).toBeTruthy()
+  })
+
+  it('a sign-in click replaces a request pending > 10 s; all waiting callers get the new token', async () => {
+    let calls = 0
+    let config: GoogleTokenClientConfig | undefined
+    const requestAccessToken = vi.fn(() => {
+      calls += 1
+    })
+    window.google = {
+      accounts: {
+        oauth2: {
+          initTokenClient: (c) => {
+            config = c
+            return { requestAccessToken }
+          },
+          revoke: vi.fn(),
+        },
+      },
+    }
+    const auth = new GoogleAuth('client-id')
+    await auth.init()
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+    const first = auth.signIn() // popup lost, never answered
+    await vi.advanceTimersByTimeAsync(5_000)
+    const early = auth.signIn() // < 10 s: joins, no new popup
+    expect(calls).toBe(1)
+    await vi.advanceTimersByTimeAsync(STALE_REQUEST_MS)
+    const second = auth.signIn() // > 10 s: popup opened again
+    expect(calls).toBe(2)
+    config?.callback({ access_token: 'NEW', expires_in: 3600, scope: DRIVE_SCOPE })
+    await expect(Promise.all([first, early, second])).resolves.toEqual([undefined, undefined, undefined])
+    expect(await auth.getToken()).toBe('NEW')
+    // The timeout was restarted by the second popup and cleared on success: nothing fires later.
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS * 2)
+    expect(auth.signedIn).toBe(true)
   })
 })
