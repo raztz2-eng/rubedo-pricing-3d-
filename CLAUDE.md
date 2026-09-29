@@ -1,0 +1,76 @@
+# CLAUDE.md — RUBEDO 3D Bid App
+
+Rulebook for every AI agent working in this repo. Read it fully before doing anything.
+Owner / final decision maker: the Founder (Raz). Company: RUBEDO.3D.
+
+## What this app is
+A single-user web app that prices 3D-printed models (bids) using the Founder's spreadsheet method,
+saves each bid with its files to the Founder's Google Drive, and shows a library of saved bids.
+Full spec: `docs/technical-brief.md` (source of truth for scope). If the code and the brief disagree, the brief wins
+— or escalate; never silently change scope.
+
+## Stack
+- React 18 + Vite + TypeScript (strict), Tailwind CSS (via `@tailwindcss/vite`), React Router
+- Vitest (+ @testing-library/react, jsdom) for unit & acceptance tests
+- JSZip for reading sliced `.3mf` files in the browser
+- Google Identity Services (token client) + Google Drive REST v3 via `fetch` + Google Picker (folder pick)
+- Hosting: Vercel (static SPA). No backend, no database.
+
+## Commands
+- dev: `npm run dev`
+- typecheck: `npm run typecheck`
+- lint: `npm run lint`
+- test: `npm test` (runs once, CI mode)
+- build: `npm run build`
+All four of typecheck, lint, test, build must pass before any agent reports "done".
+
+## Folder layout
+- `src/lib/pricing.ts` — pure pricing function. No I/O. The only place the formula lives.
+- `src/lib/threemf.ts` — sliced .3mf parser (pure, takes ArrayBuffer/Blob).
+- `src/lib/drive/` — `DriveStore` interface, `googleDrive.ts` (real), `memoryDrive.ts` (fake for tests).
+- `src/lib/auth/` — Google sign-in (token kept in memory only).
+- `src/pages/` — Home, NewModel (also Edit), Library, ModelPage, Settings.
+- `src/components/` — shared UI.
+- `tests/unit/` — unit tests (Builder). `tests/acceptance/` — acceptance tests (Test Verifier only).
+- `tests/fixtures/` — two real Bambu Studio sliced files (G-code removed to keep them small).
+
+## Architecture rules
+- Pricing formula lives ONLY in `src/lib/pricing.ts`. UI never re-implements math.
+- UI talks to Drive ONLY through the `DriveStore` interface, so tests use the in-memory fake.
+- `bid.json` in each model folder is the source of truth. `_rubedo-index.json` is a rebuildable cache.
+- Every saved bid stores a snapshot of the settings used. Changing Settings never changes saved bids.
+- Money: compute in full precision, round to 2 decimals only for display. Currency ₪, format `₪1,234.56`.
+- UI language Hebrew, `dir="rtl"`, mobile-first. Numbers/units stay LTR where needed.
+- Errors are shown to the user in plain Hebrew; never swallow errors; never silently substitute 0 for a value
+  that failed to load or parse.
+
+## Do not
+- Do not deploy to production. Preview deployments only. Production = Founder approval.
+- Do not buy, subscribe to, or enable any paid service or plan. Ever.
+- Do not add a backend, database, Supabase, Firebase or server functions (Founder decision: Drive only).
+- Do not request Drive scopes wider than `https://www.googleapis.com/auth/drive.file`.
+- Do not store the Google access token in localStorage/sessionStorage/cookies — memory only.
+- Do not commit secrets, `.env*` (except `.env.example`), keys, or tokens. The pre-commit hook blocks them.
+- Do not add dependencies beyond the stack above without writing why in your summary.
+- Do not commit directly to `main` after the initial setup commit — work on a branch, open a PR.
+- Do not delete or overwrite anything in the Founder's Drive. The app only creates; edits touch only `bid.json`
+  / index / settings files it created.
+
+## Pricing method (Founder-approved)
+printerRate = ((printerCost + upgrades + maintenancePerYear × lifeYears) / (lifeYears × 8760 × uptime)
+              + powerW/1000 × kwhPrice) × buffer                       // = ₪0.66498/h with defaults
+filament   = Σ(part.grams × part.qty) / 1000 × pricePerKg × efficiency
+hardware   = Σ(qty × unitCost)
+labor      = laborMinutes / 60 × laborRate                              // laborRate default ₪80/h
+packaging  = hasShipping ? Σ(qty × unitCost) + shippingCost : 0
+machine    = Σ(part.hours × part.qty) × printerRate
+landed     = filament + hardware + labor + packaging + machine
+price(m)   = landed / (1 − m) for m ∈ {0.5, 0.6, 0.7}; library shows price(0.7)
+Defaults: efficiency 1.1, laborRate 80, printerCost 4200, upgrades 0, maintenancePerYear 420, lifeYears 3,
+uptime 0.5, powerW 150, kwhPrice 0.64, buffer 1.3, material price ₪85/kg for PLA/PETG/other.
+
+## Deeper docs
+- `docs/technical-brief.md` — scope, data layout, flows, acceptance criteria, test cases T0–T3.
+
+## Lessons (append a rule here every time an agent makes a surprising mistake)
+- (none yet)

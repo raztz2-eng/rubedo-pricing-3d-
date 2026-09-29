@@ -1,0 +1,10 @@
+#!/bin/sh
+# Blocks commits that contain secret files. Installed via: git config core.hooksPath .claude/hooks (npm "prepare").
+blocked=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '(^|/)\.env($|\.)|\.key$|\.pem$|\.p12$|secrets?\.json$|credentials.*\.json$|client_secret.*\.json$' | grep -v '\.env\.example$')
+if [ -n "$blocked" ]; then
+  echo "COMMIT BLOCKED — these files may contain secrets and must never be committed:"
+  echo "$blocked" | sed 's/^/  - /'
+  echo "Remove them from the commit (git restore --staged <file>) and keep them out of git (.gitignore)."
+  exit 1
+fi
+exit 0
