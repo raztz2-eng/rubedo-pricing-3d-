@@ -82,6 +82,8 @@ export function createMemoryServices(drive = new MemoryDrive(), folderId?: strin
 
 export function createGoogleServices(): AppServices {
   const auth = new GoogleAuth(googleConfig.clientId)
+  // Preload GIS so the sign-in click opens the popup synchronously. A failure surfaces on sign-in.
+  void auth.init().catch(() => {})
   const drive = new GoogleDriveStore(auth)
   return {
     mode: 'google',

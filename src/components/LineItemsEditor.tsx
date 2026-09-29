@@ -26,8 +26,8 @@ export function LineItemsEditor({
             value={l.name}
             onChange={(v) => update(l.key, { name: v })}
           />
-          <Field label="כמות" type="number" min="0" value={l.qty} onChange={(v) => update(l.key, { qty: v })} />
-          <Field label="מחיר ליחידה" type="number" min="0" suffix="₪" value={l.unitCost} onChange={(v) => update(l.key, { unitCost: v })} />
+          <Field label="כמות" type="number" value={l.qty} onChange={(v) => update(l.key, { qty: v })} />
+          <Field label="מחיר ליחידה" type="number" suffix="₪" value={l.unitCost} onChange={(v) => update(l.key, { unitCost: v })} />
           <button
             type="button"
             className="btn btn-ghost col-span-2 text-red-700 sm:col-span-1"

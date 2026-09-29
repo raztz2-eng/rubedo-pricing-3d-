@@ -41,14 +41,17 @@ interface FieldProps {
   suffix?: string
   placeholder?: string
   required?: boolean
-  step?: string
-  min?: string
   className?: string
   inputRef?: React.Ref<HTMLInputElement>
+  disabled?: boolean
+  hint?: string
 }
 
-/** Labelled input. Numbers are kept as text so an invalid entry is never silently turned into 0. */
-export function Field({ label, value, onChange, type = 'text', suffix, placeholder, required, step, min, className = '', inputRef }: FieldProps) {
+/**
+ * Labelled input. `type="number"` renders a text input with a decimal keyboard: the raw text is kept, so a
+ * malformed entry (e.g. "1,5,2") is flagged by validation instead of the browser silently turning it into "".
+ */
+export function Field({ label, value, onChange, type = 'text', suffix, placeholder, required, className = '', inputRef, disabled, hint }: FieldProps) {
   const id = useId()
   return (
     <div className={`flex min-w-0 flex-col gap-1 ${className}`}>
@@ -60,11 +63,12 @@ export function Field({ label, value, onChange, type = 'text', suffix, placehold
         <input
           id={id}
           ref={inputRef}
-          type={type}
+          type="text"
           inputMode={type === 'number' ? 'decimal' : undefined}
-          step={type === 'number' ? (step ?? 'any') : undefined}
-          min={min}
+          autoComplete={type === 'number' ? 'off' : undefined}
           dir={type === 'number' ? 'ltr' : undefined}
+          disabled={disabled}
+          aria-describedby={hint ? `${id}-hint` : undefined}
           className="w-full"
           value={value}
           placeholder={placeholder}
@@ -72,6 +76,11 @@ export function Field({ label, value, onChange, type = 'text', suffix, placehold
         />
         {suffix && <span className="shrink-0 text-sm text-stone-500">{suffix}</span>}
       </div>
+      {hint && (
+        <p id={`${id}-hint`} className="text-xs text-amber-800">
+          {hint}
+        </p>
+      )}
     </div>
   )
 }

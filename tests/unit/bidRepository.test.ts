@@ -212,3 +212,54 @@ describe('updateBid (edit flow, AC11)', () => {
     expect(lib[0].name).toBe('E renamed')
   })
 })
+
+describe('robust index handling', () => {
+  it('a corrupt index (invalid JSON) is rebuilt instead of failing the save', async () => {
+    await saveNewBid(drive, root, { folderName: 'A', content: content('A'), files: [] }, newSaveSession())
+    const idx = (await drive.listChildren(root, { name: INDEX_FILE_NAME }))[0]
+    await drive.updateFileContent(idx.id, new Blob(['{broken']), 'application/json')
+
+    const { folderId } = await saveNewBid(drive, root, { folderName: 'B', content: content('B'), files: [] }, newSaveSession())
+    expect(folderId).toBeTruthy()
+    const lib = await loadLibrary(drive, root)
+    expect(lib.map((e) => e.name).sort()).toEqual(['A', 'B'])
+    expect(await drive.listChildren(root, { name: INDEX_FILE_NAME })).toHaveLength(1)
+  })
+
+  it('loadLibrary with a corrupt index rebuilds it', async () => {
+    await saveNewBid(drive, root, { folderName: 'A', content: content('A'), files: [] }, newSaveSession())
+    const idx = (await drive.listChildren(root, { name: INDEX_FILE_NAME }))[0]
+    await drive.updateFileContent(idx.id, new Blob(['not json']), 'application/json')
+    expect((await loadLibrary(drive, root)).map((e) => e.name)).toEqual(['A'])
+  })
+
+  it('rebuildIndex rethrows Drive errors and does not write a partial index', async () => {
+    await saveNewBid(drive, root, { folderName: 'A', content: content('A'), files: [] }, newSaveSession())
+    await saveNewBid(drive, root, { folderName: 'B', content: content('B'), files: [] }, newSaveSession())
+    const bFolder = (await drive.listChildren(root, { name: 'B' }))[0]
+    const bBid = (await drive.listChildren(bFolder.id, { name: BID_FILE_NAME }))[0]
+    const writesBefore = drive.writeLog.length
+
+    drive.failNext('readText', (id) => id === bBid.id)
+    await expect(rebuildIndex(drive, root)).rejects.toThrow(/simulated failure/)
+    expect(drive.writeLog.length).toBe(writesBefore) // index untouched
+    expect((await loadLibrary(drive, root)).map((e) => e.name).sort()).toEqual(['A', 'B'])
+  })
+
+  it('rebuildIndex still skips (not throws on) bid.json that fails isBid', async () => {
+    const f = await drive.createFolder(root, 'Weird')
+    await drive.uploadFile(f.id, BID_FILE_NAME, new Blob(['{"hello":1}']), 'application/json')
+    const r = await rebuildIndex(drive, root)
+    expect(r.skipped).toEqual(['Weird'])
+  })
+})
+
+describe('checkName with excludeFolderId (edit rename)', () => {
+  it("ignores the edited bid's own folder/entry but still sees other bids", async () => {
+    const a = await saveNewBid(drive, root, { folderName: 'A', content: content('A'), files: [] }, newSaveSession())
+    await saveNewBid(drive, root, { folderName: 'B', content: content('B'), files: [] }, newSaveSession())
+    expect((await checkName(drive, root, 'A', a.folderId)).taken).toBe(false)
+    expect((await checkName(drive, root, 'b', a.folderId)).taken).toBe(true)
+    expect((await checkName(drive, root, 'C', a.folderId)).taken).toBe(false)
+  })
+})

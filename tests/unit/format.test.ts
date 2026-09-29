@@ -19,3 +19,14 @@ describe('parseNumber', () => {
     expect(Number.isNaN(parseNumber('abc'))).toBe(true)
   })
 })
+
+describe('parseNumber — Israeli input', () => {
+  it('accepts a comma as the decimal separator', () => {
+    expect(parseNumber('1,5')).toBe(1.5)
+    expect(parseNumber(',5')).toBe(0.5)
+    expect(parseNumber('12.75')).toBe(12.75)
+  })
+  it('rejects malformed numbers (never 0)', () => {
+    for (const bad of ['1,5,2', '1.2.3', '1,000.5', '12abc', '--1', '1 5']) expect(Number.isNaN(parseNumber(bad)), bad).toBe(true)
+  })
+})

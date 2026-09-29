@@ -28,9 +28,9 @@ export function PartsEditor({ parts, onChange }: { parts: PartDraft[]; onChange:
               value={p.name}
               onChange={(v) => replace(p.key, (x) => ({ ...x, name: v }))}
             />
-            <Field label="כמות" type="number" min="0" value={p.qty} onChange={(v) => replace(p.key, (x) => ({ ...x, qty: v }))} />
-            <Field label="משקל" type="number" min="0" suffix="ג׳" value={p.grams} onChange={(v) => replace(p.key, (x) => editPartValue(x, 'grams', v))} />
-            <Field label="זמן הדפסה" type="number" min="0" suffix="שעות" value={p.hours} onChange={(v) => replace(p.key, (x) => editPartValue(x, 'hours', v))} />
+            <Field label="כמות" type="number" value={p.qty} onChange={(v) => replace(p.key, (x) => ({ ...x, qty: v }))} />
+            <Field label="משקל" type="number" suffix="ג׳" value={p.grams} onChange={(v) => replace(p.key, (x) => editPartValue(x, 'grams', v))} />
+            <Field label="זמן הדפסה" type="number" suffix="שעות" value={p.hours} onChange={(v) => replace(p.key, (x) => editPartValue(x, 'hours', v))} />
           </div>
           <div className="mt-2 text-end">
             <button

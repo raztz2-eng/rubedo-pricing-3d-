@@ -109,3 +109,22 @@ describe('draftToContent / filesToUpload', () => {
     expect(filesToUpload(unticked).map((f) => f.name)).toEqual(['rs.gcode.3mf'])
   })
 })
+
+describe('invalidFields — malformed and negative numbers', () => {
+  it('flags malformed text and negative values; comma decimals are valid', () => {
+    const base = { ...emptyDraft(DEFAULT_MATERIALS), name: 'x' }
+    const d = {
+      ...base,
+      laborMinutes: '-5',
+      parts: [{ ...emptyPart(), grams: '1,5,2', hours: '1,5' }],
+      hardware: [{ key: 'h', name: 'screw', qty: '2', unitCost: '-1' }],
+    }
+    const bad = invalidFields(d)
+    expect(bad).toEqual(expect.arrayContaining(['דקות עבודה', 'חלק 1 — גרמים', 'חומרה 1 — מחיר']))
+    expect(bad).not.toContain('חלק 1 — שעות')
+    expect(canSave(d)).toBe(false)
+    const ok = { ...base, parts: [{ ...emptyPart(), grams: '1,5' }] }
+    expect(invalidFields(ok)).toEqual([])
+    expect(draftToPricingInput(ok).parts[0].grams).toBe(1.5)
+  })
+})

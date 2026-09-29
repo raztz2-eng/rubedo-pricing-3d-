@@ -56,6 +56,31 @@ describe('GoogleDriveStore', () => {
     expect(text.endsWith(`--${boundary}--`)).toBe(true)
   })
 
+  it('uploads binary content byte-exact inside the multipart body', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(json({ id: 'bin', name: 'p.png', mimeType: 'image/png' }))
+    const store = new GoogleDriveStore(tokens(), fetchMock)
+    const bytes = new Uint8Array([0, 255, 137, 80])
+    await store.uploadFile('FOLDER', 'p.png', new Blob([bytes], { type: 'image/png' }), 'image/png')
+    const init = fetchMock.mock.calls[0][1]
+    const ct = (init?.headers as Record<string, string>)['Content-Type']
+    const boundary = ct.split('boundary=')[1]
+    const body = new Uint8Array(await (init?.body as Blob).arrayBuffer())
+    const header = new TextEncoder().encode(`\r\n--${boundary}\r\nContent-Type: image/png\r\n\r\n`)
+    const footer = new TextEncoder().encode(`\r\n--${boundary}--`)
+    const find = (needle: Uint8Array) => {
+      outer: for (let i = 0; i <= body.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) if (body[i + j] !== needle[j]) continue outer
+        return i
+      }
+      return -1
+    }
+    const start = find(header)
+    expect(start).toBeGreaterThan(0)
+    const dataStart = start + header.length
+    expect(Array.from(body.slice(dataStart, dataStart + 4))).toEqual([0, 255, 137, 80])
+    expect(Array.from(body.slice(dataStart + 4))).toEqual(Array.from(footer))
+  })
+
   it('updates content with PATCH uploadType=media', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(json({ id: 'F' }))
     await new GoogleDriveStore(tokens(), fetchMock).updateFileContent('F', new Blob(['x']), 'application/json')

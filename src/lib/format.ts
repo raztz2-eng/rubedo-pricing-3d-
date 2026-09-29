@@ -26,10 +26,15 @@ export function formatDate(iso: string): string {
   return d.toLocaleDateString('he-IL', { year: 'numeric', month: '2-digit', day: '2-digit' })
 }
 
-/** Parses a user-entered number. Empty → 0; anything non-numeric → NaN (never silently 0). */
+/**
+ * Parses a user-entered number. Empty → 0; anything non-numeric → NaN (never silently 0).
+ * A single comma is accepted as the decimal separator ("1,5" → 1.5).
+ */
 export function parseNumber(text: string): number {
-  const t = text.trim()
+  let t = text.trim()
   if (t === '') return 0
+  if (/^[+-]?\d*,\d+$/.test(t)) t = t.replace(',', '.')
+  if (!/^[+-]?(\d+\.?\d*|\.\d+)$/.test(t)) return NaN
   const n = Number(t)
   return Number.isFinite(n) ? n : NaN
 }

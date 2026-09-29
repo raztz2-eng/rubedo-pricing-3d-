@@ -83,6 +83,9 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
   const [conflict, setConflict] = useState<NameCheck | null>(null)
   const sessionRef = useRef<SaveSession>(newSaveSession())
   const folderNameRef = useRef<string | null>(null)
+  // True after a failed save that already created the model folder: the name is locked until the retry succeeds.
+  const [nameLocked, setNameLocked] = useState(false)
+  const [renameError, setRenameError] = useState<string | null>(null)
   const nameInputRef = useRef<HTMLInputElement>(null)
 
   const effectiveSnapshot = existing ? snapshot : settings.pricing
@@ -163,6 +166,7 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
       await fn()
     } catch (e) {
       logError('save bid', e)
+      if (!existing && sessionRef.current.folderId) setNameLocked(true)
       setSaveError(`${errorMessage(e, 'השמירה נכשלה.')} הנתונים בטופס נשמרו — אפשר ללחוץ שוב על "שמירה" כדי להמשיך מאותה נקודה.`)
     } finally {
       setSaving(false)
@@ -171,8 +175,18 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
 
   const onSave = () => {
     if (!saveAllowed || saving) return
+    setRenameError(null)
     void run(async () => {
       if (existing) {
+        // Renaming must not collide with another bid (nothing is ever overwritten).
+        if (draft.name.trim().toLocaleLowerCase() !== existing.bid.name.trim().toLocaleLowerCase()) {
+          const check = await checkName(drive, modelsFolderId, draft.name, existing.folderId)
+          if (check.taken) {
+            setRenameError(`כבר קיים דגם אחר בשם „${draft.name.trim()}”. בחרו שם אחר — שום הצעה לא נדרסה.`)
+            nameInputRef.current?.focus()
+            return
+          }
+        }
         const content = draftToContent(draft, snapshot, result)
         await updateBid(
           drive,
@@ -231,7 +245,23 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
         <div className="flex min-w-0 flex-col gap-4">
           <section className="card flex flex-col gap-3" aria-label="פרטי הדגם">
             <h2 className="section-title">פרטי הדגם</h2>
-            <Field label="שם" required value={draft.name} onChange={(v) => set('name', v)} inputRef={nameInputRef} />
+            <Field
+              label="שם"
+              required
+              value={draft.name}
+              onChange={(v) => {
+                setRenameError(null)
+                set('name', v)
+              }}
+              inputRef={nameInputRef}
+              disabled={nameLocked}
+              hint={
+                nameLocked
+                  ? 'השם נעול: תיקיית הדגם כבר נוצרה ב-Drive בניסיון השמירה הקודם. לחצו „שמירה” כדי להשלים את השמירה באותה תיקייה.'
+                  : undefined
+              }
+            />
+            {renameError && <ErrorBox>{renameError}</ErrorBox>}
             <div className="flex flex-col gap-1">
               <label htmlFor="desc">תיאור</label>
               <textarea id="desc" rows={3} value={draft.description} onChange={(e) => set('description', e.target.value)} />
@@ -252,7 +282,6 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
                 className="col-span-2 sm:col-span-1"
                 label="מחיר חומר"
                 type="number"
-                min="0"
                 suffix="₪/ק״ג"
                 value={draft.pricePerKg}
                 onChange={(v) => set('pricePerKg', v)}
@@ -304,7 +333,7 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
 
           <section className="card" aria-label="עבודה">
             <h2 className="section-title">עבודה</h2>
-            <Field label="זמן עבודה" type="number" min="0" suffix="דקות" value={draft.laborMinutes} onChange={(v) => set('laborMinutes', v)} />
+            <Field label="זמן עבודה" type="number" suffix="דקות" value={draft.laborMinutes} onChange={(v) => set('laborMinutes', v)} />
           </section>
 
           <section className="card" aria-label="חומרה">
@@ -320,7 +349,7 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
             {draft.hasShipping && (
               <div className="flex flex-col gap-3" data-testid="packaging-section">
                 <LineItemsEditor lines={draft.packaging} onChange={(l) => set('packaging', l)} addLabel="הוספת פריט אריזה" itemLabel="פריט אריזה" />
-                <Field label="עלות משלוח" type="number" min="0" suffix="₪" value={draft.shippingCost} onChange={(v) => set('shippingCost', v)} />
+                <Field label="עלות משלוח" type="number" suffix="₪" value={draft.shippingCost} onChange={(v) => set('shippingCost', v)} />
               </div>
             )}
           </section>

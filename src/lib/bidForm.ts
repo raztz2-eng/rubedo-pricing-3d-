@@ -112,11 +112,12 @@ export function draftToPricingInput(d: BidDraft): PricingInput {
   }
 }
 
-/** Names of fields that contain text that is not a number (shown to the user; save is blocked). */
+/** Names of fields that are not a valid non-negative number (shown to the user; save is blocked). */
 export function invalidFields(d: BidDraft): string[] {
   const bad: string[] = []
   const check = (label: string, v: string) => {
-    if (Number.isNaN(parseNumber(v))) bad.push(label)
+    const n = parseNumber(v)
+    if (Number.isNaN(n) || n < 0) bad.push(label)
   }
   check('מחיר חומר', d.pricePerKg)
   check('דקות עבודה', d.laborMinutes)

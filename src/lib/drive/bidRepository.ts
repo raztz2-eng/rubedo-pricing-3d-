@@ -70,12 +70,20 @@ export async function findFile(store: DriveStore, folderId: string, name: string
   return found[0]
 }
 
+/** The file was read fine but its content is not valid JSON (as opposed to a Drive/network failure). */
+export class InvalidJsonError extends DriveError {
+  constructor(what: string) {
+    super(`${what}: invalid JSON`, `הקובץ ${what} פגום (JSON לא תקין).`)
+    this.name = 'InvalidJsonError'
+  }
+}
+
 async function readJson(store: DriveStore, fileId: string, what: string): Promise<unknown> {
   const text = await store.readText(fileId)
   try {
     return JSON.parse(text)
   } catch {
-    throw new DriveError(`${what}: invalid JSON`, `הקובץ ${what} פגום (JSON לא תקין).`)
+    throw new InvalidJsonError(what)
   }
 }
 
@@ -108,10 +116,20 @@ export async function saveSettings(store: DriveStore, modelsFolderId: string, se
 
 // ---------- Index / library ----------
 
+/**
+ * Reads the index cache. Returns null (→ caller rebuilds) when it is missing, not valid JSON or not an array.
+ * Drive/network errors are rethrown.
+ */
 export async function readIndex(store: DriveStore, modelsFolderId: string): Promise<IndexEntry[] | null> {
   const file = await findFile(store, modelsFolderId, INDEX_FILE_NAME)
   if (!file) return null
-  const raw = await readJson(store, file.id, INDEX_FILE_NAME)
+  let raw: unknown
+  try {
+    raw = await readJson(store, file.id, INDEX_FILE_NAME)
+  } catch (e) {
+    if (e instanceof InvalidJsonError) return null
+    throw e
+  }
   if (!Array.isArray(raw)) return null
   return raw.filter(
     (e): e is IndexEntry => !!e && typeof e.id === 'string' && typeof e.name === 'string' && typeof e.price70 === 'number',
@@ -124,7 +142,10 @@ export interface RebuildResult {
   skipped: string[]
 }
 
-/** Rebuilds the index from every `<model>/bid.json`. Folders without bid.json are ignored. */
+/**
+ * Rebuilds the index from every `<model>/bid.json`. Folders without bid.json are ignored; folders whose
+ * bid.json is corrupt are reported in `skipped`. Any Drive error aborts the rebuild WITHOUT writing the index.
+ */
 export async function rebuildIndex(store: DriveStore, modelsFolderId: string): Promise<RebuildResult> {
   const folders = await store.listChildren(modelsFolderId, { foldersOnly: true })
   const entries: IndexEntry[] = []
@@ -132,16 +153,21 @@ export async function rebuildIndex(store: DriveStore, modelsFolderId: string): P
   for (const folder of folders) {
     const bidFile = await findFile(store, folder.id, BID_FILE_NAME)
     if (!bidFile) continue
+    let raw: unknown
     try {
-      const raw = await readJson(store, bidFile.id, BID_FILE_NAME)
-      if (!isBid(raw)) {
+      raw = await readJson(store, bidFile.id, BID_FILE_NAME)
+    } catch (e) {
+      if (e instanceof InvalidJsonError) {
         skipped.push(folder.name)
         continue
       }
-      entries.push(indexEntryFromBid(folder.id, raw))
-    } catch {
-      skipped.push(folder.name)
+      throw e
     }
+    if (!isBid(raw)) {
+      skipped.push(folder.name)
+      continue
+    }
+    entries.push(indexEntryFromBid(folder.id, raw))
   }
   const sorted = sortIndex(entries)
   await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, sorted)
@@ -175,13 +201,24 @@ export interface NameCheck {
   nextRevision: { folderName: string; revision: string }
 }
 
-export async function checkName(store: DriveStore, modelsFolderId: string, name: string): Promise<NameCheck> {
+/**
+ * Is `name` used by another bid (folder name or bid name in the index)?
+ * `excludeFolderId`: the bid being edited — its own folder/entry does not count.
+ */
+export async function checkName(
+  store: DriveStore,
+  modelsFolderId: string,
+  name: string,
+  excludeFolderId?: string,
+): Promise<NameCheck> {
   const [folders, index] = await Promise.all([
     store.listChildren(modelsFolderId, { foldersOnly: true }),
     readIndex(store, modelsFolderId),
   ])
   const folderNames = folders.map((f) => f.name)
-  const taken = folderNames.some((n) => sameName(n, name)) || (index ?? []).some((e) => sameName(e.name, name))
+  const taken =
+    folders.some((f) => f.id !== excludeFolderId && sameName(f.name, name)) ||
+    (index ?? []).some((e) => e.id !== excludeFolderId && sameName(e.name, name))
   let n = 2
   while (folderNames.some((f) => sameName(f, `${name.trim()} V${n}`))) n += 1
   return { taken, nextRevision: { folderName: `${name.trim()} V${n}`, revision: `V${n}` } }
