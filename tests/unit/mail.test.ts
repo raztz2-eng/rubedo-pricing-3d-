@@ -265,3 +265,36 @@ describe('AC29.static — no Gmail endpoint other than drafts.create in src/ or 
     expect(connect).toContain('https://gmail.googleapis.com')
   })
 })
+
+// ---------------------------------------------------------------------------------------------
+describe('v0.5 fix round — Gmail failure classification', () => {
+  it('I2: 403 accessNotConfigured / SERVICE_DISABLED / "has not been used" → the Hebrew "Gmail API לא מופעל" message (not a permission prompt)', async () => {
+    const bodies = [
+      JSON.stringify({ error: { code: 403, errors: [{ reason: 'accessNotConfigured' }], message: 'Gmail API has not been used in project 123 before or it is disabled.' } }),
+      JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED', details: [{ reason: 'SERVICE_DISABLED' }] } }),
+      'Gmail API has not been used in project 1 before',
+    ]
+    for (const body of bodies) {
+      const f = vi.fn(async () => new Response(body, { status: 403 }))
+      const err = (await new GmailMailStore(tokens(), f).createDraft(MIME).catch((e: unknown) => e)) as MailError
+      expect(err.userMessage).toBe('Gmail API לא מופעל בפרויקט Google Cloud — יש להפעיל אותו ולנסות שוב')
+      expect(err.needsPermission).toBe(false)
+      expect(err.outcome).toBe('not-created')
+    }
+  })
+
+  it('M1: 5xx, network error and a 2xx with a bad body → outcome "unknown"; 4xx → "not-created"', async () => {
+    const outcome = async (f: () => Promise<Response>) =>
+      ((await new GmailMailStore(tokens(), vi.fn(f) as unknown as typeof fetch).createDraft(MIME).catch((e: unknown) => e)) as MailError).outcome
+    expect(await outcome(async () => new Response('x', { status: 500 }))).toBe('unknown')
+    expect(await outcome(async () => new Response('x', { status: 503 }))).toBe('unknown')
+    expect(
+      await outcome(async () => {
+        throw new TypeError('connection reset')
+      }),
+    ).toBe('unknown')
+    expect(await outcome(async () => new Response('not json', { status: 200 }))).toBe('unknown')
+    expect(await outcome(async () => Response.json({ nope: 1 }))).toBe('unknown')
+    for (const status of [400, 404, 413, 429]) expect(await outcome(async () => new Response('x', { status }))).toBe('not-created')
+  })
+})

@@ -119,6 +119,25 @@ function paramValue(text: string): string {
   return `"${words.join(' ')}"`
 }
 
+/** RFC 2231 / RFC 5987 extended value: UTF-8''percent-encoded (only attr-chars stay literal). */
+export function rfc2231Value(text: string): string {
+  let out = "UTF-8''"
+  for (const b of utf8(oneLine(text))) {
+    const ch = String.fromCharCode(b)
+    out += /[A-Za-z0-9!#$&+.^_`|~-]/.test(ch) ? ch : `%${b.toString(16).toUpperCase().padStart(2, '0')}`
+  }
+  return out
+}
+
+/**
+ * `filename=` as RFC 2047 words (what Gmail and most clients read) plus, for non-ASCII names, the standard
+ * RFC 2231 `filename*=` so strict clients get the Hebrew name too (M3).
+ */
+function filenameParams(name: string): string {
+  const plain = `filename=${paramValue(name)}`
+  return isPlainAscii(oneLine(name)) ? plain : `${plain};${CRLF} filename*=${rfc2231Value(name)}`
+}
+
 function mailbox(to: MimeMessageInput['to']): string {
   const email = oneLine(to.email)
   const name = oneLine(to.name ?? '')
@@ -162,7 +181,7 @@ export function buildMimeMessage(input: MimeMessageInput): string {
     part(
       [
         `Content-Type: ${oneLine(a.mimeType)}; name=${paramValue(a.filename)}`,
-        `Content-Disposition: attachment; filename=${paramValue(a.filename)}`,
+        `Content-Disposition: attachment; ${filenameParams(a.filename)}`,
         'Content-Transfer-Encoding: base64',
       ],
       base64Wrapped(a.data),

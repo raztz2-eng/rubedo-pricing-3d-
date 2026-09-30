@@ -32,8 +32,11 @@ export function defaultCustomerPrice(price70: number): number {
   return Math.ceil(price70 - 1e-9)
 }
 
+/** Printable-ASCII addresses only (M2): no Hebrew/Unicode look-alikes, no control characters, no spaces. */
 export function isValidEmail(email: string): boolean {
-  return /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[A-Za-z]{2,}$/.test(email.trim())
+  const e = email.trim()
+  if (!/^[\x21-\x7e]+$/.test(e)) return false
+  return /^[^\s@<>()[\]\\,;:"]+@[^\s@<>()[\]\\,;:"]+\.[A-Za-z]{2,}$/.test(e)
 }
 
 /** ₪1,234 for whole shekels, otherwise ₪1,234.50. */
@@ -46,13 +49,27 @@ export function quoteSubject(modelName: string): string {
   return `הצעת מחיר — ${modelName.trim()} | RUBEDO.3D`
 }
 
+/** Shown in the price line while the price field is invalid — never a 0 (I1). */
+export const PRICE_PLACEHOLDER = '[יש להזין מחיר תקין]'
+
+/**
+ * True when `body` contains the formatted customer price as a whole amount ("₪84" does not match "₪840" or "₪84.50").
+ * The draft is blocked otherwise, so the price the customer reads is always the logged `priceShown` (I1).
+ */
+export function bodyHasPrice(body: string, price: number): boolean {
+  if (!Number.isFinite(price) || price <= 0) return false
+  const formatted = formatCustomerPrice(price).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`${formatted}(?!\\d|[.,]\\d)`).test(body)
+}
+
 export interface QuoteEmailFields {
   modelName: string
   description: string
   customerName: string
   /** Names of the included hardware rows (empty → the "מה כלול" section is left out). */
   includedHardware: string[]
-  price: number
+  /** null → the price field is invalid: the price line shows PRICE_PLACEHOLDER. */
+  price: number | null
   deliveryTime: string
   note: string
   founderEmail: string
@@ -67,7 +84,8 @@ export function quoteBodyText(f: QuoteEmailFields): string {
   if (f.description.trim()) blocks.push(f.description.trim())
   const hardware = f.includedHardware.map((h) => h.trim()).filter((h) => h !== '')
   if (hardware.length > 0) blocks.push(['מה כלול:', ...hardware.map((h) => `• ${h}`)].join('\n'))
-  const priceLines = [`מחיר: ${formatCustomerPrice(f.price)}`]
+  const priceOk = f.price !== null && Number.isFinite(f.price) && f.price > 0
+  const priceLines = [`מחיר: ${priceOk ? formatCustomerPrice(f.price as number) : PRICE_PLACEHOLDER}`]
   if (f.deliveryTime.trim()) priceLines.push(`זמן אספקה: ${f.deliveryTime.trim()}`)
   blocks.push(priceLines.join('\n'))
   if (f.note.trim()) blocks.push(f.note.trim())

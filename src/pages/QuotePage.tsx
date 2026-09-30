@@ -9,12 +9,21 @@ import { writeQuoteLog } from '../lib/drive/quoteLog'
 import type { DriveFile } from '../lib/drive/types'
 import { errorMessage, logError } from '../lib/errors'
 import { isValidAmount, parseNumber } from '../lib/format'
-import { loadAttachments } from '../lib/mail/attachments'
+import { AttachmentError, loadAttachments } from '../lib/mail/attachments'
 import { buildMimeMessage } from '../lib/mail/mime'
-import { GMAIL_COMPOSE_SCOPE, GMAIL_DRAFTS_URL, GMAIL_PERMISSION_MESSAGE, MailError, type DraftResult } from '../lib/mail/types'
 import {
+  GMAIL_API_DISABLED_MESSAGE,
+  GMAIL_COMPOSE_SCOPE,
+  GMAIL_DRAFTS_URL,
+  GMAIL_PERMISSION_MESSAGE,
+  MailError,
+  type DraftResult,
+} from '../lib/mail/types'
+import {
+  bodyHasPrice,
   buildQuoteRecord,
   defaultCustomerPrice,
+  formatCustomerPrice,
   FOUNDER_EMAIL_FALLBACK,
   isValidEmail,
   quoteBodyText,
@@ -25,6 +34,12 @@ import {
   type QuoteRecord,
 } from '../lib/quote'
 import { useApp } from '../state/AppContext'
+
+/** I1: the body was edited by hand and an input changed afterwards — the typed text was NOT regenerated. */
+export const STALE_BODY_WARNING = 'התוכן נערך ידנית — המחיר/פריטים לא עודכנו'
+/** M1: after an unclear failure a draft may exist. */
+export const MAYBE_CREATED_MESSAGE = 'ייתכן שהטיוטה נוצרה — בדקו בטיוטות לפני שמנסים שוב.'
+export const NOT_CREATED_MESSAGE = 'לא נוצרה טיוטה ולא נרשם דבר.'
 
 /** "שליחת הצעת מחיר" (brief v0.5 Q3): builds a Gmail DRAFT — the Founder presses Send in Gmail himself. */
 export function QuotePageRoute() {
@@ -69,7 +84,7 @@ function QuoteLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string })
 type Phase = 'idle' | 'attachments' | 'draft' | 'log'
 
 function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: string; data: ModelFolder & { bid: NonNullable<ModelFolder['bid']> } }) {
-  const { services, grantedScopes, requestExtraPermission, recheckPermissions, accountEmail } = useApp()
+  const { services, grantedScopes, requestExtraPermission, recheckPermissions, accountEmail, markSessionLost } = useApp()
   const { bid, contents } = data
   const images = contents.images
 
@@ -86,6 +101,8 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
   })
   const [subjectOverride, setSubjectOverride] = useState<string | null>(null)
   const [bodyOverride, setBodyOverride] = useState<string | null>(null)
+  /** The inputs at the moment the body was first edited by hand (I1 stale-content warning). */
+  const [overrideInputs, setOverrideInputs] = useState<string | null>(null)
   const [phase, setPhase] = useState<Phase>('idle')
   const [error, setError] = useState<string | null>(null)
   const [showErrors, setShowErrors] = useState(false)
@@ -107,13 +124,24 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
     description: bid.description,
     customerName,
     includedHardware: includedNames,
-    price: priceOk ? price : 0,
+    // I1: never a 0 — an invalid price shows a placeholder (and blocks the draft).
+    price: priceOk ? price : null,
     deliveryTime,
     note,
     founderEmail,
   })
   const subject = subjectOverride ?? quoteSubject(bid.name)
   const body = bodyOverride ?? generatedBody
+  const inputsKey = JSON.stringify([included, priceOk ? price : null, customerName, deliveryTime, note])
+  const bodyStale = bodyOverride !== null && overrideInputs !== null && overrideInputs !== inputsKey
+  const formattedPrice = priceOk ? formatCustomerPrice(price) : ''
+  // I1: what the customer reads must contain exactly the price that is logged as priceShown.
+  const priceInBody = priceOk && bodyHasPrice(body, price)
+  const priceBlock = !priceOk
+    ? 'המחיר ללקוח אינו תקין — יש להזין מחיר גדול מ-0 כדי ליצור טיוטה.'
+    : !priceInBody
+      ? `תוכן המייל אינו כולל את המחיר ללקוח (${formattedPrice}). עדכנו את התוכן או לחצו „שחזור הנוסח האוטומטי”.`
+      : null
 
   const gmailGranted = !permissionDenied && (grantedScopes === null || grantedScopes.includes(GMAIL_COMPOSE_SCOPE))
 
@@ -130,7 +158,6 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
   const problems: string[] = []
   if (customerName.trim() === '') problems.push('יש להזין שם לקוח.')
   if (!isValidEmail(customerEmail)) problems.push('כתובת המייל של הלקוח אינה תקינה.')
-  if (!priceOk) problems.push('המחיר ללקוח אינו תקין.')
   if (subject.trim() === '') problems.push('יש להזין נושא.')
   if (body.trim() === '') problems.push('תוכן המייל ריק.')
   if (!services.mail) problems.push('חיבור ל-Gmail אינו זמין במצב הזה.')
@@ -155,7 +182,7 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
 
   const onCreate = async () => {
     setShowErrors(true)
-    if (busy || problems.length > 0 || !gmailGranted || !services.mail) return
+    if (busy || problems.length > 0 || priceBlock || !gmailGranted || !services.mail) return
     setError(null)
     let created: DraftResult
     let attachmentNames: string[]
@@ -175,7 +202,13 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
     } catch (e) {
       logError('create quote draft', e)
       if (e instanceof MailError && e.needsPermission) setPermissionDenied(true)
-      setError(`${errorMessage(e, 'יצירת הטיוטה נכשלה.')} לא נוצרה טיוטה ולא נרשם דבר.`)
+      // M5: /api/thumb said the session is gone → "needs reconnect" (the page and the form stay).
+      if (e instanceof AttachmentError && e.sessionGone) markSessionLost()
+      const msg = errorMessage(e, 'יצירת הטיוטה נכשלה.')
+      if (e instanceof MailError && e.userMessage === GMAIL_API_DISABLED_MESSAGE) setError(msg)
+      // M1: 5xx / network / unreadable 2xx → a draft may exist; only a refusal or a failure before sending is "not created".
+      else if (e instanceof MailError && e.outcome === 'unknown') setError(`${msg} ${MAYBE_CREATED_MESSAGE} לא נרשם דבר ב-Drive.`)
+      else setError(`${msg} ${NOT_CREATED_MESSAGE}`)
       setPhase('idle')
       return
     }
@@ -279,6 +312,9 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
             <Field
               label="מייל הלקוח"
               required
+              dir="ltr"
+              inputMode="email"
+              autoComplete="off"
               value={customerEmail}
               onChange={setCustomerEmail}
               hint={showErrors && !isValidEmail(customerEmail) ? 'כתובת מייל לא תקינה' : undefined}
@@ -289,7 +325,7 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
               suffix="₪"
               value={priceText ?? String(Number.isFinite(autoPrice) ? autoPrice : '')}
               onChange={(v) => setPriceText(v)}
-              hint={!priceOk ? 'מחיר לא תקין' : undefined}
+              hint={!priceOk ? 'מחיר לא תקין — המייל יציג מקום ריק למחיר עד שיוזן מחיר' : undefined}
             />
             {priceText !== null && (
               <button type="button" className="self-start text-sm text-accent underline" onClick={() => setPriceText(null)}>
@@ -350,19 +386,36 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
             </div>
             <div className="flex flex-col gap-1">
               <label htmlFor="quote-body">עריכת תוכן המייל</label>
-              <textarea id="quote-body" rows={10} dir="rtl" value={body} onChange={(e) => setBodyOverride(e.target.value)} />
+              <textarea
+                id="quote-body"
+                rows={10}
+                dir="rtl"
+                value={body}
+                onChange={(e) => {
+                  if (bodyOverride === null) setOverrideInputs(inputsKey)
+                  setBodyOverride(e.target.value)
+                }}
+              />
             </div>
             {(bodyOverride !== null || subjectOverride !== null) && (
-              <button
-                type="button"
-                className="self-start text-sm text-accent underline"
-                onClick={() => {
-                  setBodyOverride(null)
-                  setSubjectOverride(null)
-                }}
-              >
-                שחזור הנוסח האוטומטי
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className="text-sm text-accent underline"
+                  onClick={() => {
+                    setBodyOverride(null)
+                    setSubjectOverride(null)
+                    setOverrideInputs(null)
+                  }}
+                >
+                  שחזור הנוסח האוטומטי
+                </button>
+                {bodyStale && (
+                  <span role="status" className="rounded bg-amber-50 px-2 py-0.5 text-sm text-amber-900" data-testid="stale-body-warning">
+                    {STALE_BODY_WARNING}
+                  </span>
+                )}
+              </div>
             )}
           </section>
         </div>
@@ -405,10 +458,15 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
               type="button"
               className="btn btn-primary"
               onClick={() => void onCreate()}
-              disabled={busy || !gmailGranted || !!draft}
+              disabled={busy || !gmailGranted || !!draft || priceBlock !== null}
             >
               {phase === 'attachments' ? 'מכין תמונות…' : phase === 'draft' ? 'יוצר טיוטה…' : phase === 'log' ? 'רושם הצעה…' : 'צור טיוטה ב-Gmail'}
             </button>
+          )}
+          {priceBlock && !draft && (
+            <Notice tone="warn">
+              <span data-testid="price-block">{priceBlock}</span>
+            </Notice>
           )}
           {showErrors && problems.length > 0 && (
             <ErrorBox>

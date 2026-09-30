@@ -31,6 +31,8 @@ export interface AuthLike {
   reconnect?(): void
   /** After the popup: fetch a new token so newly granted scopes are known. Optional. */
   recheck?(): Promise<void>
+  /** A same-origin API call (e.g. /api/thumb) answered 401: switch to "needs reconnect" (M5). Optional. */
+  onUnauthorized?(): void
   signOut(): void
   subscribe(listener: (signedIn: boolean) => void): () => void
 }
@@ -91,6 +93,8 @@ export class MemoryAuth implements AuthLike {
   private listeners = new Set<(signedIn: boolean) => void>()
   /** How many times the sign-in popup was opened. */
   reconnectCalls = 0
+  /** How many times a 401 was reported (demo session never expires). */
+  unauthorizedCalls = 0
 
   constructor(options: { scopes?: string[] | null; email?: string | null } = {}) {
     this.granted = options.scopes === undefined ? [DRIVE_SCOPE, GMAIL_COMPOSE_SCOPE] : options.scopes
@@ -106,6 +110,9 @@ export class MemoryAuth implements AuthLike {
   reconnect(): void {
     this.reconnectCalls += 1
     this.popupOpened = true
+  }
+  onUnauthorized(): void {
+    this.unauthorizedCalls += 1
   }
   async recheck(): Promise<void> {
     if (this.popupOpened && this.granted && !this.granted.includes(GMAIL_COMPOSE_SCOPE)) {

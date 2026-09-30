@@ -1,11 +1,12 @@
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { App } from '../../src/App'
 import { BID_FILE_NAME, FOLDER_MIME, type HardwareLine } from '../../src/lib/bid'
 import { newSaveSession, saveNewBid } from '../../src/lib/drive/bidRepository'
 import { MemoryDrive } from '../../src/lib/drive/memoryDrive'
+import { MemoryAuth } from '../../src/state/services'
 import { MemoryMail } from '../../src/lib/mail/memoryMail'
 import { computePrice, DEFAULT_PRICING_SETTINGS } from '../../src/lib/pricing'
 import { createMemoryServices, type AppServices } from '../../src/state/services'
@@ -169,7 +170,7 @@ describe('Quote screen (Q3)', () => {
     expect(drive.writeLog.filter((w) => w.includes(BID_FILE_NAME))).toEqual(['upload:bid.json'])
   })
 
-  it('AC30: draft fails → Hebrew error and NOTHING written to Drive', async () => {
+  it('AC30 + M1: Gmail refused (4xx) → "לא נוצרה טיוטה"; unclear failure (5xx/network) → "ייתכן שהטיוטה נוצרה"; NOTHING written to Drive either way', async () => {
     const user = userEvent.setup()
     const mail = new MemoryMail()
     const { drive, services, folderId } = await setup({ mail })
@@ -177,9 +178,17 @@ describe('Quote screen (Q3)', () => {
     await user.type(await screen.findByLabelText(/שם הלקוח/), 'דנה')
     await user.type(customerEmail(), 'dana@example.com')
     const writesBefore = drive.writeLog.length
-    mail.failNext()
+
+    mail.failNext('rejected')
     await user.click(screen.getByRole('button', { name: 'צור טיוטה ב-Gmail' }))
     expect(await screen.findByText(/לא נוצרה טיוטה ולא נרשם דבר/)).toBeTruthy()
+    expect(screen.queryByText(/ייתכן שהטיוטה נוצרה/)).toBeNull()
+
+    mail.failNext('network')
+    await user.click(screen.getByRole('button', { name: 'צור טיוטה ב-Gmail' }))
+    expect(await screen.findByText(/ייתכן שהטיוטה נוצרה — בדקו בטיוטות לפני שמנסים שוב/)).toBeTruthy()
+    expect(screen.queryByText(/לא נוצרה טיוטה/)).toBeNull()
+
     expect(mail.drafts).toHaveLength(0)
     expect(drive.writeLog.length).toBe(writesBefore)
     expect(await quotesFolder(drive, folderId)).toBeUndefined()
@@ -222,14 +231,15 @@ describe('Quote screen (Q3)', () => {
     const subject = screen.getByLabelText('נושא')
     await user.clear(subject)
     await user.type(subject, 'הצעה מיוחדת')
+    const price = priceInput().value
     const body = screen.getByLabelText('עריכת תוכן המייל')
     await user.clear(body)
-    await user.type(body, 'טקסט חופשי')
+    await user.type(body, `טקסט חופשי — מחיר: ₪${price}`)
     await user.click(screen.getByRole('button', { name: 'צור טיוטה ב-Gmail' }))
     await screen.findByTestId('draft-success')
     const msg = readQuoteMessage(services.mail.drafts[0].raw)
     expect(msg.subject).toBe('הצעה מיוחדת')
-    expect(msg.text).toBe('טקסט חופשי')
+    expect(msg.text).toBe(`טקסט חופשי — מחיר: ₪${price}`)
   })
 
   it('attachments over 20 MB → Hebrew error, no draft, nothing written', async () => {
@@ -326,5 +336,139 @@ describe('Bid form: "כלול במחיר" per hardware row (Q1, AC25)', () => {
     expect(bid.schemaVersion).toBe(2)
     expect(bid.hardware).toEqual([{ name: 'Plant', qty: 1, unitCost: 20, included: false }])
     expect(bid.result.hardware).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+// v0.5 fix round
+
+describe('I1 — never a frozen or zero price', () => {
+  it('invalid price → placeholder in the price line (never ₪0), draft button disabled with a Hebrew reason', async () => {
+    const user = userEvent.setup()
+    const { services, folderId } = await setup()
+    renderApp(services, `/model/${folderId}/quote`)
+    await user.type(await screen.findByLabelText(/שם הלקוח/), 'דנה')
+    await user.type(customerEmail(), 'dana@example.com')
+    for (const bad of ['abc', '0', '1,5']) {
+      await user.clear(priceInput())
+      await user.type(priceInput(), bad)
+      const preview = screen.getByTestId('email-preview').textContent ?? ''
+      expect(preview).toContain('מחיר: [יש להזין מחיר תקין]')
+      expect(preview).not.toMatch(/₪0(?![\d.])/)
+      expect((screen.getByRole('button', { name: 'צור טיוטה ב-Gmail' }) as HTMLButtonElement).disabled).toBe(true)
+      expect(screen.getByTestId('price-block').textContent).toMatch(/המחיר ללקוח אינו תקין/)
+    }
+    expect(services.mail.drafts).toHaveLength(0)
+  })
+
+  it('manual body edit, then an input changes → warning next to "שחזור הנוסח האוטומטי"; reset clears it', async () => {
+    const user = userEvent.setup()
+    const { services, folderId } = await setup()
+    renderApp(services, `/model/${folderId}/quote`)
+    const body = (await screen.findByLabelText('עריכת תוכן המייל')) as HTMLTextAreaElement
+    await user.type(body, ' תודה!')
+    expect(screen.queryByTestId('stale-body-warning')).toBeNull()
+    // Each kind of input change triggers the warning.
+    for (const change of [
+      () => user.click(screen.getByRole('checkbox', { name: /צמח פוטוס/ })),
+      async () => {
+        await user.clear(priceInput())
+        await user.type(priceInput(), '99')
+      },
+      () => user.type(customerName(), 'X'),
+      () => user.type(screen.getByLabelText(/זמן אספקה/), 'X'),
+      () => user.type(screen.getByLabelText(/הערה/), 'X'),
+    ]) {
+      await user.click(screen.getByRole('button', { name: 'שחזור הנוסח האוטומטי' }))
+      await user.type(screen.getByLabelText('עריכת תוכן המייל'), ' ערוך')
+      expect(screen.queryByTestId('stale-body-warning')).toBeNull()
+      await change()
+      const warning = screen.getByTestId('stale-body-warning')
+      expect(warning.textContent).toBe('התוכן נערך ידנית — המחיר/פריטים לא עודכנו')
+      expect(warning.parentElement?.textContent).toContain('שחזור הנוסח האוטומטי')
+    }
+    await user.click(screen.getByRole('button', { name: 'שחזור הנוסח האוטומטי' }))
+    expect(screen.queryByTestId('stale-body-warning')).toBeNull()
+  })
+
+  it('edited body without the exact price → blocked with a Hebrew reason; the logged priceShown = the price in the sent body', async () => {
+    const user = userEvent.setup()
+    const { drive, services, folderId } = await setup()
+    renderApp(services, `/model/${folderId}/quote`)
+    await user.type(await screen.findByLabelText(/שם הלקוח/), 'דנה')
+    await user.type(customerEmail(), 'dana@example.com')
+    await user.clear(priceInput())
+    await user.type(priceInput(), '150')
+    const body = screen.getByLabelText('עריכת תוכן המייל')
+    // Freeze the body, then change the price: the body still says ₪150.
+    await user.type(body, ' ')
+    await user.clear(priceInput())
+    await user.type(priceInput(), '1500')
+    expect(screen.getByTestId('stale-body-warning')).toBeTruthy()
+    // "₪150" is in the text, but ₪1,500 is not → blocked ("₪150" never matches "₪1500" / "₪150.5" either).
+    expect((screen.getByRole('button', { name: 'צור טיוטה ב-Gmail' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByTestId('price-block').textContent).toContain('תוכן המייל אינו כולל את המחיר ללקוח (₪1,500)')
+
+    await user.click(screen.getByRole('button', { name: 'שחזור הנוסח האוטומטי' }))
+    await user.click(screen.getByRole('button', { name: 'צור טיוטה ב-Gmail' }))
+    await screen.findByTestId('draft-success')
+    const msg = readQuoteMessage(services.mail.drafts[0].raw)
+    expect(msg.text).toContain('מחיר: ₪1,500')
+    const q = await quotesFolder(drive, folderId)
+    const [log] = await drive.listChildren(q?.id as string)
+    expect(JSON.parse(await drive.readText(log.id)).priceShown).toBe(1500)
+  })
+})
+
+describe('I2 — Gmail API not enabled in the Cloud project', () => {
+  it('shows the Hebrew setup message; no draft, nothing written; not the permission prompt', async () => {
+    const user = userEvent.setup()
+    const mail = new MemoryMail()
+    const { drive, services, folderId } = await setup({ mail })
+    renderApp(services, `/model/${folderId}/quote`)
+    await user.type(await screen.findByLabelText(/שם הלקוח/), 'דנה')
+    await user.type(customerEmail(), 'dana@example.com')
+    const writes = drive.writeLog.length
+    mail.failNext('api-disabled')
+    await user.click(screen.getByRole('button', { name: 'צור טיוטה ב-Gmail' }))
+    expect(await screen.findByText('Gmail API לא מופעל בפרויקט Google Cloud — יש להפעיל אותו ולנסות שוב')).toBeTruthy()
+    expect(screen.queryByTestId('gmail-permission')).toBeNull()
+    expect(drive.writeLog.length).toBe(writes)
+  })
+})
+
+describe('M5 — /api/thumb 401 while attaching → needs reconnect', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('reports the lost session (onUnauthorized), shows a Hebrew error, keeps the form, creates no draft', async () => {
+    const user = userEvent.setup()
+    const { services, folderId } = await setup()
+    // A drive that serves images by URL, like the real store (/api/thumb).
+    const drive = services.drive
+    const urlDrive = Object.assign(Object.create(Object.getPrototypeOf(drive)) as MemoryDrive, drive, {
+      thumbnailUrl: (id: string, size: number) => `/api/thumb?id=${id}&s=${size}`,
+    })
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: 'no_session' }), { status: 401 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const auth = services.auth as MemoryAuth
+    renderApp({ ...services, drive: urlDrive }, `/model/${folderId}/quote`)
+    await user.type(await screen.findByLabelText(/שם הלקוח/), 'דנה')
+    await user.type(customerEmail(), 'dana@example.com')
+    await user.click(screen.getByRole('button', { name: 'צור טיוטה ב-Gmail' }))
+    expect(await screen.findByText(/פג תוקף ההתחברות ל-Google/)).toBeTruthy()
+    expect(auth.unauthorizedCalls).toBe(1)
+    expect(fetchMock.mock.calls.some((c) => String((c as unknown[])[0]).startsWith('/api/thumb?') && String((c as unknown[])[0]).includes('s=1600'))).toBe(true)
+    expect(services.mail.drafts).toHaveLength(0)
+    expect((customerName() as HTMLInputElement).value).toBe('דנה')
+  })
+})
+
+describe('M7 — customer e-mail field is LTR', () => {
+  it('dir="ltr" (and an e-mail keyboard)', async () => {
+    const { services, folderId } = await setup()
+    renderApp(services, `/model/${folderId}/quote`)
+    const email = (await screen.findByLabelText(/מייל הלקוח/)) as HTMLInputElement
+    expect(email.getAttribute('dir')).toBe('ltr')
+    expect(email.getAttribute('inputmode')).toBe('email')
   })
 })

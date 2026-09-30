@@ -5,6 +5,7 @@ import {
   buildMimeMessage,
   encodeHeaderText,
   encodedWords,
+  rfc2231Value,
   type MimeMessageInput,
 } from '../../src/lib/mail/mime'
 import { decodeBase64Body, decodeWords, mediaType, multipartChildren, param, parsePart, splitHead } from './mimeReader'
@@ -160,5 +161,17 @@ describe('buildMimeMessage (AC28)', () => {
     const a = parsePart(buildMimeMessage(input({ boundarySeed: undefined })))
     const b = parsePart(buildMimeMessage(input({ boundarySeed: undefined })))
     expect(a.headers.get('content-type')).not.toBe(b.headers.get('content-type'))
+  })
+
+  it('M3: non-ASCII attachment names also carry RFC 2231 filename*=UTF-8\'\'…, on a folded line; ASCII names do not', () => {
+    const top = parsePart(raw)
+    const mixed = multipartChildren(top.body, param(top.headers.get('content-type') as string, 'boundary') as string)
+    const disp = mixed[1].headers.get('content-disposition') as string
+    const ext = /filename\*=UTF-8''([A-Za-z0-9!#$&+.^_`|~%-]+)/.exec(disp)
+    expect(ext).not.toBeNull()
+    expect(decodeURIComponent((ext as RegExpExecArray)[1])).toBe('תמונה ראשית.jpg')
+    expect(raw).toMatch(/Content-Disposition: attachment; filename="=\?UTF-8\?B\?[^\r]+;\r\n filename\*=UTF-8''/)
+    expect(mixed[2].headers.get('content-disposition')).toBe('attachment; filename="plate-1.png"')
+    expect(rfc2231Value("a b'(c).jpg")).toBe("UTF-8''a%20b%27%28c%29.jpg")
   })
 })

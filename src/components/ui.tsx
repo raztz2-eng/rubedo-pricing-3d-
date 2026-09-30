@@ -45,13 +45,32 @@ interface FieldProps {
   inputRef?: React.Ref<HTMLInputElement>
   disabled?: boolean
   hint?: string
+  /** Text direction of the input; number fields are always LTR. */
+  dir?: 'ltr' | 'rtl'
+  inputMode?: 'text' | 'email' | 'decimal'
+  autoComplete?: string
 }
 
 /**
  * Labelled input. `type="number"` renders a text input with a decimal keyboard: the raw text is kept, so a
  * malformed entry (e.g. "1,5,2") is flagged by validation instead of the browser silently turning it into "".
  */
-export function Field({ label, value, onChange, type = 'text', suffix, placeholder, required, className = '', inputRef, disabled, hint }: FieldProps) {
+export function Field({
+  label,
+  value,
+  onChange,
+  type = 'text',
+  suffix,
+  placeholder,
+  required,
+  className = '',
+  inputRef,
+  disabled,
+  hint,
+  dir,
+  inputMode,
+  autoComplete,
+}: FieldProps) {
   const id = useId()
   return (
     <div className={`flex min-w-0 flex-col gap-1 ${className}`}>
@@ -64,9 +83,9 @@ export function Field({ label, value, onChange, type = 'text', suffix, placehold
           id={id}
           ref={inputRef}
           type="text"
-          inputMode={type === 'number' ? 'decimal' : undefined}
-          autoComplete={type === 'number' ? 'off' : undefined}
-          dir={type === 'number' ? 'ltr' : undefined}
+          inputMode={type === 'number' ? 'decimal' : inputMode}
+          autoComplete={type === 'number' ? 'off' : autoComplete}
+          dir={type === 'number' ? 'ltr' : dir}
           disabled={disabled}
           aria-describedby={hint ? `${id}-hint` : undefined}
           className="w-full"

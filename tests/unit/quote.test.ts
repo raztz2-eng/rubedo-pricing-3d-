@@ -3,7 +3,9 @@ import type { Bid } from '../../src/lib/bid'
 import { formatMoney } from '../../src/lib/format'
 import { computePrice, DEFAULT_PRICING_SETTINGS, type PricingSettings } from '../../src/lib/pricing'
 import {
+  bodyHasPrice,
   buildQuoteRecord,
+  PRICE_PLACEHOLDER,
   defaultCustomerPrice,
   formatCustomerPrice,
   isValidEmail,
@@ -248,5 +250,36 @@ describe('quote log record (Q4)', () => {
   it('file name quote-YYYYMMDD-HHmm.json (local time)', () => {
     expect(quoteFileName(new Date(2026, 9, 1, 9, 5))).toBe('quote-20261001-0905.json')
     expect(quoteFileName(new Date(2026, 0, 31, 23, 59))).toBe('quote-20260131-2359.json')
+  })
+})
+
+describe('v0.5 fix round', () => {
+  it('M2: only printable-ASCII e-mail addresses', () => {
+    for (const bad of ['דנה@example.com', 'dana@דוגמה.co.il', 'dаna@example.com' /* Cyrillic а */, 'dana@example.com‏', 'da\tna@example.com'])
+      expect(isValidEmail(bad)).toBe(false)
+    expect(isValidEmail('first.last+tag@sub.example.co.il')).toBe(true)
+  })
+
+  it('I1: the price line shows a placeholder (never ₪0) when the price is invalid', () => {
+    const base = { modelName: 'M', description: '', customerName: 'דנה', includedHardware: [], deliveryTime: '', note: '', founderEmail: 'raztz2@gmail.com' }
+    for (const price of [null, 0, NaN, -5]) {
+      const t = quoteBodyText({ ...base, price })
+      expect(t).toContain(`מחיר: ${PRICE_PLACEHOLDER}`)
+      expect(t).not.toContain('₪0')
+    }
+  })
+
+  it('I1: bodyHasPrice matches the exact formatted amount only', () => {
+    expect(bodyHasPrice('מחיר: ₪84', 84)).toBe(true)
+    expect(bodyHasPrice('מחיר: ₪84.', 84)).toBe(true)
+    expect(bodyHasPrice('מחיר: ₪84, כולל מע״מ', 84)).toBe(true)
+    expect(bodyHasPrice('מחיר: ₪840', 84)).toBe(false)
+    expect(bodyHasPrice('מחיר: ₪84.50', 84)).toBe(false)
+    expect(bodyHasPrice('מחיר: ₪84,000', 84)).toBe(false)
+    expect(bodyHasPrice('מחיר: 84', 84)).toBe(false)
+    expect(bodyHasPrice('מחיר: ₪1,500', 1500)).toBe(true)
+    expect(bodyHasPrice('מחיר: ₪1500', 1500)).toBe(false)
+    expect(bodyHasPrice('מחיר: ₪84.50', 84.5)).toBe(true)
+    expect(bodyHasPrice('מחיר: ₪0', 0)).toBe(false)
   })
 })

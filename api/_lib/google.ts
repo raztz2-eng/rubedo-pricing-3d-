@@ -24,7 +24,8 @@ export interface TokenResponse {
 }
 
 export type RefreshResult =
-  | { ok: true; accessToken: string; expiresIn: number; refreshToken?: string; scopes: string[] }
+    /** `scopes` only when Google's answer had a `scope` field (M4: unknown ≠ none). */
+  | { ok: true; accessToken: string; expiresIn: number; refreshToken?: string; scopes?: string[] }
   /** `revoked`: Google says the refresh token is no longer valid → the session is gone. Otherwise: temporary. */
   | { ok: false; revoked: boolean; status: number }
 
@@ -86,7 +87,7 @@ export async function refreshAccessToken(
     ok: true,
     accessToken: body.access_token,
     expiresIn: Number(body.expires_in ?? 3600),
-    scopes: splitScopes(body.scope),
+    ...(typeof body.scope === 'string' ? { scopes: splitScopes(body.scope) } : {}),
     ...(body.refresh_token ? { refreshToken: body.refresh_token } : {}),
   }
 }

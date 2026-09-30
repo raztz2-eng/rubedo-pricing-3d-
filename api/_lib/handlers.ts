@@ -268,7 +268,7 @@ async function mintAccessToken(req: Request, deps: Deps, cfg: ServerConfig): Pro
     accessToken: r.accessToken,
     expiresIn: r.expiresIn,
     session,
-    scopes: r.scopes,
+    ...(r.scopes ? { scopes: r.scopes } : {}),
     ...(r.refreshToken ? { newRefreshToken: r.refreshToken } : {}),
   }
 }
@@ -287,7 +287,12 @@ export async function handleToken(req: Request, deps: Deps): Promise<Response> {
     ? { 'Set-Cookie': sessionCookie({ ...t.session, rt: t.newRefreshToken }, cfg.config.clientSecret) }
     : {}
   // v0.5 Q5: the SPA learns which permissions this session has (e.g. gmail.compose missing on older sessions).
-  return json(200, { access_token: t.accessToken, expires_in: t.expiresIn, email: t.session.email, scopes: t.scopes ?? [] }, headers)
+  // M4: when Google did not report the scopes, `scopes` is omitted (unknown) — never [] (which would mean "none").
+  return json(
+    200,
+    { access_token: t.accessToken, expires_in: t.expiresIn, email: t.session.email, ...(t.scopes ? { scopes: t.scopes } : {}) },
+    headers,
+  )
 }
 
 // ---------------------------------------------------------------------------------------------

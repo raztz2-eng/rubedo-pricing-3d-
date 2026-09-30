@@ -23,6 +23,8 @@ export interface AppState {
   requestExtraPermission: () => void
   /** After the popup: refresh the session so newly granted scopes are known. */
   recheckPermissions: () => Promise<void>
+  /** A same-origin API call answered 401 (session gone): switch to "needs reconnect", pages stay mounted (M5). */
+  markSessionLost: () => void
   /** I2: the settings file of the CURRENT folder was just created (one-time notice until dismissed). */
   settingsJustCreated: boolean
   /** How it was created: from defaults, or copied from an old unmarked settings file. */
@@ -135,6 +137,10 @@ export function AppProvider({ services, children }: { services: AppServices; chi
     await services.auth?.recheck?.()
   }, [services.auth])
 
+  const markSessionLost = useCallback(() => {
+    services.auth?.onUnauthorized?.()
+  }, [services.auth])
+
   const signOut = useCallback(() => {
     services.auth?.signOut()
   }, [services.auth])
@@ -172,6 +178,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       grantedScopes,
       requestExtraPermission,
       recheckPermissions,
+      markSessionLost,
       settingsJustCreated,
       settingsCreatedFrom,
       dismissSettingsCreated,
@@ -187,7 +194,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       reloadSettings,
       saveSettings,
     }),
-    [services, signedIn, needsReconnect, sessionActive, authChecking, authError, accountEmail, grantedScopes, requestExtraPermission, recheckPermissions, settingsJustCreated, settingsCreatedFrom, dismissSettingsCreated, folderId, settings, settingsFolderId, settingsLoading, settingsError, signIn, retrySession, signOut, pickFolder, reloadSettings, saveSettings],
+    [services, signedIn, needsReconnect, sessionActive, authChecking, authError, accountEmail, grantedScopes, requestExtraPermission, recheckPermissions, markSessionLost, settingsJustCreated, settingsCreatedFrom, dismissSettingsCreated, folderId, settings, settingsFolderId, settingsLoading, settingsError, signIn, retrySession, signOut, pickFolder, reloadSettings, saveSettings],
   )
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>

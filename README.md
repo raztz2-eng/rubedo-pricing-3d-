@@ -26,8 +26,13 @@ See `.env.example`. In Vercel (Project → Settings → Environment Variables):
 - `GOOGLE_CLIENT_SECRET` — **new, required**, mark as Sensitive. The Founder adds it; agents never handle it.
 - `ALLOWED_EMAIL` — optional (default `raztz2@gmail.com`); `GOOGLE_CLIENT_ID` — optional (default `VITE_GOOGLE_CLIENT_ID`).
 
-In Google Cloud Console (v0.5, free): **APIs & Services → Library → enable "Gmail API"**, and add the scope
-`https://www.googleapis.com/auth/gmail.compose` to the OAuth consent screen (Data access / Scopes).
+**Founder setup for the quote e-mail (v0.5, free — both steps are needed, in the same Google Cloud project as the
+OAuth client):**
+1. **Enable the Gmail API:** Google Cloud Console → APIs & Services → Library → search "Gmail API" → **Enable**.
+   Without it, creating a draft fails with "Gmail API לא מופעל בפרויקט Google Cloud — יש להפעיל אותו ולנסות שוב".
+2. **Add the scope:** Google Auth Platform → **Data Access** → "Add or remove scopes" → add
+   `https://www.googleapis.com/auth/gmail.compose` → Save. Then, in the app, open a quote screen and click
+   "אישור הרשאה ל-Gmail" once (sessions from before v0.5 do not have this permission yet).
 
 In Google Cloud Console → the OAuth client → **Authorized redirect URIs**, add (exact match, no wildcards):
 - the production domain: `https://<production-domain>/api/auth/callback`

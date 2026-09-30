@@ -27,17 +27,37 @@ export interface MailStore {
 /** Plain-Hebrew message when the session lacks gmail.compose (v0.5 Q5). */
 export const GMAIL_PERMISSION_MESSAGE = 'נדרש אישור נוסף ל-Gmail'
 
-/** Error thrown by a MailStore; `userMessage` is plain Hebrew. `needsPermission`: the Gmail scope is missing. */
+/** I2: the Gmail API is not enabled in the Google Cloud project (a Founder setup step). */
+export const GMAIL_API_DISABLED_MESSAGE = 'Gmail API לא מופעל בפרויקט Google Cloud — יש להפעיל אותו ולנסות שוב'
+
+/**
+ * Whether a draft may exist after a failure (M1):
+ *  - `not-created`: Gmail refused the request (4xx) or it was never sent → safe to retry;
+ *  - `unknown`: 5xx, network error, or a 2xx answer we could not read → a draft MAY exist; check Drafts first.
+ */
+export type DraftOutcome = 'not-created' | 'unknown'
+
+export interface MailErrorOptions {
+  status?: number
+  /** The session lacks gmail.compose (Q5). */
+  needsPermission?: boolean
+  /** Default `not-created`. */
+  outcome?: DraftOutcome
+}
+
+/** Error thrown by a MailStore; `userMessage` is plain Hebrew. */
 export class MailError extends Error {
   readonly status?: number
   readonly userMessage: string
   readonly needsPermission: boolean
+  readonly outcome: DraftOutcome
 
-  constructor(message: string, userMessage: string, status?: number, needsPermission = false) {
+  constructor(message: string, userMessage: string, options: MailErrorOptions = {}) {
     super(message)
     this.name = 'MailError'
-    this.status = status
+    this.status = options.status
     this.userMessage = userMessage
-    this.needsPermission = needsPermission
+    this.needsPermission = options.needsPermission ?? false
+    this.outcome = options.outcome ?? 'not-created'
   }
 }

@@ -321,13 +321,13 @@ describe('GET /api/auth/callback', () => {
 
 // ---------------------------------------------------------------------------------------------
 describe('POST /api/auth/token (AC20)', () => {
-  it('valid session → {access_token, expires_in, email, scopes}, no-store; refreshes with the stored refresh token', async () => {
+  it('valid session → {access_token, expires_in, email[, scopes]}, no-store; refreshes with the stored refresh token', async () => {
     const { deps, g } = makeDeps()
     const res = await handleToken(req('/api/auth/token', { method: 'POST', cookie: validSessionCookie(), origin: ORIGIN }), deps)
     expect(res.status).toBe(200)
     expect(res.headers.get('Cache-Control')).toBe('no-store')
-    // The scripted refresh answer has no `scope` field → an empty list (never undefined).
-    expect(await res.json()).toEqual({ access_token: 'fake-access-fresh', expires_in: 3599, email: EMAIL, scopes: [] })
+    // M4: the scripted refresh answer has no `scope` field → `scopes` omitted (unknown), never [] ("none").
+    expect(await res.json()).toEqual({ access_token: 'fake-access-fresh', expires_in: 3599, email: EMAIL })
     const call = g.calls[0]
     expect(call.url).toBe('https://oauth2.googleapis.com/token')
     expect(new URLSearchParams(call.body).get('refresh_token')).toBe(RT)

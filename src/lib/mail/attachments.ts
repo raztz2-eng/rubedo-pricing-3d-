@@ -16,10 +16,13 @@ const EXT: Record<string, string> = { 'image/jpeg': 'jpg', 'image/png': 'png', '
 
 export class AttachmentError extends Error {
   readonly userMessage: string
-  constructor(message: string, userMessage: string) {
+  /** The thumbnail proxy answered 401: the session is gone → the app switches to "needs reconnect" (M5). */
+  readonly sessionGone: boolean
+  constructor(message: string, userMessage: string, sessionGone = false) {
     super(message)
     this.name = 'AttachmentError'
     this.userMessage = userMessage
+    this.sessionGone = sessionGone
   }
 }
 
@@ -39,7 +42,8 @@ export function assertTotalSize(attachments: readonly { data: Uint8Array }[]): v
 
 /** "IMG_0042.HEIC" + image/jpeg → "IMG_0042.jpg" (the file name matches what is really attached). */
 export function attachmentFileName(name: string, mimeType: string): string {
-  const base = name.trim().replace(/\.[A-Za-z0-9]{1,5}$/, '') || 'photo'
+  // Capped so the encoded Content-Disposition header stays well under the 998-char line limit.
+  const base = [...(name.trim().replace(/\.[A-Za-z0-9]{1,5}$/, '') || 'photo')].slice(0, 60).join('')
   return `${base}.${EXT[mimeType] ?? 'jpg'}`
 }
 
@@ -60,7 +64,7 @@ async function fetchImage(fetchImpl: typeof fetch, url: string, file: DriveFile)
     throw new AttachmentError(`attachment network error: ${String(e)}`, 'אין חיבור לשרת. בדקו את החיבור לאינטרנט ונסו שוב.')
   }
   if (res.status === 401) {
-    throw new AttachmentError('attachment 401', 'פג תוקף ההתחברות ל-Google. התחברו מחדש ונסו שוב.')
+    throw new AttachmentError('attachment 401', 'פג תוקף ההתחברות ל-Google. התחברו מחדש ונסו שוב.', true)
   }
   if (res.status === 404) {
     throw new AttachmentError('attachment 404', `לתמונה „${file.name}” אין תצוגה ב-Drive, ולכן אי אפשר לצרף אותה. בטלו את הסימון שלה.`)
