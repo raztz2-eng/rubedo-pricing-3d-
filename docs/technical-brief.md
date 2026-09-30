@@ -149,3 +149,66 @@ AC15 Such a folder containing `tests/fixtures/rooting-stand.gcode.3mf` shows the
      card becomes priced (₪23.17 at defaults).
 AC16 An image added to a priced model's folder after saving (not in bid.json) appears on its model page.
 AC17 Requested scopes are exactly drive.file + drive.readonly; no write/delete call targets a file not created by the app.
+
+---
+# Addendum v0.4 — Stay signed in + write into existing folders (Founder decision, 30 Sep 2026)
+Supersedes v0.3 D-A (scopes) and the "no backend" rule. Reason: Founder wants to sign in once and stay signed in;
+v0.3 validation showed drive.file cannot write bid.json into the Founder's existing folders (C1) and thumbnail
+fetches are blocked by CORS so iPhone HEIC photos never render (C2).
+
+## Decisions
+- D-E **Small backend = Vercel Serverless Functions in `/api` only** (Node, free tier). No database, no other services.
+- D-F **Scope:** `https://www.googleapis.com/auth/drive` (full). Needed to create bid.json inside existing folders.
+  The app's own write rules stay strict (N6+): the ONLY writes allowed are (a) creating new files/folders,
+  (b) updating content of files that carry `appProperties.rubedo = "1"` (set on everything the app creates).
+  Never delete, trash, move, rename, or change permissions of anything. Enforced in code + tests.
+- D-G **Sessions:** OAuth authorization-code flow with `access_type=offline`. The refresh token lives ONLY in an
+  encrypted (AES-256-GCM), `HttpOnly; Secure; SameSite=Lax; Path=/api` cookie, max-age 180 days. Encryption key =
+  HKDF-SHA256(GOOGLE_CLIENT_SECRET, info "rubedo-session-v1") — no extra secret to manage.
+  Access tokens: minted by the backend, returned to the SPA, kept in memory only (never storage/cookies in JS).
+- D-H **Single user:** callback rejects any Google account other than `ALLOWED_EMAIL` (env, default raztz2@gmail.com)
+  with a Hebrew error page; no cookie is set.
+
+## Endpoints
+- `GET /api/auth/login` → 302 to Google (client_id from `GOOGLE_CLIENT_ID` or `VITE_GOOGLE_CLIENT_ID`, redirect_uri =
+  `${origin}/api/auth/callback`, scope drive + openid email, access_type=offline, prompt=consent, `state` = random,
+  stored in a short-lived HttpOnly cookie, include_granted_scopes=false).
+- `GET /api/auth/callback` → verify state; exchange code; verify email (id_token / userinfo) == ALLOWED_EMAIL;
+  require a refresh_token and the drive scope; set session cookie; 302 to `/`.
+- `POST /api/auth/token` → decrypt cookie, refresh → `{access_token, expires_in, email}`; 401 JSON if no/invalid
+  session (cookie cleared). Reject if `Origin` header present and ≠ request origin (CSRF). `Cache-Control: no-store`.
+- `POST /api/auth/logout` → revoke refresh token at Google (best effort), clear cookie, 204.
+- `GET /api/thumb?id=<fileId>&s=<px>` → requires valid session; fetch file metadata `thumbnailLink` with the token,
+  download it server-side, stream image back (`Cache-Control: private, max-age=3600`). 404 if no thumbnail.
+  `id` must match `^[A-Za-z0-9_-]{10,}$`; `s` clamped 64–1600. Only googleusercontent.com / google.com thumbnail
+  hosts are fetched (no SSRF).
+- Secrets needed in Vercel env (Founder adds; agents never handle them): `GOOGLE_CLIENT_SECRET` (sensitive).
+  Optional `ALLOWED_EMAIL`.
+
+## Front-end changes
+- Sign-in button → navigate to `/api/auth/login` (full redirect, no popup → works on mobile Safari).
+- On app start: `POST /api/auth/token`; 200 → signed in silently (no click). 401 → signed-out state.
+- Before expiry (≈5 min early) and on any Drive 401: refresh via `/api/auth/token` (shared in-flight promise).
+  If the session is gone → existing "needs reconnect" banner (form stays mounted).
+- Remove GIS token client. Keep Google Picker (setOAuthToken with the access token) for choosing the models folder.
+- Images: `<img src="/api/thumb?id=…&s=…">` for all Drive images incl. HEIC; concurrency no longer needed for thumbs.
+- Everything the app creates gets `appProperties: { rubedo: "1" }`; library "failed-save" hiding (v0.3) uses this
+  marker instead of `isAppAuthorized`.
+- Local dev: `vercel dev` or a Vite proxy note in README; demo mode (`?demo=1`) unchanged, no backend needed.
+
+## Also fix (validator findings on v0.3)
+- I3 edit of an N2 bid must not force a plate picture as permanent cover (use folder photos first).
+- I4 `/model/:id/create` must verify the folder is a direct child of the models folder and not skipped.
+- I2 when Settings are freshly created in a folder, show a one-time Hebrew notice.
+- M2 hide the download button for native Google files (`application/vnd.google-apps.*`).
+- M3 prefer the `bid.json` that has the app marker. M4 error-box retry must re-run the refresh.
+
+## Acceptance criteria (additional)
+AC18 With a valid session cookie, opening the app signs in with NO click; reload keeps the user signed in.
+AC19 A non-allowed Google account is rejected at callback; no session cookie is set.
+AC20 `/api/auth/token` without cookie → 401; with tampered cookie → 401 and cookie cleared; cross-origin Origin → 403.
+AC21 bid.json can be created inside an existing Founder folder (N2) — in tests via memory drive with realistic
+     permissions (drive scope = write allowed to create children anywhere).
+AC22 No code path can delete/trash/move/rename, or update content of a file lacking `appProperties.rubedo="1"`.
+AC23 `/api/thumb` returns an image for a HEIC file's thumbnail, rejects invalid ids and non-Google hosts.
+AC24 No secret or refresh token is ever sent to the browser JS, logged, or committed.

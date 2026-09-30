@@ -14,7 +14,7 @@ Full spec: `docs/technical-brief.md` (source of truth for scope). If the code an
 - Vitest (+ @testing-library/react, jsdom) for unit & acceptance tests
 - JSZip for reading sliced `.3mf` files in the browser
 - Google Identity Services (token client) + Google Drive REST v3 via `fetch` + Google Picker (folder pick)
-- Hosting: Vercel (static SPA). No backend, no database.
+- Hosting: Vercel. SPA + Vercel Serverless Functions in `/api` (auth + thumbnail proxy only). No database.
 
 ## Commands
 - dev: `npm run dev`
@@ -28,7 +28,8 @@ All four of typecheck, lint, test, build must pass before any agent reports "don
 - `src/lib/pricing.ts` — pure pricing function. No I/O. The only place the formula lives.
 - `src/lib/threemf.ts` — sliced .3mf parser (pure, takes ArrayBuffer/Blob).
 - `src/lib/drive/` — `DriveStore` interface, `googleDrive.ts` (real), `memoryDrive.ts` (fake for tests).
-- `src/lib/auth/` — Google sign-in (token kept in memory only).
+- `src/lib/auth/` — session client (calls /api/auth/*; access token in memory only).
+- `api/` — Vercel functions: auth (login/callback/token/logout) and thumb proxy. Shared code in `api/_lib/`.
 - `src/pages/` — Home, NewModel (also Edit), Library, ModelPage, Settings.
 - `src/components/` — shared UI.
 - `tests/unit/` — unit tests (Builder). `tests/acceptance/` — acceptance tests (Test Verifier only).
@@ -47,9 +48,9 @@ All four of typecheck, lint, test, build must pass before any agent reports "don
 ## Do not
 - Do not deploy to production. Preview deployments only. Production = Founder approval.
 - Do not buy, subscribe to, or enable any paid service or plan. Ever.
-- Do not add a backend, database, Supabase, Firebase or server functions (Founder decision: Drive only).
-- Drive scopes: exactly `drive.file` + `drive.readonly` (Founder decision 30 Sep). Read anything; write/modify ONLY files the app created; never delete/move.
-- Do not store the Google access token in localStorage/sessionStorage/cookies — memory only.
+- Backend = Vercel functions in `/api` ONLY for auth + thumbnails (Founder decision 30 Sep, addendum v0.4). No database, Supabase, Firebase or other services.
+- Drive scope: `drive` (addendum v0.4). Allowed writes: create new files/folders; update content ONLY of files with `appProperties.rubedo="1"`. NEVER delete, trash, move, rename or change permissions.
+- Access token: memory only in the SPA. Refresh token: ONLY inside the encrypted HttpOnly session cookie, never in JS, logs or responses. GOOGLE_CLIENT_SECRET only in Vercel env.
 - Do not commit secrets, `.env*` (except `.env.example`), keys, or tokens. The pre-commit hook blocks them.
 - Do not add dependencies beyond the stack above without writing why in your summary.
 - Do not commit directly to `main` after the initial setup commit — work on a branch, open a PR.
