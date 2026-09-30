@@ -14,7 +14,8 @@ export function LibraryPage() {
 function Library({ ctx }: { ctx: DriveContext }) {
   const { drive, folderId } = ctx
   const [entries, setEntries] = useState<IndexEntry[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  // M4: the error remembers which action failed, so "try again" re-runs that action (refresh → refresh).
+  const [error, setError] = useState<{ message: string; retry: 'load' | 'refresh' } | null>(null)
   const [skipped, setSkipped] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [query, setQuery] = useState('')
@@ -30,7 +31,7 @@ function Library({ ctx }: { ctx: DriveContext }) {
       setSkipped(r.skipped)
     } catch (e) {
       logError('rebuild index', e)
-      setError(errorMessage(e, 'רענון הספרייה נכשל.'))
+      setError({ message: errorMessage(e, 'רענון הספרייה נכשל.'), retry: 'refresh' })
     } finally {
       setBusy(false)
     }
@@ -47,7 +48,7 @@ function Library({ ctx }: { ctx: DriveContext }) {
       stale = state.stale
     } catch (e) {
       logError('load library', e)
-      setError(errorMessage(e, 'טעינת הספרייה נכשלה.'))
+      setError({ message: errorMessage(e, 'טעינת הספרייה נכשלה.'), retry: 'load' })
     } finally {
       setBusy(false)
     }
@@ -84,7 +85,7 @@ function Library({ ctx }: { ctx: DriveContext }) {
         value={query}
         onChange={(e) => setQuery(e.target.value)}
       />
-      {error && <ErrorBox onRetry={load}>{error}</ErrorBox>}
+      {error && <ErrorBox onRetry={error.retry === 'refresh' ? refresh : load}>{error.message}</ErrorBox>}
       {skipped.length > 0 && (
         <Notice tone="warn">לא ניתן היה לקרוא את bid.json בתיקיות: {skipped.join(', ')} — הן לא מוצגות.</Notice>
       )}
@@ -109,7 +110,7 @@ function PricedCard({ entry: e, ctx }: { entry: IndexEntry; ctx: DriveContext })
       data-testid="library-card"
       data-status="priced"
     >
-      <DriveImage drive={ctx.drive} fileId={e.coverFileId} alt={e.name} className="aspect-square w-full rounded-lg object-cover" />
+      <DriveImage drive={ctx.drive} fileId={e.coverFileId} alt={e.name} size={400} className="aspect-square w-full rounded-lg object-cover" />
       <div className="flex flex-1 flex-col px-1 pb-1">
         <span className="line-clamp-2 font-semibold">{e.name}</span>
         {e.revision && e.revision !== 'V1' && <span className="text-xs text-stone-500">{e.revision}</span>}
@@ -137,7 +138,7 @@ function NeedsSlicingCard({ entry: e, ctx }: { entry: IndexEntry; ctx: DriveCont
         data-testid="library-card"
         data-status="needs-slicing"
       >
-        <DriveImage drive={ctx.drive} fileId={e.coverFileId} alt={e.name} className="aspect-square w-full rounded-lg object-cover" />
+        <DriveImage drive={ctx.drive} fileId={e.coverFileId} alt={e.name} size={400} className="aspect-square w-full rounded-lg object-cover" />
         <div className="flex flex-1 flex-col gap-1 px-1 pb-1">
           <span className="line-clamp-2 font-semibold">{e.name}</span>
           <span

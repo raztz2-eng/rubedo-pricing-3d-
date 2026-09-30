@@ -27,6 +27,7 @@ import {
   loadBid,
   loadModelFolder,
   newSaveSession,
+  requireModelFolder,
   saveNewBid,
   updateBid,
   type NameCheck,
@@ -95,6 +96,8 @@ function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }
     let cancelled = false
     setError(null)
     const run = async () => {
+      // I4: only a direct, non-skipped subfolder of the models folder can receive a bid.
+      await requireModelFolder(ctx.drive, ctx.folderId, folderId)
       const { folder, contents, bid } = await loadModelFolder(ctx.drive, folderId)
       if (bid) return { hasBid: true }
       const slicedFile = contents.sliced[0]
@@ -120,7 +123,7 @@ function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }
     return () => {
       cancelled = true
     }
-  }, [ctx.drive, ctx.settings.materials, folderId, tick])
+  }, [ctx.drive, ctx.folderId, ctx.settings.materials, folderId, tick])
 
   if (error) return <ErrorBox onRetry={() => setTick((t) => t + 1)}>{error}</ErrorBox>
   if (!state) return <Spinner label="טוען תיקייה…" />

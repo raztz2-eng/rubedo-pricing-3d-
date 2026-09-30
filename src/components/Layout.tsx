@@ -4,17 +4,18 @@ import { errorMessage } from '../lib/errors'
 import { useApp } from '../state/AppContext'
 
 export function Layout() {
-  const { services, signedIn, needsReconnect, signIn, signOut } = useApp()
-  const [authError, setAuthError] = useState<string | null>(null)
+  const { services, signedIn, needsReconnect, authChecking, authError: sessionError, settingsJustCreated, dismissSettingsCreated, signIn, signOut } =
+    useApp()
+  const [clickError, setClickError] = useState<string | null>(null)
+  const authError = clickError ?? sessionError
 
-  // signIn() is called first thing in the click (no await before it) so the popup is not blocked.
+  // Sign-in navigates to /api/auth/login (full redirect, no popup). Reconnect first retries the session silently.
   const onSignIn = async () => {
-    const pending = signIn()
-    setAuthError(null)
+    setClickError(null)
     try {
-      await pending
+      await signIn()
     } catch (e) {
-      setAuthError(errorMessage(e, 'ההתחברות ל-Google נכשלה.'))
+      setClickError(errorMessage(e, 'ההתחברות ל-Google נכשלה.'))
     }
   }
 
@@ -46,7 +47,9 @@ export function Layout() {
           </nav>
           <div className="ms-auto flex items-center gap-2 text-sm">
             {services.mode === 'google' &&
-              (needsReconnect ? (
+              (authChecking ? (
+                <span className="text-stone-500">בודק חיבור…</span>
+              ) : needsReconnect ? (
                 <span className="flex items-center gap-1 text-amber-800">
                   <span className="h-2 w-2 rounded-full bg-amber-500" aria-hidden="true" />
                   נדרש חיבור מחדש
@@ -71,7 +74,10 @@ export function Layout() {
         </div>
         {needsReconnect && (
           <div role="alert" className="flex flex-wrap items-center justify-center gap-3 bg-amber-50 px-4 py-2 text-sm text-amber-900">
-            <span>החיבור ל-Google פג — לחצו „התחבר מחדש” כדי להמשיך. הנתונים שבטופס נשמרים.</span>
+            <span>
+              החיבור ל-Google פג — לחצו „התחבר מחדש” כדי להמשיך. הטופס נשאר פתוח; אם תידרש כניסה מחדש לחשבון Google, הדף
+              ייטען מחדש ונתונים שלא נשמרו יאבדו.
+            </span>
             <button type="button" className="btn btn-primary px-3 py-1" onClick={onSignIn}>
               התחבר מחדש
             </button>
@@ -80,6 +86,17 @@ export function Layout() {
         {authError && (
           <div role="alert" className="bg-red-50 px-4 py-2 text-center text-sm text-red-800">
             {authError}
+          </div>
+        )}
+        {settingsJustCreated && (
+          <div className="flex flex-wrap items-center justify-center gap-3 bg-sky-50 px-4 py-2 text-sm text-sky-900" data-testid="settings-created-notice">
+            <span>
+              בתיקיית הדגמים הזו לא היה קובץ הגדרות, ולכן נוצר חדש עם ערכי ברירת המחדל. אם זו לא התיקייה הנכונה (3D › models), החליפו
+              אותה בעמוד ההגדרות.
+            </span>
+            <button type="button" className="btn btn-secondary px-3 py-1" onClick={dismissSettingsCreated}>
+              הבנתי
+            </button>
           </div>
         )}
       </header>

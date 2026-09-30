@@ -52,6 +52,7 @@ describe('GoogleDriveStore', () => {
     const text = await (init?.body as Blob).text()
     expect(text).toContain(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8`)
     expect(text).toContain('"parents":["FOLDER"]')
+    expect(text).toContain('"appProperties":{"rubedo":"1"}')
     expect(text).toContain('{"a":1}')
     expect(text.endsWith(`--${boundary}--`)).toBe(true)
   })
@@ -81,23 +82,28 @@ describe('GoogleDriveStore', () => {
     expect(Array.from(body.slice(dataStart + 4))).toEqual(Array.from(footer))
   })
 
-  it('updates content with PATCH uploadType=media after checking the app created the file', async () => {
+  it('updates content with one multipart PATCH whose metadata is ONLY the app marker (no rename/move)', async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(json({ id: 'F', name: 'bid.json', mimeType: 'application/json', isAppAuthorized: true }))
+      .mockResolvedValueOnce(json({ id: 'F', name: 'bid.json', mimeType: 'application/json', parents: ['D'], appProperties: { rubedo: '1' } }))
       .mockResolvedValueOnce(json({ id: 'F' }))
-    await new GoogleDriveStore(tokens(), fetchMock).updateFileContent('F', new Blob(['x']), 'application/json')
+    await new GoogleDriveStore(tokens(), fetchMock).updateFileContent('F', new Blob(['{"x":1}']), 'application/json')
     const meta = new URL(String(fetchMock.mock.calls[0][0]))
     expect(meta.pathname).toBe('/drive/v3/files/F')
-    expect(meta.searchParams.get('fields')).toContain('isAppAuthorized')
+    expect(meta.searchParams.get('fields')).toContain('appProperties')
+    expect(meta.searchParams.get('fields')).toContain('parents')
     const [url, init] = fetchMock.mock.calls[1]
-    expect(String(url)).toBe('https://www.googleapis.com/upload/drive/v3/files/F?uploadType=media&fields=id')
+    expect(String(url)).toBe('https://www.googleapis.com/upload/drive/v3/files/F?uploadType=multipart&fields=id')
     expect(init?.method).toBe('PATCH')
+    const body = await (init?.body as Blob).text()
+    const metadata = JSON.parse(body.split('\r\n\r\n')[1].split('\r\n--')[0])
+    expect(metadata).toEqual({ appProperties: { rubedo: '1' } })
+    expect(body).toContain('{"x":1}')
   })
 
-  it('AC17: refuses to update a file the app did not create (no PATCH is sent)', async () => {
-    for (const meta of [{ isAppAuthorized: false }, {}]) {
-      const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ id: 'F', name: 'photo.jpg', mimeType: 'image/jpeg', ...meta }))
+  it('AC22: refuses to update a file without the app marker (no PATCH is sent)', async () => {
+    for (const meta of [{ appProperties: { rubedo: '0' } }, { appProperties: {} }, {}, { isAppAuthorized: true }]) {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ id: 'F', name: 'photo.jpg', mimeType: 'image/jpeg', parents: ['D'], ...meta }))
       const err = await new GoogleDriveStore(tokens(), fetchMock)
         .updateFileContent('F', new Blob(['x']), 'application/json')
         .catch((e: unknown) => e)
@@ -108,13 +114,54 @@ describe('GoogleDriveStore', () => {
     }
   })
 
-  it('lists with thumbnailLink and isAppAuthorized and maps them', async () => {
+  it('legacy settings/index (pre-v0.4, no marker) in the models folder root: update allowed and the marker added in the same PATCH', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(json({ id: 'S', name: '_rubedo-settings.json', mimeType: 'application/json', parents: ['ROOT'] }))
+      .mockResolvedValueOnce(json({ id: 'S' }))
+    await new GoogleDriveStore(tokens(), fetchMock).updateFileContent('S', new Blob(['{}']), 'application/json', {
+      adoptLegacy: { modelsFolderId: 'ROOT', name: '_rubedo-settings.json' },
+    })
+    const [, init] = fetchMock.mock.calls[1]
+    expect(init?.method).toBe('PATCH')
+    expect(await (init?.body as Blob).text()).toContain('"appProperties":{"rubedo":"1"}')
+  })
+
+  it('legacy exception does not apply elsewhere: other folder, other name, or a name claim that does not match', async () => {
+    const cases = [
+      { file: { name: '_rubedo-settings.json', parents: ['SUB'] }, claim: { modelsFolderId: 'ROOT', name: '_rubedo-settings.json' } },
+      { file: { name: 'bid.json', parents: ['ROOT'] }, claim: { modelsFolderId: 'ROOT', name: 'bid.json' } },
+      { file: { name: 'notes.json', parents: ['ROOT'] }, claim: { modelsFolderId: 'ROOT', name: '_rubedo-index.json' } },
+    ]
+    for (const c of cases) {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ id: 'X', mimeType: 'application/json', ...c.file }))
+      const err = await new GoogleDriveStore(tokens(), fetchMock)
+        .updateFileContent('X', new Blob(['x']), 'application/json', { adoptLegacy: c.claim })
+        .catch((e: unknown) => e)
+      expect((err as DriveError).status, JSON.stringify(c)).toBe(403)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    }
+  })
+
+  it('lists with thumbnailLink, parents and appProperties and maps the marker to appCreated', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
-      json({ files: [{ id: '1', name: 'IMG.HEIC', mimeType: 'image/heic', thumbnailLink: 'https://lh3.googleusercontent.com/x=s220', isAppAuthorized: false }] }),
+      json({
+        files: [
+          { id: '1', name: 'IMG.HEIC', mimeType: 'image/heic', thumbnailLink: 'https://lh3.googleusercontent.com/x=s220', parents: ['D'] },
+          { id: '2', name: 'bid.json', mimeType: 'application/json', parents: ['D'], appProperties: { rubedo: '1' } },
+        ],
+      }),
     )
     const files = await new GoogleDriveStore(tokens(), fetchMock).listChildren('D')
-    expect(new URL(String(fetchMock.mock.calls[0][0])).searchParams.get('fields')).toContain('thumbnailLink')
-    expect(files[0]).toMatchObject({ thumbnailLink: 'https://lh3.googleusercontent.com/x=s220', appCreated: false })
+    const fields = new URL(String(fetchMock.mock.calls[0][0])).searchParams.get('fields') ?? ''
+    expect(fields).toContain('thumbnailLink')
+    expect(fields).toContain('appProperties')
+    expect(files[0]).toMatchObject({ thumbnailLink: 'https://lh3.googleusercontent.com/x=s220', appCreated: false, parents: ['D'] })
+    expect(files[1].appCreated).toBe(true)
+  })
+
+  it('thumbnailUrl points at the same-origin proxy', () => {
+    expect(new GoogleDriveStore(tokens(), vi.fn<typeof fetch>()).thumbnailUrl('abc_DEF-123', 400)).toBe('/api/thumb?id=abc_DEF-123&s=400')
   })
 
   it('reads a thumbnail with the bearer token and without the 401-refresh path', async () => {
@@ -141,14 +188,23 @@ describe('GoogleDriveStore', () => {
     for (const name of ['deleteFile', 'delete', 'trash', 'moveFile', 'move']) expect(proto[name]).toBeUndefined()
   })
 
-  it('creates folders with the folder mime type', async () => {
+  it('creates folders with the folder mime type and the app marker', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(json({ id: 'D', name: 'M', mimeType: 'application/vnd.google-apps.folder' }))
     await new GoogleDriveStore(tokens(), fetchMock).createFolder('P', 'M')
     expect(JSON.parse(String(fetchMock.mock.calls[0][1]?.body))).toEqual({
       name: 'M',
       mimeType: 'application/vnd.google-apps.folder',
       parents: ['P'],
+      appProperties: { rubedo: '1' },
     })
+  })
+
+  it('a Drive 401 that survives the refresh tells the token provider (→ needs reconnect)', async () => {
+    const t = { ...tokens(), onUnauthorized: vi.fn() }
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('', { status: 401 }))
+    await expect(new GoogleDriveStore(t, fetchMock).readText('F')).rejects.toBeInstanceOf(DriveError)
+    expect(t.refresh).toHaveBeenCalledTimes(1)
+    expect(t.onUnauthorized).toHaveBeenCalledTimes(1)
   })
 
   it('refreshes the token once on 401 and retries', async () => {

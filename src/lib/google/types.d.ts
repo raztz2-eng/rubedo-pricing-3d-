@@ -1,24 +1,4 @@
-/** Minimal ambient types for the Google scripts we load at runtime (GIS token client + Picker). */
-
-interface GoogleTokenResponse {
-  access_token?: string
-  expires_in?: number | string
-  scope?: string
-  error?: string
-  error_description?: string
-}
-
-interface GoogleTokenClient {
-  requestAccessToken(overrides?: { prompt?: string }): void
-}
-
-interface GoogleTokenClientConfig {
-  client_id: string
-  scope: string
-  include_granted_scopes?: boolean
-  callback: (response: GoogleTokenResponse) => void
-  error_callback?: (error: { type: string; message?: string }) => void
-}
+/** Minimal ambient types for the Google script we load at runtime (Picker). Sign-in is server-side (brief v0.4). */
 
 interface GooglePickerDocument {
   id: string
@@ -50,12 +30,6 @@ interface GooglePickerBuilder {
 
 interface Window {
   google?: {
-    accounts?: {
-      oauth2: {
-        initTokenClient(config: GoogleTokenClientConfig): GoogleTokenClient
-        revoke(token: string, done?: () => void): void
-      }
-    }
     picker?: {
       DocsView: new (viewId?: string) => GooglePickerDocsView
       PickerBuilder: new () => GooglePickerBuilder

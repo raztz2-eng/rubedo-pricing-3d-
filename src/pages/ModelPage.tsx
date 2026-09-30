@@ -7,6 +7,7 @@ import { RequireDrive, type DriveContext } from '../components/RequireDrive'
 import { ErrorBox, Money, Notice, Spinner } from '../components/ui'
 import type { BidLine } from '../lib/bid'
 import { loadModelFolder, type ModelFolder } from '../lib/drive/bidRepository'
+import { isGoogleNativeFile } from '../lib/drive/folderContents'
 import type { DriveFile } from '../lib/drive/types'
 import { errorMessage, logError } from '../lib/errors'
 import { formatDate, formatNumber } from '../lib/format'
@@ -61,7 +62,8 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
     ...contents.sliced.map((f) => f.id),
     ...(bid?.files ?? []).filter((f) => f.kind === 'sliced').map((f) => f.id),
   ])
-  const sliced = contents.files.filter((f) => slicedIds.has(f.id))
+  // M2: native Google files (Docs, Sheets, …) have no bytes to download — they only get their Drive link.
+  const sliced = contents.files.filter((f) => slicedIds.has(f.id) && !isGoogleNativeFile(f))
   const otherFiles = contents.files.filter((f) => !slicedIds.has(f.id))
 
   const download = async (f: DriveFile) => {
@@ -122,7 +124,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
               <a className="truncate text-accent underline" dir="ltr" href={ctx.drive.fileUrl(f.id)} target="_blank" rel="noreferrer">
                 {f.name}
               </a>
-              {!slicedIds.has(f.id) && (
+              {!slicedIds.has(f.id) && !isGoogleNativeFile(f) && (
                 <button type="button" className="shrink-0 text-accent underline" onClick={() => download(f)} disabled={downloading === f.id}>
                   {downloading === f.id ? 'מוריד…' : 'הורדה'}
                 </button>

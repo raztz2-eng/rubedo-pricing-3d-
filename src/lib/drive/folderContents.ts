@@ -42,8 +42,22 @@ export interface FolderContents {
   sliced: DriveFile[]
 }
 
+/** Native Google Docs/Sheets/… files: no binary content, cannot be downloaded as is (M2). */
+export function isGoogleNativeFile(f: Pick<DriveFile, 'mimeType'>): boolean {
+  return f.mimeType !== FOLDER_MIME && f.mimeType.startsWith('application/vnd.google-apps.')
+}
+
+/**
+ * Of several files with the same name, the one carrying the app marker wins (M3); otherwise the first.
+ * Used for bid.json, the settings file and the index.
+ */
+export function preferAppFile(files: DriveFile[]): DriveFile | undefined {
+  const plain = files.filter((f) => f.mimeType !== FOLDER_MIME)
+  return plain.find((f) => f.appCreated === true) ?? plain[0]
+}
+
 export function classifyFolder(children: DriveFile[]): FolderContents {
-  const bidFile = children.find((c) => c.name === BID_FILE_NAME && c.mimeType !== FOLDER_MIME)
+  const bidFile = preferAppFile(children.filter((c) => c.name === BID_FILE_NAME))
   const plain = children.filter((c) => c.mimeType !== FOLDER_MIME && c !== bidFile)
   const images = plain.filter(isImageFile).sort(byName)
   const files = plain.filter((c) => !isImageFile(c)).sort(byName)

@@ -12,8 +12,8 @@ export function NotConfiguredNotice() {
       <p className="font-semibold">האפליקציה עדיין לא מחוברת ל-Google.</p>
       <p className="mt-1">
         חסר המשתנה <code dir="ltr">VITE_GOOGLE_CLIENT_ID</code> (וגם <code dir="ltr">VITE_GOOGLE_API_KEY</code>,{' '}
-        <code dir="ltr">VITE_GOOGLE_APP_ID</code>). יש להגדיר אותם בקובץ <code dir="ltr">.env.local</code> או בהגדרות
-        הפרויקט ב-Vercel ולבנות מחדש.
+        <code dir="ltr">VITE_GOOGLE_APP_ID</code>, ובשרת <code dir="ltr">GOOGLE_CLIENT_SECRET</code>). יש להגדיר אותם בקובץ{' '}
+        <code dir="ltr">.env.local</code> או בהגדרות הפרויקט ב-Vercel ולבנות מחדש.
       </p>
       <p className="mt-1">
         לצפייה בממשק בלי Google: <a className="text-accent underline" href="?demo=1">מצב הדגמה</a>.
@@ -35,7 +35,7 @@ export interface DriveContext {
  * Only an explicit sign-out or a different models folder unmounts them.
  */
 export function RequireDrive({ children }: { children: (ctx: DriveContext) => ReactNode }) {
-  const { services, sessionActive, signIn, folderId, settings, settingsFolderId, settingsLoading, settingsError, reloadSettings } =
+  const { services, sessionActive, authChecking, signIn, folderId, settings, settingsFolderId, settingsLoading, settingsError, reloadSettings } =
     useApp()
   const [error, setError] = useState<string | null>(null)
   const lastCtx = useRef<DriveContext | null>(null)
@@ -56,18 +56,22 @@ export function RequireDrive({ children }: { children: (ctx: DriveContext) => Re
   }
   if (!sessionActive) lastCtx.current = null
 
+  if (!sessionActive && authChecking) return <Spinner label="בודק חיבור ל-Google…" />
+
   if (!sessionActive) {
     return (
       <div className="card flex flex-col items-start gap-3">
-        <p>כדי לעבוד עם הדגמים יש להתחבר לחשבון Google (צפייה בקבצים ב-Drive; שינוי רק של קבצים שהאפליקציה יצרה).</p>
+        <p>
+          כדי לעבוד עם הדגמים יש להתחבר לחשבון Google פעם אחת (האפליקציה קוראת קבצים ב-Drive, יוצרת קבצים חדשים ומשנה רק
+          קבצים שהיא יצרה; היא לא מוחקת ולא מזיזה דבר).
+        </p>
         <button
           type="button"
           className="btn btn-primary"
           onClick={async () => {
-            const pending = signIn()
             setError(null)
             try {
-              await pending
+              await signIn()
             } catch (e) {
               setError(errorMessage(e, 'ההתחברות ל-Google נכשלה.'))
             }

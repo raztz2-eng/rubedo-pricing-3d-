@@ -20,5 +20,4 @@ export function loadScript(src: string): Promise<void> {
   return p
 }
 
-export const GIS_SRC = 'https://accounts.google.com/gsi/client'
 export const GAPI_SRC = 'https://apis.google.com/js/api.js'

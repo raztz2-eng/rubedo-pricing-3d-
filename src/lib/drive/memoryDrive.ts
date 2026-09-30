@@ -1,5 +1,6 @@
 import { FOLDER_MIME } from '../bid'
-import { DriveError, NOT_APP_FILE_MESSAGE, type DriveFile, type DriveStore, type ListOptions } from './types'
+import { DriveError, type DriveFile, type DriveStore, type ListOptions } from './types'
+import { decideUpdate, type UpdateOptions } from './writeGuard'
 
 interface MemoryNode {
   id: string
@@ -9,7 +10,10 @@ interface MemoryNode {
   parentId: string | null
   data?: Blob
   createdSeq: number
-  /** Created through the DriveStore API (= by the app). Foreign nodes simulate the Founder's own files. */
+  /**
+   * Carries the app marker (appProperties.rubedo="1"): created through the DriveStore API (= by the app, v0.4+).
+   * Foreign nodes simulate the Founder's own files; legacy nodes simulate app files from before v0.4 (no marker).
+   */
   appCreated: boolean
   /** Explicit preview; `null` = Drive has no thumbnail for this file. Undefined → derived from the data. */
   thumbnail?: Blob | null
@@ -39,9 +43,10 @@ export interface ForeignFileOptions {
  * In-memory DriveStore — used by tests and by the `?demo=1` mode. No network.
  * `failNext(op)` makes the next call of that operation throw (to test retry flows).
  *
- * Nodes created through the DriveStore API count as created by the app. `addForeignFolder` / `addForeignFile`
- * simulate files the Founder put in Drive himself: the app may read them but `updateFileContent` refuses them,
- * exactly like the real store (AC17).
+ * Permissions are realistic for the `drive` scope (brief v0.4): the app may create children in ANY folder, including
+ * the Founder's own. Nodes created through the DriveStore API carry the app marker. `addForeignFolder` /
+ * `addForeignFile` simulate files the Founder put in Drive himself; `addLegacyAppFile` simulates a file the app
+ * created before v0.4 (no marker). `updateFileContent` applies the same write guard as the real store (AC22).
  */
 export class MemoryDrive implements DriveStore {
   private nodes = new Map<string, MemoryNode>()
@@ -73,6 +78,12 @@ export class MemoryDrive implements DriveStore {
     if (options.thumbnail !== undefined) n.thumbnail = options.thumbnail
     if (options.modifiedTime) n.modifiedTime = options.modifiedTime
     return n.id
+  }
+
+  /** Test helper: a file the app created before v0.4 (no appProperties marker). */
+  addLegacyAppFile(parentId: string, name: string, data: Blob, mimeType: string): string {
+    this.requireFolder(parentId)
+    return this.addNode({ name, mimeType, parentId, data, appCreated: false }).id
   }
 
   failNext(op: MemoryOperation, predicate?: (arg: string) => boolean): void {
@@ -120,12 +131,13 @@ export class MemoryDrive implements DriveStore {
     return this.toFile(n)
   }
 
-  async updateFileContent(fileId: string, data: Blob, mimeType: string): Promise<void> {
+  async updateFileContent(fileId: string, data: Blob, mimeType: string, options: UpdateOptions = {}): Promise<void> {
     this.maybeFail('updateFileContent', fileId)
     this.writeTargets.push({ op: 'updateFileContent', targetId: fileId })
     const n = this.nodes.get(fileId)
     if (!n || n.mimeType === FOLDER_MIME) throw new DriveError(`not found: ${fileId}`, 'הקובץ לא נמצא ב-Drive.', 404)
-    if (!n.appCreated) throw new DriveError(`refused: ${fileId} was not created by the app`, NOT_APP_FILE_MESSAGE, 403)
+    // Same guard as the real store; a legacy settings/index file gets the marker in the same update.
+    if (decideUpdate(this.toFile(n), options) === 'adopt') n.appCreated = true
     n.data = data
     n.mimeType = mimeType
     n.modifiedTime = new Date().toISOString()
@@ -151,6 +163,11 @@ export class MemoryDrive implements DriveStore {
     return thumb
   }
 
+  /** No image URL: the UI loads previews as blobs via readThumbnail/readBlob. */
+  thumbnailUrl(): string | null {
+    return null
+  }
+
   folderUrl(folderId: string): string {
     return `#demo-folder-${folderId}`
   }
@@ -166,7 +183,14 @@ export class MemoryDrive implements DriveStore {
   }
 
   private toFile(n: MemoryNode): DriveFile {
-    const f: DriveFile = { id: n.id, name: n.name, mimeType: n.mimeType, modifiedTime: n.modifiedTime, appCreated: n.appCreated }
+    const f: DriveFile = {
+      id: n.id,
+      name: n.name,
+      mimeType: n.mimeType,
+      modifiedTime: n.modifiedTime,
+      parents: n.parentId ? [n.parentId] : [],
+      appCreated: n.appCreated,
+    }
     if (this.thumbnailOf(n)) f.thumbnailLink = `${THUMB_PREFIX}${n.id}=s220`
     return f
   }

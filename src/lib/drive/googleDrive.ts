@@ -1,20 +1,23 @@
 import { FOLDER_MIME } from '../bid'
-import { DriveError, NOT_APP_FILE_MESSAGE, type DriveFile, type DriveStore, type ListOptions } from './types'
+import { DriveError, type DriveFile, type DriveStore, type ListOptions } from './types'
+import { APP_PROPERTIES, decideUpdate, hasAppMarker, type UpdateOptions } from './writeGuard'
 
 /**
- * DriveStore backed by Google Drive REST v3 (plain fetch). Scopes: drive.file + drive.readonly.
- * Reads anything; never deletes or moves anything; updates only touch files the app created
- * (bid.json / index / settings) — checked via `isAppAuthorized` before every update (AC17).
+ * DriveStore backed by Google Drive REST v3 (plain fetch). Scope: drive (brief v0.4 D-F).
+ * Reads anything. Writes: creates (always with appProperties.rubedo="1") and content updates of marked files only
+ * (writeGuard.ts). There is no request that deletes, trashes, moves, renames or changes sharing (AC22).
  */
 
 const API = 'https://www.googleapis.com/drive/v3'
 const UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3'
-const FILE_FIELDS = 'id,name,mimeType,modifiedTime,thumbnailLink,isAppAuthorized'
+const FILE_FIELDS = 'id,name,mimeType,modifiedTime,thumbnailLink,parents,appProperties'
 
 export interface TokenProvider {
   getToken(): Promise<string>
   /** Called once after a 401 to obtain a fresh token. */
   refresh(): Promise<string>
+  /** Called when Drive still answers 401 after a refresh: the session is unusable → "needs reconnect". */
+  onUnauthorized?(): void
 }
 
 /** Escapes a value for use inside single quotes in a Drive `q` expression. */
@@ -28,14 +31,15 @@ interface RawFile {
   mimeType: string
   modifiedTime?: string
   thumbnailLink?: string
-  isAppAuthorized?: boolean
+  parents?: string[]
+  appProperties?: Record<string, string>
 }
 
 function toDriveFile(raw: RawFile): DriveFile {
-  const f: DriveFile = { id: raw.id, name: raw.name, mimeType: raw.mimeType }
+  const f: DriveFile = { id: raw.id, name: raw.name, mimeType: raw.mimeType, appCreated: hasAppMarker(raw.appProperties) }
   if (raw.modifiedTime) f.modifiedTime = raw.modifiedTime
   if (raw.thumbnailLink) f.thumbnailLink = raw.thumbnailLink
-  if (typeof raw.isAppAuthorized === 'boolean') f.appCreated = raw.isAppAuthorized
+  if (Array.isArray(raw.parents)) f.parents = raw.parents
   return f
 }
 
@@ -56,12 +60,34 @@ export function buildListQuery(folderId: string, options: ListOptions = {}): str
   return parts.join(' and ')
 }
 
+/** Same-origin thumbnail proxy (brief v0.4). */
+export function thumbProxyUrl(fileId: string, size: number): string {
+  return `/api/thumb?id=${encodeURIComponent(fileId)}&s=${Math.round(size)}`
+}
+
 function userMessageFor(status: number): string {
   if (status === 401) return 'פג תוקף ההתחברות ל-Google. התחברו מחדש ונסו שוב.'
-  if (status === 403) return 'אין הרשאה לפעולה הזו ב-Drive (ייתכן שחרגתם ממכסה או שהתיקייה לא נבחרה דרך האפליקציה).'
+  if (status === 403) return 'אין הרשאה לפעולה הזו ב-Drive (ייתכן שחרגתם ממכסה).'
   if (status === 404) return 'הקובץ או התיקייה לא נמצאו ב-Drive. ייתכן שיש לבחור שוב את תיקיית הדגמים בהגדרות.'
   if (status === 429 || status >= 500) return 'Google Drive לא זמין כרגע. נסו שוב בעוד רגע.'
   return 'הפעולה מול Google Drive נכשלה. נסו שוב.'
+}
+
+/** multipart/related body: JSON metadata + content. */
+function multipart(metadata: Record<string, unknown>, data: Blob, mimeType: string): { body: Blob; contentType: string } {
+  const boundary = `rubedo-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`
+  const contentType = `multipart/related; boundary=${boundary}`
+  const body = new Blob(
+    [
+      `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
+      JSON.stringify(metadata),
+      `\r\n--${boundary}\r\nContent-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`,
+      data,
+      `\r\n--${boundary}--`,
+    ],
+    { type: contentType },
+  )
+  return { body, contentType }
 }
 
 export class GoogleDriveStore implements DriveStore {
@@ -97,27 +123,16 @@ export class GoogleDriveStore implements DriveStore {
     const res = await this.request(`${API}/files?fields=${FILE_FIELDS}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json; charset=UTF-8' },
-      body: JSON.stringify({ name, mimeType: FOLDER_MIME, parents: [parentId] }),
+      body: JSON.stringify({ name, mimeType: FOLDER_MIME, parents: [parentId], appProperties: { ...APP_PROPERTIES } }),
     })
     return toDriveFile((await res.json()) as RawFile)
   }
 
   async uploadFile(parentId: string, name: string, data: Blob, mimeType: string): Promise<DriveFile> {
-    const boundary = `rubedo-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`
-    const metadata = { name, mimeType, parents: [parentId] }
-    const body = new Blob(
-      [
-        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`,
-        JSON.stringify(metadata),
-        `\r\n--${boundary}\r\nContent-Type: ${mimeType || 'application/octet-stream'}\r\n\r\n`,
-        data,
-        `\r\n--${boundary}--`,
-      ],
-      { type: `multipart/related; boundary=${boundary}` },
-    )
+    const { body, contentType } = multipart({ name, mimeType, parents: [parentId], appProperties: { ...APP_PROPERTIES } }, data, mimeType)
     const res = await this.request(`${UPLOAD_API}/files?uploadType=multipart&fields=${FILE_FIELDS}`, {
       method: 'POST',
-      headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
+      headers: { 'Content-Type': contentType },
       body,
     })
     return toDriveFile((await res.json()) as RawFile)
@@ -128,16 +143,17 @@ export class GoogleDriveStore implements DriveStore {
     return toDriveFile((await res.json()) as RawFile)
   }
 
-  async updateFileContent(fileId: string, data: Blob, mimeType: string): Promise<void> {
-    // Guard (AC17): never modify a file the app did not create, even if Google would allow it.
-    const meta = await this.getFile(fileId)
-    if (meta.appCreated !== true) {
-      throw new DriveError(`refused: ${fileId} was not created by the app`, NOT_APP_FILE_MESSAGE, 403)
-    }
-    await this.request(`${UPLOAD_API}/files/${encodeURIComponent(fileId)}?uploadType=media&fields=id`, {
+  /**
+   * The ONLY modifying request the app sends. Checked by writeGuard.decideUpdate before anything is sent.
+   * The metadata part contains appProperties only — never name/parents (no rename/move).
+   */
+  async updateFileContent(fileId: string, data: Blob, mimeType: string, options: UpdateOptions = {}): Promise<void> {
+    decideUpdate(await this.getFile(fileId), options)
+    const { body, contentType } = multipart({ appProperties: { ...APP_PROPERTIES } }, data, mimeType)
+    await this.request(`${UPLOAD_API}/files/${encodeURIComponent(fileId)}?uploadType=multipart&fields=id`, {
       method: 'PATCH',
-      headers: { 'Content-Type': mimeType },
-      body: data,
+      headers: { 'Content-Type': contentType },
+      body,
     })
   }
 
@@ -152,9 +168,8 @@ export class GoogleDriveStore implements DriveStore {
   }
 
   /**
-   * Thumbnails live on googleusercontent.com and may need the bearer token for private files.
-   * Deliberately NOT the 401→refresh path: a failing preview must never push the session into "reconnect";
-   * the caller falls back to downloading the file (images.ts).
+   * Direct thumbnail download from the browser. Kept for the DriveStore contract; the UI does not use it with
+   * this store (googleusercontent.com blocks it by CORS — brief v0.4 C2) and loads `thumbnailUrl()` instead.
    */
   async readThumbnail(thumbnailLink: string): Promise<Blob> {
     if (!isGoogleThumbnailUrl(thumbnailLink)) {
@@ -169,6 +184,10 @@ export class GoogleDriveStore implements DriveStore {
     }
     if (!res.ok) throw new DriveError(`thumbnail ${res.status}`, 'התמונה לא נטענה.', res.status)
     return res.blob()
+  }
+
+  thumbnailUrl(fileId: string, size: number): string {
+    return thumbProxyUrl(fileId, size)
   }
 
   folderUrl(folderId: string): string {
@@ -191,6 +210,7 @@ export class GoogleDriveStore implements DriveStore {
       throw new DriveError(`network error: ${String(e)}`, 'אין חיבור ל-Google Drive. בדקו את החיבור לאינטרנט ונסו שוב.')
     }
     if (res.status === 401 && !retried) return this.request(url, init, true)
+    if (res.status === 401) this.tokens.onUnauthorized?.()
     if (!res.ok) {
       let detail = ''
       try {

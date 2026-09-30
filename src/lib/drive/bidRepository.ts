@@ -1,6 +1,7 @@
 import { mapLimit } from '../concurrency'
 import {
   BID_FILE_NAME,
+  FOLDER_MIME,
   INDEX_FILE_NAME,
   INDEX_MAX_AGE_MS,
   SETTINGS_FILE_NAME,
@@ -18,7 +19,7 @@ import {
   type IndexEntry,
   type IndexFile,
 } from '../bid'
-import { classifyFolder, isPlatePictureName, isSkippedFolderName, pickCover, type FolderContents } from './folderContents'
+import { classifyFolder, isPlatePictureName, isSkippedFolderName, pickCover, preferAppFile, type FolderContents } from './folderContents'
 import { DriveError, type DriveFile, type DriveStore } from './types'
 
 /** How many model folders are listed in parallel when (re)building the library. */
@@ -72,9 +73,9 @@ function sameName(a: string, b: string): boolean {
   return a.trim().toLocaleLowerCase() === b.trim().toLocaleLowerCase()
 }
 
+/** A file with that exact name in the folder; one with the app marker is preferred (M3). */
 export async function findFile(store: DriveStore, folderId: string, name: string): Promise<DriveFile | undefined> {
-  const found = await store.listChildren(folderId, { name })
-  return found[0]
+  return preferAppFile(await store.listChildren(folderId, { name }))
 }
 
 /** The file was read fine but its content is not valid JSON (as opposed to a Drive/network failure). */
@@ -94,10 +95,25 @@ async function readJson(store: DriveStore, fileId: string, what: string): Promis
   }
 }
 
-async function writeJsonFile(store: DriveStore, folderId: string, name: string, value: unknown): Promise<string> {
+/**
+ * Creates or rewrites a JSON file. `legacyInModelsFolder`: the settings/index file directly in the models folder —
+ * a pre-v0.4 copy without the app marker may be rewritten (and gets the marker); see writeGuard.ts.
+ */
+async function writeJsonFile(
+  store: DriveStore,
+  folderId: string,
+  name: string,
+  value: unknown,
+  legacyInModelsFolder = false,
+): Promise<string> {
   const existing = await findFile(store, folderId, name)
   if (existing) {
-    await store.updateFileContent(existing.id, jsonBlob(value), JSON_MIME)
+    await store.updateFileContent(
+      existing.id,
+      jsonBlob(value),
+      JSON_MIME,
+      legacyInModelsFolder ? { adoptLegacy: { modelsFolderId: folderId, name } } : {},
+    )
     return existing.id
   }
   const created = await store.uploadFile(folderId, name, jsonBlob(value), JSON_MIME)
@@ -108,17 +124,22 @@ async function writeJsonFile(store: DriveStore, folderId: string, name: string, 
 
 /** Loads `_rubedo-settings.json`; creates it with defaults on first run. */
 export async function loadSettings(store: DriveStore, modelsFolderId: string): Promise<AppSettings> {
+  return (await loadSettingsWithStatus(store, modelsFolderId)).settings
+}
+
+/** Like loadSettings; `created` = the file did not exist and was just created with defaults (→ I2 notice). */
+export async function loadSettingsWithStatus(store: DriveStore, modelsFolderId: string): Promise<{ settings: AppSettings; created: boolean }> {
   const file = await findFile(store, modelsFolderId, SETTINGS_FILE_NAME)
   if (!file) {
     const defaults = defaultAppSettings()
     await store.uploadFile(modelsFolderId, SETTINGS_FILE_NAME, jsonBlob(defaults), JSON_MIME)
-    return defaults
+    return { settings: defaults, created: true }
   }
-  return normaliseSettings(await readJson(store, file.id, SETTINGS_FILE_NAME))
+  return { settings: normaliseSettings(await readJson(store, file.id, SETTINGS_FILE_NAME)), created: false }
 }
 
 export async function saveSettings(store: DriveStore, modelsFolderId: string, settings: AppSettings): Promise<void> {
-  await writeJsonFile(store, modelsFolderId, SETTINGS_FILE_NAME, settings)
+  await writeJsonFile(store, modelsFolderId, SETTINGS_FILE_NAME, settings, true)
 }
 
 // ---------- Index / library ----------
@@ -160,7 +181,7 @@ export async function readIndex(store: DriveStore, modelsFolderId: string): Prom
 
 async function writeIndex(store: DriveStore, modelsFolderId: string, entries: IndexEntry[], builtAt: string): Promise<void> {
   const file: IndexFile = { schemaVersion: 2, builtAt, entries: sortIndex(entries) }
-  await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, file)
+  await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, file, true)
 }
 
 /** True when the index was never fully rebuilt by v0.3 or is older than 10 minutes (N5). */
@@ -285,6 +306,22 @@ export async function loadModelFolder(store: DriveStore, folderId: string): Prom
   return { folder, contents, bid: raw }
 }
 
+// ---------- Existing model folder check (I4) ----------
+
+export const NOT_MODEL_FOLDER_MESSAGE = 'התיקייה הזו אינה תיקיית דגם ישירות בתוך תיקיית הדגמים שנבחרה, ולכן לא תיצור בה הצעת מחיר.'
+
+/**
+ * A folder may receive a bid (N2) only if it is a direct, non-skipped subfolder of the models folder.
+ * Returns its metadata; throws a Hebrew DriveError otherwise.
+ */
+export async function requireModelFolder(store: DriveStore, modelsFolderId: string, folderId: string): Promise<DriveFile> {
+  const folder = await store.getFile(folderId)
+  if (folder.mimeType !== FOLDER_MIME || !(folder.parents ?? []).includes(modelsFolderId) || isSkippedFolderName(folder.name)) {
+    throw new DriveError(`not a model folder: ${folderId}`, NOT_MODEL_FOLDER_MESSAGE, 400)
+  }
+  return folder
+}
+
 // ---------- Name check ----------
 
 export interface NameCheck {
@@ -376,6 +413,7 @@ export async function saveNewBid(
   session: SaveSession,
 ): Promise<{ folderId: string; bid: Bid }> {
   if (params.existingFolderId) {
+    if (!session.bidFileId) await requireModelFolder(store, modelsFolderId, params.existingFolderId)
     session.folderId = params.existingFolderId
     // Never overwrite a bid that is already there (e.g. saved meanwhile from another tab).
     if (!session.bidFileId && (await findFile(store, params.existingFolderId, BID_FILE_NAME))) {
@@ -444,7 +482,8 @@ export async function updateBid(
   const { folderId, existing } = params
   await uploadMissing(store, folderId, params.newFiles, session)
 
-  const files = [...existing.files, ...params.newFiles.map((f) => session.uploaded[f.key])]
+  const newUploads = params.newFiles.map((f) => session.uploaded[f.key])
+  const files = [...existing.files, ...newUploads]
   const existingParts = params.content.parts
   const bid: Bid = {
     ...existing,
@@ -455,7 +494,9 @@ export async function updateBid(
     updatedAt: (params.now ?? new Date()).toISOString(),
     parts: resolveParts(existingParts, session),
     files,
-    coverFileId: existing.coverFileId ?? firstImage(files),
+    // I3: a bid without an explicit cover never gets a plate picture forced on it as its permanent cover — the cover
+    // rule (folder photos first, plate picture last) keeps applying. A newly added photo does become the cover.
+    coverFileId: existing.coverFileId ?? firstImage(newUploads.filter((f) => !isPlatePictureName(f.name))),
   }
   if (!bid.coverFileId) delete bid.coverFileId
 

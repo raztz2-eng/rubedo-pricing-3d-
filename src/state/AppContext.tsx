@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import type { AppSettings } from '../lib/bid'
-import { loadSettings, saveSettings as saveSettingsFile } from '../lib/drive/bidRepository'
+import { loadSettingsWithStatus, saveSettings as saveSettingsFile } from '../lib/drive/bidRepository'
 import { errorMessage } from '../lib/errors'
 import type { AppServices } from './services'
 
@@ -11,6 +11,13 @@ export interface AppState {
   needsReconnect: boolean
   /** Signed in, or temporarily disconnected (needs reconnect). Pages are gated on this, not on signedIn. */
   sessionActive: boolean
+  /** The start-up session check is still running. */
+  authChecking: boolean
+  /** Start-up/renewal problem (Hebrew) other than "signed out". */
+  authError: string | null
+  /** I2: the settings file of the CURRENT folder was just created with defaults (one-time notice until dismissed). */
+  settingsJustCreated: boolean
+  dismissSettingsCreated: () => void
   folderId: string | null
   /** Settings of the CURRENT models folder only (null while another folder's settings are all we have). */
   settings: AppSettings | null
@@ -38,15 +45,25 @@ export function AppProvider({ services, children }: { services: AppServices; chi
   const [reloadTick, setReloadTick] = useState(0)
 
   const [needsReconnect, setNeedsReconnect] = useState(services.auth?.needsReconnect ?? false)
+  const [authChecking, setAuthChecking] = useState(services.auth?.checking ?? false)
+  const [authError, setAuthError] = useState<string | null>(services.auth?.lastError ?? null)
+  // I2: tagged with the folder whose settings file was just created.
+  const [createdFor, setCreatedFor] = useState<string | null>(null)
   const sessionActive = signedIn || needsReconnect
 
   useEffect(() => {
     const auth = services.auth
     if (!auth) return
-    return auth.subscribe((s) => {
+    const sync = (s: boolean) => {
       setSignedIn(s)
       setNeedsReconnect(auth.needsReconnect ?? false)
-    })
+      setAuthChecking(auth.checking ?? false)
+      setAuthError(auth.lastError ?? null)
+    }
+    const unsubscribe = auth.subscribe(sync)
+    // The start-up check may have finished between the first render and this subscription.
+    sync(auth.signedIn)
+    return unsubscribe
   }, [services.auth])
 
   const drive = services.drive
@@ -60,9 +77,11 @@ export function AppProvider({ services, children }: { services: AppServices; chi
     let cancelled = false
     setLoadingFor(folderId)
     setLoadError(null)
-    loadSettings(drive, folderId)
-      .then((s) => {
-        if (!cancelled) setLoaded({ folderId, settings: s })
+    loadSettingsWithStatus(drive, folderId)
+      .then(({ settings: s, created }) => {
+        if (cancelled) return
+        setLoaded({ folderId, settings: s })
+        if (created) setCreatedFor(folderId)
       })
       .catch((e: unknown) => {
         if (!cancelled) setLoadError({ folderId, message: errorMessage(e, 'טעינת ההגדרות מ-Drive נכשלה.') })
@@ -109,6 +128,8 @@ export function AppProvider({ services, children }: { services: AppServices; chi
   )
 
   const reloadSettings = useCallback(() => setReloadTick((t) => t + 1), [])
+  const dismissSettingsCreated = useCallback(() => setCreatedFor(null), [])
+  const settingsJustCreated = createdFor !== null && createdFor === folderId
 
   const value = useMemo<AppState>(
     () => ({
@@ -116,6 +137,10 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       signedIn,
       needsReconnect,
       sessionActive,
+      authChecking,
+      authError,
+      settingsJustCreated,
+      dismissSettingsCreated,
       folderId,
       settings,
       settingsFolderId,
@@ -127,7 +152,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       reloadSettings,
       saveSettings,
     }),
-    [services, signedIn, needsReconnect, sessionActive, folderId, settings, settingsFolderId, settingsLoading, settingsError, signIn, signOut, pickFolder, reloadSettings, saveSettings],
+    [services, signedIn, needsReconnect, sessionActive, authChecking, authError, settingsJustCreated, dismissSettingsCreated, folderId, settings, settingsFolderId, settingsLoading, settingsError, signIn, signOut, pickFolder, reloadSettings, saveSettings],
   )
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>

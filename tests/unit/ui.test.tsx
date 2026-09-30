@@ -6,8 +6,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { App } from '../../src/App'
 import { BID_FILE_NAME } from '../../src/lib/bid'
-import { GoogleAuth } from '../../src/lib/auth/googleAuth'
-import { DRIVE_SCOPE } from '../../src/lib/config'
+import { SessionAuth } from '../../src/lib/auth/sessionAuth'
 import { MemoryDrive } from '../../src/lib/drive/memoryDrive'
 import type { DriveFile, DriveStore, ListOptions } from '../../src/lib/drive/types'
 import {
@@ -234,7 +233,7 @@ class TokenGatedDrive implements DriveStore {
   refreshBeforeUploadOf: string | null = null
   constructor(
     readonly inner: MemoryDrive,
-    private readonly auth: GoogleAuth,
+    private readonly auth: SessionAuth,
   ) {}
   private async token() {
     await this.auth.getToken()
@@ -275,6 +274,9 @@ class TokenGatedDrive implements DriveStore {
     await this.token()
     return this.inner.readThumbnail(link)
   }
+  thumbnailUrl() {
+    return null
+  }
   folderUrl(id: string) {
     return this.inner.folderUrl(id)
   }
@@ -283,49 +285,44 @@ class TokenGatedDrive implements DriveStore {
   }
 }
 
-describe('Fix round 2 — lost Google connection during a save', () => {
+/** Fake /api/auth/* backend: `session` decides what POST /api/auth/token answers. */
+function fakeSessionBackend() {
+  const state = { session: 'ok' as 'ok' | 'gone', n: 0, calls: [] as string[] }
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    const url = String(input)
+    state.calls.push(url)
+    if (url === '/api/auth/token') {
+      if (state.session === 'gone') return new Response(JSON.stringify({ error: 'no_session' }), { status: 401 })
+      state.n += 1
+      return new Response(JSON.stringify({ access_token: `T${state.n}`, expires_in: 3600, email: 'raztz2@gmail.com' }), { status: 200 })
+    }
+    return new Response(null, { status: 204 })
+  }) as typeof fetch
+  return { state, fetchImpl }
+}
+
+describe('Fix round 2 (v0.4 session) — lost Google connection during a save', () => {
   afterEach(() => {
     vi.restoreAllMocks()
-    delete (window as Window).google
   })
 
-  it('renewal fails mid-save → error + reconnect prompt, form kept; after reconnect the retry completes into the SAME folder', async () => {
-    let gisMode: 'grant' | 'fail' = 'grant'
-    let n = 0
-    window.google = {
-      accounts: {
-        oauth2: {
-          initTokenClient: (c) => ({
-            requestAccessToken: () =>
-              setTimeout(() => {
-                n += 1
-                if (gisMode === 'grant') c.callback({ access_token: `T${n}`, expires_in: 3600, scope: DRIVE_SCOPE })
-                else c.error_callback?.({ type: 'popup_failed_to_open' })
-              }, 0),
-          }),
-          revoke: vi.fn(),
-        },
-      },
-    }
-    vi.spyOn(document.head, 'appendChild').mockImplementation((el) => {
-      queueMicrotask(() => (el as HTMLScriptElement).onload?.(new Event('load')))
-      return el
-    })
-    const auth = new GoogleAuth('cid')
+  async function setup() {
+    const backend = fakeSessionBackend()
+    const navigate = vi.fn()
+    const auth = new SessionAuth({ fetchImpl: backend.fetchImpl, navigate, log: () => {} })
     await auth.init()
     const mem = new MemoryDrive()
     const root = mem.createRootFolder('models')
     const drive = new TokenGatedDrive(mem, auth)
-    const services: AppServices = {
-      mode: 'google',
-      drive,
-      auth,
-      folderPointer: memoryFolderPointer(root),
-      pickFolder: async () => null,
-    }
+    const services: AppServices = { mode: 'google', drive, auth, folderPointer: memoryFolderPointer(root), pickFolder: async () => null }
+    return { backend, navigate, auth, mem, root, drive, services }
+  }
+
+  it('session lost mid-save → error + reconnect banner, form kept; reconnect (silent) → the retry completes into the SAME folder', async () => {
+    const { backend, navigate, mem, root, drive, services } = await setup()
     const user = userEvent.setup()
     renderApp(services, '/new')
-    await user.click(within(screen.getByRole('banner')).getByRole('button', { name: 'התחברות עם Google' }))
+    // AC18: signed in from the session cookie with no click.
     await screen.findByText('מחובר ל-Google')
 
     const name = (await screen.findByLabelText(/^שם\s*\*$/)) as HTMLInputElement
@@ -334,9 +331,9 @@ describe('Fix round 2 — lost Google connection during a save', () => {
     await screen.findAllByTestId('part-row')
     await user.type(screen.getByLabelText('זמן עבודה'), '15')
 
-    // The token "expires" while uploading the sliced file; the silent renewal popup is blocked.
+    // Drive says 401 while uploading the sliced file; the session endpoint answers 401 too.
     drive.refreshBeforeUploadOf = 'rooting-stand.gcode.3mf'
-    gisMode = 'fail'
+    backend.state.session = 'gone'
     await user.click(screen.getByRole('button', { name: 'שמירה' }))
 
     expect(await screen.findByText(/החיבור ל-Google פג — לחצו 'התחבר מחדש'/)).toBeTruthy()
@@ -348,13 +345,14 @@ describe('Fix round 2 — lost Google connection during a save', () => {
     expect((screen.getByLabelText('משקל') as HTMLInputElement).value).toBe('55.94')
     expect((screen.getByLabelText('זמן עבודה') as HTMLInputElement).value).toBe('15')
     expect(screen.getByText('rooting-stand.gcode.3mf')).toBeTruthy()
-    expect(screen.getByText(/להשתמש בתמונת הפלטה 1/)).toBeTruthy()
     const foldersAfterFailure = await mem.listChildren(root, { foldersOnly: true })
     expect(foldersAfterFailure.map((f) => f.name)).toEqual(['Stand'])
 
-    gisMode = 'grant'
+    // The session is valid again (e.g. a transient problem): reconnect succeeds silently, no page navigation.
+    backend.state.session = 'ok'
     await user.click(reconnect)
     await screen.findByText('מחובר ל-Google')
+    expect(navigate).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'התחבר מחדש' })).toBeNull()
 
     await user.click(screen.getByRole('button', { name: 'שמירה' }))
@@ -366,6 +364,28 @@ describe('Fix round 2 — lost Google connection during a save', () => {
       'rooting-stand.gcode.3mf',
       BID_FILE_NAME,
     ])
+  })
+
+  it('reconnect when the session is really gone → full-page navigation to /api/auth/login', async () => {
+    const { backend, navigate, auth, services } = await setup()
+    const user = userEvent.setup()
+    renderApp(services, '/new')
+    await screen.findByText('מחובר ל-Google')
+    backend.state.session = 'gone'
+    await expect(auth.refresh()).rejects.toThrow()
+    await user.click(await screen.findByRole('button', { name: 'התחבר מחדש' }))
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/api/auth/login'))
+  })
+
+  it('signed out: the header button navigates to /api/auth/login (no popup)', async () => {
+    const { backend, navigate, services } = { ...(await setup()) }
+    backend.state.session = 'gone'
+    const auth2 = new SessionAuth({ fetchImpl: backend.fetchImpl, navigate, log: () => {} })
+    await auth2.init()
+    const user = userEvent.setup()
+    renderApp({ ...services, auth: auth2 }, '/')
+    await user.click(within(screen.getByRole('banner')).getByRole('button', { name: 'התחברות עם Google' }))
+    expect(navigate).toHaveBeenCalledWith('/api/auth/login')
   })
 })
 
