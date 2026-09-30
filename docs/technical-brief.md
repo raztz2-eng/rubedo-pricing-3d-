@@ -112,3 +112,40 @@ Read only these small entries with JSZip; never decompress the large `.gcode` en
 - "Open in Bambu Studio" links are blocked by Bambu for non-MakerWorld sites → download button instead.
 - drive.file scope: the app only sees files it created (old models in the folder are not listed unless saved via the app).
 - Google OAuth app stays in "Testing" mode (single user, free); sign-in shows an "unverified app" notice.
+
+---
+# Addendum v0.3 — Existing models & manual photos (Founder decisions, 30 Sep 2026)
+
+## Decisions
+- D-A **Drive access:** scopes = `drive.file` + `drive.readonly`. The app may READ everything (to see existing model
+  folders and photos the Founder adds directly in Drive) but WRITES only files it created (bid.json, index, settings,
+  new model folders, uploads). Still never deletes, never modifies/moves files it did not create.
+- D-B **Models without a sliced file** appear in the library as "דורש סלייס" (needs slicing): no price, but name,
+  cover picture and files.
+- D-C Models folder = `3D › models` (the Founder re-picks it in Settings; the earlier pick was the parent `3D`).
+
+## New behaviour
+N1 **Library = every direct subfolder of the models folder** (skip names starting with `_` and the folder "Models photo").
+   - Has `bid.json` → normal priced card (as today).
+   - No `bid.json` → "needs slicing" card: folder name, cover, badge "דורש סלייס". If the folder contains a sliced
+     `.gcode.3mf`, the badge is "נמצא קובץ סלייס — צור הצעה" instead.
+N2 **Create bid from an existing folder:** from a needs-slicing card/page, button "צור הצעת מחיר" opens the bid form
+   prefilled: name = folder name; if a sliced .gcode.3mf is in the folder it is parsed and becomes the part(s) (source
+   3mf, slicedFileId = that existing file — not re-uploaded). Saving writes `bid.json` (+ any newly added uploads) INTO
+   THAT EXISTING FOLDER — no new folder, no name-conflict dialog for that folder.
+N3 **Photos from Drive:** a model page shows ALL images in its folder (not only those listed in bid.json), incl. photos
+   added manually later. Cover = bid.coverFileId if set, else the first image in the folder (by name), else plate picture.
+   Use Drive `thumbnailLink` (sized, e.g. `=s800`) for display so HEIC photos from iPhone render; full image via link.
+N4 **Model files list** on the model page = all non-image files in the folder (STL/3MF/STEP/ZIP/…), each with a Drive
+   link; sliced files get the "Download for Bambu Studio" button.
+N5 Index cache stores both kinds (`status: "priced" | "needs-slicing"`) and is rebuilt by "רענון ספרייה"; the library
+   also auto-refreshes once on open if the index is older than 10 minutes.
+N6 Nothing in N1–N5 may modify or move files the app did not create.
+
+## Acceptance criteria (additional)
+AC14 A models-folder subfolder without bid.json appears as a needs-slicing card with its name.
+AC15 Such a folder containing `tests/fixtures/rooting-stand.gcode.3mf` shows the "sliced file found" badge; "create bid"
+     prefills 55.94 g / 2.587 h; saving writes bid.json into the SAME folder, uploads nothing already present, and the
+     card becomes priced (₪23.17 at defaults).
+AC16 An image added to a priced model's folder after saving (not in bid.json) appears on its model page.
+AC17 Requested scopes are exactly drive.file + drive.readonly; no write/delete call targets a file not created by the app.

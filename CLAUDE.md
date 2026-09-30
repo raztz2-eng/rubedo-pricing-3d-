@@ -48,7 +48,7 @@ All four of typecheck, lint, test, build must pass before any agent reports "don
 - Do not deploy to production. Preview deployments only. Production = Founder approval.
 - Do not buy, subscribe to, or enable any paid service or plan. Ever.
 - Do not add a backend, database, Supabase, Firebase or server functions (Founder decision: Drive only).
-- Do not request Drive scopes wider than `https://www.googleapis.com/auth/drive.file`.
+- Drive scopes: exactly `drive.file` + `drive.readonly` (Founder decision 30 Sep). Read anything; write/modify ONLY files the app created; never delete/move.
 - Do not store the Google access token in localStorage/sessionStorage/cookies — memory only.
 - Do not commit secrets, `.env*` (except `.env.example`), keys, or tokens. The pre-commit hook blocks them.
 - Do not add dependencies beyond the stack above without writing why in your summary.
