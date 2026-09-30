@@ -87,3 +87,7 @@ uptime 0.5, powerW 150, kwhPrice 0.64, buffer 1.3, material price ₪85/kg for P
   production ONLY from the Founder merging to `main`. (COO incident)
 - jsdom: `URL.createObjectURL` throws on JSZip blobs → use `createObjectUrlSafe`; load fixtures with
   `resolve(process.cwd(), 'tests/fixtures', …)`. Tailwind v4 custom classes need `@utility`. (builder notes)
+- Static safety scans grep comments too: don't write delete/trash/move or /permissions in comments under src/ or api/. (v0.4)
+- Test fixtures must never use real secret prefixes (e.g. GOCSPX-) — push protection and scanners flag them. (v0.4)
+- When a Founder decision changes an asserted rule, COO has the test-verifier update affected acceptance tests right
+  after the builder; the builder reports conflicts instead of editing tests/acceptance/. (v0.3/v0.4)

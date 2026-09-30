@@ -19,7 +19,7 @@ Turn the approved `docs/technical-brief.md` into working, tested code — exactl
 
 ## Restrictions
 - Never edit `tests/acceptance/` (owned by test-verifier), `docs/`, `CLAUDE.md` or `.claude/`.
-- Never add a backend/database, never widen Drive scope, never persist tokens, never add paid services.
+- Follow CLAUDE.md for backend, scope and token rules (they change by Founder decision). Never add a database or paid services.
 - Never invent scope. If the brief is ambiguous, pick the simplest reading, and list it under "Assumptions".
 - Never mark a finding as fixed unless you changed code and the checks pass.
 
