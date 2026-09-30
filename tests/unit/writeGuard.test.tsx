@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { describe, expect, it, vi } from 'vitest'
@@ -81,7 +81,7 @@ describe('AC22 — static: no code path can delete/trash/move/rename or change p
     expect(patches.map((f) => f.replace(process.cwd(), ''))).toEqual(['/src/lib/drive/googleDrive.ts'])
     const code = readFileSync(resolve(process.cwd(), 'src/lib/drive/googleDrive.ts'), 'utf8')
     const update = code.slice(code.indexOf('async updateFileContent'), code.indexOf('async readText'))
-    expect(update).toContain('decideUpdate(await this.getFile(fileId), options)')
+    expect(update).toContain('assertUpdatable(await this.getFile(fileId))')
     expect(update).toMatch(/multipart\(\{ appProperties: \{ \.\.\.APP_PROPERTIES \} \}/)
     expect(update).not.toMatch(/\bname\b\s*:|parents\s*:/)
   })
@@ -110,35 +110,103 @@ describe('AC22 — write guard on the in-memory drive (same rules as the real st
     for (const id of [foreign, legacyBid, folder.id]) {
       await expect(d.updateFileContent(id, new Blob(['x']), 'application/json')).rejects.toBeInstanceOf(DriveError)
     }
-    // Claiming the legacy exception for a bid.json does not work (settings/index only).
-    await expect(
-      d.updateFileContent(legacyBid, new Blob(['x']), 'application/json', { adoptLegacy: { modelsFolderId: folder.id, name: 'bid.json' } }),
-    ).rejects.toMatchObject({ status: 403 })
   })
 
-  it('legacy settings + index (pre-v0.4, no marker) in the models folder root: rewritten once and marked', async () => {
+  it('unmarked settings + index in the models folder root are NEVER rewritten: new marked files are created next to them', async () => {
     const d = new MemoryDrive()
     const root = d.createRootFolder('models')
-    const settingsId = d.addLegacyAppFile(root, SETTINGS_FILE_NAME, new Blob([JSON.stringify(defaultAppSettings())]), 'application/json')
+    const old = { ...defaultAppSettings(), pricing: { ...DEFAULT_PRICING_SETTINGS, laborRate: 77 } }
+    const settingsId = d.addLegacyAppFile(root, SETTINGS_FILE_NAME, new Blob([JSON.stringify(old)]), 'application/json')
     const indexId = d.addLegacyAppFile(root, INDEX_FILE_NAME, new Blob(['[]']), 'application/json')
+    const oldSettings = await d.readBlob(settingsId)
+    const oldIndex = await d.readBlob(indexId)
 
-    await saveSettings(d, root, { ...defaultAppSettings(), pricing: { ...DEFAULT_PRICING_SETTINGS, laborRate: 95 } })
+    // First load: seeded from the old file's values; a NEW marked file; I2 notice ("copied").
+    const loaded = await loadSettingsWithStatus(d, root)
+    expect(loaded).toMatchObject({ created: true, origin: 'copied' })
+    expect(loaded.settings.pricing.laborRate).toBe(77)
+    await saveSettings(d, root, { ...old, pricing: { ...old.pricing, laborRate: 95 } })
     await rebuildIndex(d, root)
-    expect((await d.getFile(settingsId)).appCreated).toBe(true)
-    expect((await d.getFile(indexId)).appCreated).toBe(true)
-    expect(JSON.parse(await d.readText(settingsId)).pricing.laborRate).toBe(95)
-    // No duplicate files were created.
-    expect((await d.listChildren(root)).map((f) => f.name).sort()).toEqual([INDEX_FILE_NAME, SETTINGS_FILE_NAME].sort())
+    await rebuildIndex(d, root)
+
+    // Old files: same content object, still unmarked, never a write target.
+    expect(await d.readBlob(settingsId)).toBe(oldSettings)
+    expect(await d.readBlob(indexId)).toBe(oldIndex)
+    expect((await d.getFile(settingsId)).appCreated).toBe(false)
+    expect(d.writeTargets.filter((w) => w.op === 'updateFileContent').map((w) => w.targetId)).not.toContain(settingsId)
+    expect(d.writeTargets.filter((w) => w.op === 'updateFileContent').map((w) => w.targetId)).not.toContain(indexId)
+    // Exactly one new marked copy of each, which later reads/writes use.
+    const kids = await d.listChildren(root)
+    for (const name of [SETTINGS_FILE_NAME, INDEX_FILE_NAME]) {
+      const same = kids.filter((k) => k.name === name)
+      expect(same.map((k) => k.appCreated).sort(), name).toEqual([false, true])
+    }
+    const again = await loadSettingsWithStatus(d, root)
+    expect(again).toMatchObject({ created: false, origin: 'existing' })
+    expect(again.settings.pricing.laborRate).toBe(95)
   })
 
-  it('a settings-named file in a SUBFOLDER is not covered by the exception', async () => {
+  it('a corrupt unmarked settings file is an error (never silently replaced by defaults)', async () => {
     const d = new MemoryDrive()
     const root = d.createRootFolder('models')
-    const sub = d.addForeignFolder(root, 'Sub')
-    const id = d.addLegacyAppFile(sub, SETTINGS_FILE_NAME, new Blob(['{}']), 'application/json')
+    d.addLegacyAppFile(root, SETTINGS_FILE_NAME, new Blob(['{not json']), 'application/json')
+    await expect(loadSettingsWithStatus(d, root)).rejects.toThrow()
+    expect(d.writeLog).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+describe('I2 (fix round) — a bid saved before v0.4 (bid.json without marker) is read-only and can be re-created', () => {
+  async function legacyFolder() {
+    const services = createMemoryServices()
+    const root = services.folderPointer.get() as string
+    const d = services.drive
+    const folder = d.addForeignFolder(root, 'Old stand')
+    const old = await validBid(d, root)
+    const legacy = { ...old, name: 'Old stand', laborMinutes: 12 }
+    const legacyId = d.addLegacyAppFile(folder, 'bid.json', new Blob([JSON.stringify(legacy)]), 'application/json')
+    return { services, root, d, folder, legacyId }
+  }
+
+  it('model page: Hebrew notice, no "edit", a "re-create" link; the edit route refuses too; updateBid writes nothing', async () => {
+    const { services, root, d, folder, legacyId } = await legacyFolder()
+    renderApp(services, `/model/${folder}`)
+    await screen.findByRole('heading', { level: 1, name: 'Old stand' })
+    expect(screen.getByTestId('legacy-bid-notice').textContent).toBe('הצעה זו נשמרה בגרסה ישנה — לא ניתן לערוך. אפשר ליצור הצעה חדשה מהתיקייה.')
+    expect(screen.queryByRole('link', { name: 'עריכה' })).toBeNull()
+    expect(screen.getByRole('link', { name: 'צור הצעה מחדש' }).getAttribute('href')).toBe(`/model/${folder}/create`)
+    cleanup()
+
+    renderApp(services, `/model/${folder}/edit`)
+    expect((await screen.findByRole('alert')).textContent).toMatch(/נשמרה בגרסה ישנה/)
+    expect(screen.queryByRole('button', { name: 'שמירה' })).toBeNull()
+
+    const bid = JSON.parse(await d.readText(legacyId))
+    const before = d.writeLog.length
     await expect(
-      d.updateFileContent(id, new Blob(['x']), 'application/json', { adoptLegacy: { modelsFolderId: root, name: SETTINGS_FILE_NAME } }),
+      updateBid(d, root, { folderId: folder, existing: bid, content: content('Old stand'), newFiles: [png('x.png')] }, newSaveSession()),
     ).rejects.toMatchObject({ status: 403 })
+    expect(d.writeLog.length).toBe(before) // nothing uploaded either
+  })
+
+  it('"צור הצעה מחדש" → prefilled from the old bid → saving writes a NEW marked bid.json next to the old one, which stays untouched; the page is then editable', async () => {
+    const user = userEvent.setup()
+    const { services, d, folder, legacyId } = await legacyFolder()
+    const oldBlob = await d.readBlob(legacyId)
+    renderApp(services, `/model/${folder}`)
+    await user.click(await screen.findByRole('link', { name: 'צור הצעה מחדש' }))
+    expect(((await screen.findByLabelText(/^שם \*$/)) as HTMLInputElement).value).toBe('Old stand')
+    expect((screen.getByLabelText('זמן עבודה') as HTMLInputElement).value).toBe('12')
+    await user.click(screen.getByRole('button', { name: 'שמירה' }))
+    await screen.findByRole('heading', { level: 1, name: 'Old stand' })
+
+    const bids = await d.listChildren(folder, { name: 'bid.json' })
+    expect(bids.map((b) => b.appCreated).sort()).toEqual([false, true])
+    expect(await d.readBlob(legacyId)).toBe(oldBlob)
+    expect(d.writeTargets.filter((w) => w.op === 'updateFileContent').map((w) => w.targetId)).not.toContain(legacyId)
+    // The marked copy wins (M3): no legacy notice, "edit" is back.
+    expect(screen.queryByTestId('legacy-bid-notice')).toBeNull()
+    expect(screen.getByRole('link', { name: 'עריכה' })).toBeTruthy()
   })
 })
 

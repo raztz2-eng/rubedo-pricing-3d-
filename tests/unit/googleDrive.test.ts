@@ -114,31 +114,11 @@ describe('GoogleDriveStore', () => {
     }
   })
 
-  it('legacy settings/index (pre-v0.4, no marker) in the models folder root: update allowed and the marker added in the same PATCH', async () => {
-    const fetchMock = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(json({ id: 'S', name: '_rubedo-settings.json', mimeType: 'application/json', parents: ['ROOT'] }))
-      .mockResolvedValueOnce(json({ id: 'S' }))
-    await new GoogleDriveStore(tokens(), fetchMock).updateFileContent('S', new Blob(['{}']), 'application/json', {
-      adoptLegacy: { modelsFolderId: 'ROOT', name: '_rubedo-settings.json' },
-    })
-    const [, init] = fetchMock.mock.calls[1]
-    expect(init?.method).toBe('PATCH')
-    expect(await (init?.body as Blob).text()).toContain('"appProperties":{"rubedo":"1"}')
-  })
-
-  it('legacy exception does not apply elsewhere: other folder, other name, or a name claim that does not match', async () => {
-    const cases = [
-      { file: { name: '_rubedo-settings.json', parents: ['SUB'] }, claim: { modelsFolderId: 'ROOT', name: '_rubedo-settings.json' } },
-      { file: { name: 'bid.json', parents: ['ROOT'] }, claim: { modelsFolderId: 'ROOT', name: 'bid.json' } },
-      { file: { name: 'notes.json', parents: ['ROOT'] }, claim: { modelsFolderId: 'ROOT', name: '_rubedo-index.json' } },
-    ]
-    for (const c of cases) {
-      const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ id: 'X', mimeType: 'application/json', ...c.file }))
-      const err = await new GoogleDriveStore(tokens(), fetchMock)
-        .updateFileContent('X', new Blob(['x']), 'application/json', { adoptLegacy: c.claim })
-        .catch((e: unknown) => e)
-      expect((err as DriveError).status, JSON.stringify(c)).toBe(403)
+  it('AC22: an unmarked settings/index file in the models folder root is refused too (no legacy exception)', async () => {
+    for (const name of ['_rubedo-settings.json', '_rubedo-index.json']) {
+      const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ id: 'S', name, mimeType: 'application/json', parents: ['ROOT'] }))
+      const err = await new GoogleDriveStore(tokens(), fetchMock).updateFileContent('S', new Blob(['{}']), 'application/json').catch((e: unknown) => e)
+      expect((err as DriveError).status, name).toBe(403)
       expect(fetchMock).toHaveBeenCalledTimes(1)
     }
   })

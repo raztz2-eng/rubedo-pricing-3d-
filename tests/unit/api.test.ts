@@ -17,6 +17,8 @@ import {
 } from '../../api/_lib/handlers'
 import { SESSION_COOKIE, STATE_COOKIE, sessionCookie } from '../../api/_lib/session'
 
+const NOW = 1_700_000_000_000
+
 const ORIGIN = 'https://rubedo.example.app'
 const SECRET = 'fake-test-client-secret-not-real'
 const CLIENT_ID = 'client-123.apps.googleusercontent.com'
@@ -48,10 +50,10 @@ function google(overrides: Partial<Record<'token' | 'refresh' | 'userinfo' | 're
       if (grant === 'authorization_code') {
         return answer(
           overrides.token ??
-            (() => Response.json({ access_token: 'ya29.login', refresh_token: RT, expires_in: 3599, scope: `openid ${DRIVE} https://www.googleapis.com/auth/userinfo.email` })),
+            (() => Response.json({ access_token: 'fake-access-login', refresh_token: RT, expires_in: 3599, scope: `openid ${DRIVE} https://www.googleapis.com/auth/userinfo.email` })),
         )
       }
-      return answer(overrides.refresh ?? (() => Response.json({ access_token: 'ya29.fresh', expires_in: 3599 })))
+      return answer(overrides.refresh ?? (() => Response.json({ access_token: 'fake-access-fresh', expires_in: 3599 })))
     }
     if (url === 'https://www.googleapis.com/oauth2/v3/userinfo') {
       return answer(overrides.userinfo ?? (() => Response.json({ email: EMAIL, email_verified: true })))
@@ -75,7 +77,7 @@ function makeDeps(g = google(), env: Record<string, string | undefined> = { GOOG
     fetch: g.fetchImpl,
     log: (m) => logs.push(m),
     random: (n) => Buffer.alloc(n, 7),
-    now: () => 1_700_000_000_000,
+    now: () => NOW,
     tokenCache: new Map<string, CachedToken>(),
   }
   return { deps, logs, g }
@@ -88,8 +90,8 @@ function req(path: string, init: { method?: string; cookie?: string; origin?: st
   return new Request(`${ORIGIN}${path}`, { method: init.method ?? 'GET', headers })
 }
 
-function validSessionCookie(rt = RT, email = EMAIL): string {
-  const set = sessionCookie({ v: 1, rt, email, iat: 1 }, SECRET)
+function validSessionCookie(rt = RT, email = EMAIL, iat = Math.floor(NOW / 1000) - 60): string {
+  const set = sessionCookie({ v: 1, rt, email, iat }, SECRET)
   return set.split(';')[0]
 }
 
@@ -108,10 +110,12 @@ async function visible(res: Response): Promise<string> {
 describe('api/_lib/crypto — AES-256-GCM session sealing', () => {
   it('round-trips, and rejects tampering, another key and garbage', () => {
     const key = deriveKey(SECRET)
-    const sealed = seal('{"rt":"x"}', key)
+    const plain = '{"rt":"refresh-value-in-plaintext"}'
+    const sealed = seal(plain, key)
     expect(sealed.startsWith('v1.')).toBe(true)
-    expect(sealed).not.toContain('rt')
-    expect(unseal(sealed, key)).toBe('{"rt":"x"}')
+    expect(sealed).not.toContain('refresh-value-in-plaintext')
+    expect(Buffer.from(sealed.slice(3), 'base64url').toString('latin1')).not.toContain('refresh-value')
+    expect(unseal(sealed, key)).toBe(plain)
 
     const raw = Buffer.from(sealed.slice(3), 'base64url')
     for (const i of [0, 13, raw.length - 1]) {
@@ -225,6 +229,45 @@ describe('GET /api/auth/callback', () => {
     }
   })
 
+  it('M2: the rejected account\'s refresh token is revoked at Google (best effort)', async () => {
+    const { deps, g } = makeDeps(google({ userinfo: () => Response.json({ email: 'someone.else@gmail.com', email_verified: true }) }))
+    await handleCallback(cb(`code=CODE&state=${STATE}`), deps)
+    const revoke = g.calls.find((c) => c.url === 'https://oauth2.googleapis.com/revoke') as Call
+    expect(new URLSearchParams(revoke.body).get('token')).toBe(RT)
+    // Revoke failure never changes the answer.
+    const failing = makeDeps(
+      google({
+        userinfo: () => Response.json({ email: 'someone.else@gmail.com', email_verified: true }),
+        revoke: () => {
+          throw new Error('down')
+        },
+      }),
+    )
+    expect((await handleCallback(cb(`code=CODE&state=${STATE}`), failing.deps)).status).toBe(403)
+  })
+
+  it('I4 popup: login?popup=1 → callback answers a tiny "you can close this window" page (session set), whose only script is window.close()', async () => {
+    const { deps } = makeDeps()
+    const login = await handleLogin(req('/api/auth/login?popup=1'), deps)
+    const state = new URL(login.headers.get('Location') as string).searchParams.get('state') as string
+    const stateCookie = login.headers.getSetCookie()[0].split(';')[0]
+    const res = await handleCallback(req(`/api/auth/callback?code=CODE&state=${encodeURIComponent(state)}`, { cookie: stateCookie }), deps)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('Location')).toBeNull()
+    const html = await res.text()
+    expect(html).toContain('מחובר — אפשר לסגור את החלון')
+    expect(html).toContain('<script>window.close()</script>')
+    const csp = res.headers.get('Content-Security-Policy') ?? ''
+    const { createHash } = await import('node:crypto')
+    expect(csp).toContain(`script-src 'sha256-${createHash('sha256').update('window.close()').digest('base64')}'`)
+    expect(csp).toMatch(/default-src 'none'/)
+    expect(setCookies(res).some((c) => c.startsWith(`${SESSION_COOKIE}=v1.`))).toBe(true)
+    // A normal (non-popup) login still ends with the 302 to "/".
+    const normal = await handleLogin(req('/api/auth/login'), deps)
+    const s2 = new URL(normal.headers.get('Location') as string).searchParams.get('state') as string
+    expect(s2.endsWith('.p')).toBe(false)
+  })
+
   it('ALLOWED_EMAIL env overrides the default (case-insensitive)', async () => {
     const { deps } = makeDeps(google({ userinfo: () => Response.json({ email: 'Partner@Example.com', email_verified: true }) }), {
       GOOGLE_CLIENT_ID: CLIENT_ID,
@@ -282,7 +325,7 @@ describe('POST /api/auth/token (AC20)', () => {
     const res = await handleToken(req('/api/auth/token', { method: 'POST', cookie: validSessionCookie(), origin: ORIGIN }), deps)
     expect(res.status).toBe(200)
     expect(res.headers.get('Cache-Control')).toBe('no-store')
-    expect(await res.json()).toEqual({ access_token: 'ya29.fresh', expires_in: 3599, email: EMAIL })
+    expect(await res.json()).toEqual({ access_token: 'fake-access-fresh', expires_in: 3599, email: EMAIL })
     const call = g.calls[0]
     expect(call.url).toBe('https://oauth2.googleapis.com/token')
     expect(new URLSearchParams(call.body).get('refresh_token')).toBe(RT)
@@ -334,6 +377,17 @@ describe('POST /api/auth/token (AC20)', () => {
     expect(setCookies(r2)).toEqual([])
   })
 
+  it('M4: a session issued more than 180 days ago is rejected (401 + cleared) without asking Google', async () => {
+    const { deps, g } = makeDeps()
+    const old = validSessionCookie(RT, EMAIL, Math.floor(NOW / 1000) - 181 * 24 * 3600)
+    const res = await handleToken(req('/api/auth/token', { method: 'POST', cookie: old }), deps)
+    expect(res.status).toBe(401)
+    expect(setCookies(res)[0]).toMatch(/Max-Age=0$/)
+    expect(g.calls).toEqual([])
+    const young = validSessionCookie(RT, EMAIL, Math.floor(NOW / 1000) - 179 * 24 * 3600)
+    expect((await handleToken(req('/api/auth/token', { method: 'POST', cookie: young }), deps)).status).toBe(200)
+  })
+
   it('a session for an account that is no longer allowed → 401 + cleared', async () => {
     const { deps, g } = makeDeps()
     const res = await handleToken(req('/api/auth/token', { method: 'POST', cookie: validSessionCookie(RT, 'old@example.com') }), deps)
@@ -342,7 +396,7 @@ describe('POST /api/auth/token (AC20)', () => {
   })
 
   it('a rotated refresh token from Google is stored in a new encrypted cookie, never in the body', async () => {
-    const { deps } = makeDeps(google({ refresh: () => Response.json({ access_token: 'ya29.x', expires_in: 3600, refresh_token: RT2 }) }))
+    const { deps } = makeDeps(google({ refresh: () => Response.json({ access_token: 'fake-access-x', expires_in: 3600, refresh_token: RT2 }) }))
     const res = await handleToken(req('/api/auth/token', { method: 'POST', cookie: validSessionCookie() }), deps)
     const [cookie] = setCookies(res)
     const value = cookie.split(';')[0].slice(SESSION_COOKIE.length + 1)
@@ -407,7 +461,7 @@ describe('GET /api/thumb (AC23)', () => {
     expect(Array.from(new Uint8Array(await res.arrayBuffer()))).toEqual([0xff, 0xd8, 0xff])
     const meta = g.calls.find((c) => c.url.startsWith('https://www.googleapis.com/drive/v3/files/')) as Call
     expect(meta.url).toContain(`/files/${FILE_ID}?fields=thumbnailLink`)
-    expect(meta.headers.authorization).toBe('Bearer ya29.fresh')
+    expect(meta.headers.authorization).toBe('Bearer fake-access-fresh')
     const img = g.calls.find((c) => c.url.startsWith('https://lh3.googleusercontent.com/')) as Call
     expect(img.url).toBe('https://lh3.googleusercontent.com/drive-thumb/abc=s400')
     expect(img.redirect).toBe('manual')
@@ -444,9 +498,13 @@ describe('GET /api/thumb (AC23)', () => {
     expect(redirecting.g.calls.some((c) => c.url.includes('evil.example.com'))).toBe(false)
   })
 
-  it('host allowlist', () => {
-    expect(isAllowedThumbnailUrl('https://lh3.googleusercontent.com/a')).toBe(true)
-    expect(isAllowedThumbnailUrl('https://drive.google.com/thumbnail?id=1')).toBe(true)
+  it('M8 host allowlist: only lh3–lh6.googleusercontent.com, drive.google.com, docs.google.com', () => {
+    for (const ok of ['https://lh3.googleusercontent.com/a', 'https://lh6.googleusercontent.com/a', 'https://drive.google.com/thumbnail?id=1', 'https://docs.google.com/x']) {
+      expect(isAllowedThumbnailUrl(ok), ok).toBe(true)
+    }
+    for (const bad of ['https://lh7.googleusercontent.com/a', 'https://lh2.googleusercontent.com/a', 'https://sites.googleusercontent.com/a', 'https://www.google.com/a', 'https://google.com/a', 'https://evil.google.com/a']) {
+      expect(isAllowedThumbnailUrl(bad), bad).toBe(false)
+    }
     expect(isAllowedThumbnailUrl('https://evilgoogle.com/a')).toBe(false)
     expect(isAllowedThumbnailUrl('https://google.com.evil.io/a')).toBe(false)
     expect(isAllowedThumbnailUrl('https://lh3.googleusercontent.com:8443/a')).toBe(false)
@@ -454,11 +512,57 @@ describe('GET /api/thumb (AC23)', () => {
     expect(sizeThumbnailUrl('https://lh3.googleusercontent.com/a=s220', 800)).toBe('https://lh3.googleusercontent.com/a=s800')
   })
 
-  it('no thumbnail → 404; file not found → 404; not an image → 502', async () => {
+  it('no thumbnail → 404; file not found → 404; upstream error → 502', async () => {
     expect((await handleThumb(thumbReq(`id=${FILE_ID}`), makeDeps(google({ meta: () => Response.json({}) })).deps)).status).toBe(404)
     expect((await handleThumb(thumbReq(`id=${FILE_ID}`), makeDeps(google({ meta: () => new Response('', { status: 404 }) })).deps)).status).toBe(404)
-    const html = makeDeps(google({ thumb: () => new Response('<html>', { headers: { 'Content-Type': 'text/html' } }) }))
-    expect((await handleThumb(thumbReq(`id=${FILE_ID}`), html.deps)).status).toBe(502)
+    expect((await handleThumb(thumbReq(`id=${FILE_ID}`), makeDeps(google({ thumb: () => new Response('', { status: 500 }) })).deps)).status).toBe(502)
+  })
+
+  it('I3: only jpeg/png/webp/gif pass (with CSP sandbox + nosniff); SVG, HTML, HEIC, missing type → 415', async () => {
+    for (const type of ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/png; charset=binary']) {
+      const d = makeDeps(google({ thumb: () => new Response(new Uint8Array([1, 2]), { headers: { 'Content-Type': type } }) }))
+      const res = await handleThumb(thumbReq(`id=${FILE_ID}`), d.deps)
+      expect(res.status, type).toBe(200)
+      expect(res.headers.get('Content-Type')).toBe(type.split(';')[0])
+      expect(res.headers.get('Content-Security-Policy')).toBe("default-src 'none'; sandbox")
+      expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff')
+    }
+    for (const type of ['image/svg+xml', 'text/html', 'image/heic', 'application/octet-stream', '']) {
+      const d = makeDeps(google({ thumb: () => new Response('<svg onload="alert(1)"/>', { headers: type ? { 'Content-Type': type } : {} }) }))
+      const res = await handleThumb(thumbReq(`id=${FILE_ID}`), d.deps)
+      expect(res.status, type).toBe(415)
+      expect(await res.text()).not.toContain('<svg')
+    }
+  })
+
+  it('M8: the bearer token goes only to the initial thumbnail host, never on a redirect hop (even to an allowed host)', async () => {
+    const d = makeDeps(
+      google({
+        thumb: () => new Response(null, { status: 302, headers: { Location: 'https://drive.google.com/thumb-final' } }),
+      }),
+    )
+    // drive.google.com is not served by the fake → answer an image for it.
+    const inner = d.deps.fetch
+    d.deps.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === 'https://drive.google.com/thumb-final') {
+        d.g.calls.push({ url: String(input), method: 'GET', body: '', headers: Object.fromEntries(new Headers(init?.headers).entries()) })
+        return new Response(new Uint8Array([9]), { headers: { 'Content-Type': 'image/png' } })
+      }
+      return inner(input, init)
+    }) as typeof fetch
+    const res = await handleThumb(thumbReq(`id=${FILE_ID}`), d.deps)
+    expect(res.status).toBe(200)
+    const first = d.g.calls.find((c) => c.url.startsWith('https://lh3.googleusercontent.com/')) as Call
+    const hop = d.g.calls.find((c) => c.url === 'https://drive.google.com/thumb-final') as Call
+    expect(first.headers.authorization).toMatch(/^Bearer /)
+    expect(hop.headers.authorization).toBeUndefined()
+  })
+
+  it('M9: many thumbnails requested at once share ONE token mint', async () => {
+    const { deps, g } = makeDeps()
+    const results = await Promise.all(Array.from({ length: 8 }, () => handleThumb(thumbReq(`id=${FILE_ID}`), deps)))
+    expect(results.map((r) => r.status)).toEqual(Array(8).fill(200))
+    expect(g.calls.filter((c) => c.url === 'https://oauth2.googleapis.com/token')).toHaveLength(1)
   })
 
   it('requires a valid session: none → 401; tampered → 401 + cleared', async () => {
@@ -548,6 +652,41 @@ describe('AC24 — the refresh token and the client secret never reach a respons
     }
     const example = readFileSync(resolve(process.cwd(), '.env.example'), 'utf8')
     expect(example).toMatch(/^GOOGLE_CLIENT_SECRET=\s*$/m)
+  })
+
+  it('M5: seal() takes no IV from callers — two seals of the same text differ', () => {
+    const key = deriveKey(SECRET)
+    expect(seal.length).toBe(2)
+    expect(seal('same', key)).not.toBe(seal('same', key))
+  })
+
+  it('I3 vercel.json security headers: CSP (self + Google Picker hosts, img self/data/blob), Referrer-Policy, nosniff; /api keeps its own CSP', () => {
+    const cfg = JSON.parse(readFileSync(resolve(process.cwd(), 'vercel.json'), 'utf8')) as {
+      headers: { source: string; headers: { key: string; value: string }[] }[]
+    }
+    const forPath = (path: string) =>
+      cfg.headers
+        .filter((h) => new RegExp(`^${h.source}$`).test(path))
+        .flatMap((h) => h.headers)
+        .reduce<Record<string, string>>((acc, h) => ({ ...acc, [h.key.toLowerCase()]: h.value }), {})
+    const app = forPath('/library')
+    expect(app['referrer-policy']).toBe('strict-origin-when-cross-origin')
+    expect(app['x-content-type-options']).toBe('nosniff')
+    const csp = Object.fromEntries(
+      app['content-security-policy'].split(';').map((d) => d.trim().split(/\s+/)).map(([k, ...v]) => [k, v]),
+    ) as Record<string, string[]>
+    expect(csp['default-src']).toEqual(["'self'"])
+    expect(csp['script-src']).toEqual(expect.arrayContaining(["'self'", 'https://apis.google.com', 'https://accounts.google.com', 'https://docs.google.com']))
+    expect(csp['script-src']).not.toContain("'unsafe-inline'")
+    expect(csp['script-src']).not.toContain("'unsafe-eval'")
+    expect(csp['frame-src']).toEqual(expect.arrayContaining(['https://docs.google.com', 'https://*.googleusercontent.com']))
+    expect(csp['img-src']).toEqual(["'self'", 'data:', 'blob:'])
+    expect(csp['connect-src']).toEqual(expect.arrayContaining(["'self'", 'https://www.googleapis.com']))
+    expect(csp['object-src']).toEqual(["'none'"])
+    expect(csp['frame-ancestors']).toEqual(["'none'"])
+    const api = forPath('/api/auth/callback')
+    expect(api['content-security-policy']).toBeUndefined()
+    expect(api['x-content-type-options']).toBe('nosniff')
   })
 
   it('vercel.json: the SPA rewrite does not swallow /api/*', () => {

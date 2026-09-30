@@ -309,17 +309,18 @@ describe('Fix round 2 (v0.4 session) — lost Google connection during a save', 
   async function setup() {
     const backend = fakeSessionBackend()
     const navigate = vi.fn()
-    const auth = new SessionAuth({ fetchImpl: backend.fetchImpl, navigate, log: () => {} })
+    const openWindow = vi.fn(() => ({}))
+    const auth = new SessionAuth({ fetchImpl: backend.fetchImpl, navigate, openWindow, log: () => {} })
     await auth.init()
     const mem = new MemoryDrive()
     const root = mem.createRootFolder('models')
     const drive = new TokenGatedDrive(mem, auth)
     const services: AppServices = { mode: 'google', drive, auth, folderPointer: memoryFolderPointer(root), pickFolder: async () => null }
-    return { backend, navigate, auth, mem, root, drive, services }
+    return { backend, navigate, openWindow, auth, mem, root, drive, services }
   }
 
-  it('session lost mid-save → error + reconnect banner, form kept; reconnect (silent) → the retry completes into the SAME folder', async () => {
-    const { backend, navigate, mem, root, drive, services } = await setup()
+  it('session lost mid-save → error + reconnect banner, form kept; reconnect popup + "המשך" → the retry completes into the SAME folder', async () => {
+    const { backend, navigate, openWindow, mem, root, drive, services } = await setup()
     const user = userEvent.setup()
     renderApp(services, '/new')
     // AC18: signed in from the session cookie with no click.
@@ -348,9 +349,14 @@ describe('Fix round 2 (v0.4 session) — lost Google connection during a save', 
     const foldersAfterFailure = await mem.listChildren(root, { foldersOnly: true })
     expect(foldersAfterFailure.map((f) => f.name)).toEqual(['Stand'])
 
-    // The session is valid again (e.g. a transient problem): reconnect succeeds silently, no page navigation.
-    backend.state.session = 'ok'
+    // I4: the click opens the login popup; this page (and the form) stays mounted.
     await user.click(reconnect)
+    expect(openWindow).toHaveBeenCalledWith('/api/auth/login?popup=1')
+    expect(navigate).not.toHaveBeenCalled()
+    expect((screen.getByLabelText('משקל') as HTMLInputElement).value).toBe('55.94')
+    // Signed in inside the popup (new session cookie) → "המשך".
+    backend.state.session = 'ok'
+    await user.click(screen.getByRole('button', { name: 'המשך' }))
     await screen.findByText('מחובר ל-Google')
     expect(navigate).not.toHaveBeenCalled()
     expect(screen.queryByRole('button', { name: 'התחבר מחדש' })).toBeNull()
@@ -366,15 +372,24 @@ describe('Fix round 2 (v0.4 session) — lost Google connection during a save', 
     ])
   })
 
-  it('reconnect when the session is really gone → full-page navigation to /api/auth/login', async () => {
+  it('I4: coming back to the tab (window focus) after the popup sign-in reconnects by itself; the form never unmounts', async () => {
     const { backend, navigate, auth, services } = await setup()
     const user = userEvent.setup()
     renderApp(services, '/new')
     await screen.findByText('מחובר ל-Google')
+    await user.type((await screen.findByLabelText(/^שם\s*\*$/)) as HTMLInputElement, 'Keep me')
     backend.state.session = 'gone'
     await expect(auth.refresh()).rejects.toThrow()
     await user.click(await screen.findByRole('button', { name: 'התחבר מחדש' }))
-    await waitFor(() => expect(navigate).toHaveBeenCalledWith('/api/auth/login'))
+    // Focus while still no session: stays disconnected, nothing lost.
+    window.dispatchEvent(new Event('focus'))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(screen.getByText('נדרש חיבור מחדש')).toBeTruthy()
+    backend.state.session = 'ok'
+    window.dispatchEvent(new Event('focus'))
+    await screen.findByText('מחובר ל-Google')
+    expect((screen.getByLabelText(/^שם\s*\*$/) as HTMLInputElement).value).toBe('Keep me')
+    expect(navigate).not.toHaveBeenCalled()
   })
 
   it('signed out: the header button navigates to /api/auth/login (no popup)', async () => {

@@ -16,6 +16,8 @@ export interface AuthLike {
   /** A start-up/renewal problem other than "signed out", in plain Hebrew. Optional. */
   readonly lastError?: string | null
   signIn(): Promise<void>
+  /** "needs reconnect": ask the session again (after the popup sign-in). Optional. */
+  retry?(): Promise<void>
   signOut(): void
   subscribe(listener: (signedIn: boolean) => void): () => void
 }

@@ -96,24 +96,14 @@ async function readJson(store: DriveStore, fileId: string, what: string): Promis
 }
 
 /**
- * Creates or rewrites a JSON file. `legacyInModelsFolder`: the settings/index file directly in the models folder —
- * a pre-v0.4 copy without the app marker may be rewritten (and gets the marker); see writeGuard.ts.
+ * Creates or rewrites an app JSON file. Only a file carrying the app marker is rewritten. If the only file of that
+ * name is unmarked (written before v0.4, or not by the app), it is left untouched and a NEW marked file is created
+ * next to it — later lookups prefer the marked one (M3).
  */
-async function writeJsonFile(
-  store: DriveStore,
-  folderId: string,
-  name: string,
-  value: unknown,
-  legacyInModelsFolder = false,
-): Promise<string> {
+async function writeJsonFile(store: DriveStore, folderId: string, name: string, value: unknown): Promise<string> {
   const existing = await findFile(store, folderId, name)
-  if (existing) {
-    await store.updateFileContent(
-      existing.id,
-      jsonBlob(value),
-      JSON_MIME,
-      legacyInModelsFolder ? { adoptLegacy: { modelsFolderId: folderId, name } } : {},
-    )
+  if (existing?.appCreated === true) {
+    await store.updateFileContent(existing.id, jsonBlob(value), JSON_MIME)
     return existing.id
   }
   const created = await store.uploadFile(folderId, name, jsonBlob(value), JSON_MIME)
@@ -127,19 +117,29 @@ export async function loadSettings(store: DriveStore, modelsFolderId: string): P
   return (await loadSettingsWithStatus(store, modelsFolderId)).settings
 }
 
-/** Like loadSettings; `created` = the file did not exist and was just created with defaults (→ I2 notice). */
-export async function loadSettingsWithStatus(store: DriveStore, modelsFolderId: string): Promise<{ settings: AppSettings; created: boolean }> {
+/**
+ * How the settings were obtained: `existing` (the app's marked file), `defaults` (no file → created with defaults),
+ * `copied` (only an unmarked pre-v0.4 file → a NEW marked file seeded with its values; the old one is untouched).
+ */
+export type SettingsOrigin = 'existing' | 'defaults' | 'copied'
+
+/** Like loadSettings, plus how they were obtained (a new file → one-time I2 notice). */
+export async function loadSettingsWithStatus(
+  store: DriveStore,
+  modelsFolderId: string,
+): Promise<{ settings: AppSettings; created: boolean; origin: SettingsOrigin }> {
   const file = await findFile(store, modelsFolderId, SETTINGS_FILE_NAME)
-  if (!file) {
-    const defaults = defaultAppSettings()
-    await store.uploadFile(modelsFolderId, SETTINGS_FILE_NAME, jsonBlob(defaults), JSON_MIME)
-    return { settings: defaults, created: true }
+  if (file?.appCreated === true) {
+    return { settings: normaliseSettings(await readJson(store, file.id, SETTINGS_FILE_NAME)), created: false, origin: 'existing' }
   }
-  return { settings: normaliseSettings(await readJson(store, file.id, SETTINGS_FILE_NAME)), created: false }
+  // Reading the old file is fine; a corrupt one is an error (never silently replaced by defaults).
+  const settings = file ? normaliseSettings(await readJson(store, file.id, SETTINGS_FILE_NAME)) : defaultAppSettings()
+  await store.uploadFile(modelsFolderId, SETTINGS_FILE_NAME, jsonBlob(settings), JSON_MIME)
+  return { settings, created: true, origin: file ? 'copied' : 'defaults' }
 }
 
 export async function saveSettings(store: DriveStore, modelsFolderId: string, settings: AppSettings): Promise<void> {
-  await writeJsonFile(store, modelsFolderId, SETTINGS_FILE_NAME, settings, true)
+  await writeJsonFile(store, modelsFolderId, SETTINGS_FILE_NAME, settings)
 }
 
 // ---------- Index / library ----------
@@ -181,7 +181,7 @@ export async function readIndex(store: DriveStore, modelsFolderId: string): Prom
 
 async function writeIndex(store: DriveStore, modelsFolderId: string, entries: IndexEntry[], builtAt: string): Promise<void> {
   const file: IndexFile = { schemaVersion: 2, builtAt, entries: sortIndex(entries) }
-  await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, file, true)
+  await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, file)
 }
 
 /** True when the index was never fully rebuilt by v0.3 or is older than 10 minutes (N5). */
@@ -291,7 +291,12 @@ export interface ModelFolder {
   contents: FolderContents
   /** Present when the folder has a valid bid.json. */
   bid?: Bid
+  /** The bid.json shown has no app marker (saved before v0.4): read-only, can only be re-created (I2). */
+  legacyBid?: boolean
 }
+
+/** Shown on bids saved before v0.4 (bid.json without the app marker). */
+export const LEGACY_BID_MESSAGE = 'הצעה זו נשמרה בגרסה ישנה — לא ניתן לערוך. אפשר ליצור הצעה חדשה מהתיקייה.'
 
 /**
  * Everything the model page shows (N3/N4): the folder, all its files and its bid (if any). Read-only.
@@ -303,7 +308,7 @@ export async function loadModelFolder(store: DriveStore, folderId: string): Prom
   if (!contents.bidFile) return { folder, contents }
   const raw = await readJson(store, contents.bidFile.id, BID_FILE_NAME)
   if (!isBid(raw)) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
-  return { folder, contents, bid: raw }
+  return { folder, contents, bid: raw, ...(contents.bidFile.appCreated === true ? {} : { legacyBid: true }) }
 }
 
 // ---------- Existing model folder check (I4) ----------
@@ -355,12 +360,12 @@ export async function checkName(
 
 // ---------- Load ----------
 
-export async function loadBid(store: DriveStore, folderId: string): Promise<{ bid: Bid; bidFileId: string }> {
+export async function loadBid(store: DriveStore, folderId: string): Promise<{ bid: Bid; bidFileId: string; legacy: boolean }> {
   const file = await findFile(store, folderId, BID_FILE_NAME)
   if (!file) throw new DriveError('bid.json missing', 'לא נמצא קובץ bid.json בתיקיית הדגם.', 404)
   const raw = await readJson(store, file.id, BID_FILE_NAME)
   if (!isBid(raw)) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
-  return { bid: raw, bidFileId: file.id }
+  return { bid: raw, bidFileId: file.id, legacy: file.appCreated !== true }
 }
 
 // ---------- Save / edit ----------
@@ -415,8 +420,9 @@ export async function saveNewBid(
   if (params.existingFolderId) {
     if (!session.bidFileId) await requireModelFolder(store, modelsFolderId, params.existingFolderId)
     session.folderId = params.existingFolderId
-    // Never overwrite a bid that is already there (e.g. saved meanwhile from another tab).
-    if (!session.bidFileId && (await findFile(store, params.existingFolderId, BID_FILE_NAME))) {
+    // Never overwrite a bid that is already there (e.g. saved meanwhile from another tab). An unmarked bid.json
+    // (pre-v0.4, read-only) stays untouched: the new marked bid.json is written next to it (I2 "re-create").
+    if (!session.bidFileId && (await findFile(store, params.existingFolderId, BID_FILE_NAME))?.appCreated === true) {
       throw new DriveError('bid.json already exists', 'כבר קיימת הצעת מחיר בתיקייה הזו. רעננו את הספרייה ופתחו אותה משם.', 409)
     }
   }
@@ -480,6 +486,10 @@ export async function updateBid(
   session: SaveSession,
 ): Promise<Bid> {
   const { folderId, existing } = params
+  // Checked before anything is written: a pre-v0.4 bid.json (no marker) is read-only (I2).
+  const bidFile = await findFile(store, folderId, BID_FILE_NAME)
+  if (!bidFile) throw new DriveError('bid.json missing', 'לא נמצא קובץ bid.json בתיקיית הדגם.', 404)
+  if (bidFile.appCreated !== true) throw new DriveError('legacy bid.json is read-only', LEGACY_BID_MESSAGE, 403)
   await uploadMissing(store, folderId, params.newFiles, session)
 
   const newUploads = params.newFiles.map((f) => session.uploaded[f.key])
@@ -500,8 +510,6 @@ export async function updateBid(
   }
   if (!bid.coverFileId) delete bid.coverFileId
 
-  const bidFile = await findFile(store, folderId, BID_FILE_NAME)
-  if (!bidFile) throw new DriveError('bid.json missing', 'לא נמצא קובץ bid.json בתיקיית הדגם.', 404)
   await store.updateFileContent(bidFile.id, jsonBlob(bid), JSON_MIME)
 
   const entry = indexEntryFromBid(folderId, bid)

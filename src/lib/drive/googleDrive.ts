@@ -1,6 +1,6 @@
 import { FOLDER_MIME } from '../bid'
 import { DriveError, type DriveFile, type DriveStore, type ListOptions } from './types'
-import { APP_PROPERTIES, decideUpdate, hasAppMarker, type UpdateOptions } from './writeGuard'
+import { APP_PROPERTIES, assertUpdatable, hasAppMarker } from './writeGuard'
 
 /**
  * DriveStore backed by Google Drive REST v3 (plain fetch). Scope: drive (brief v0.4 D-F).
@@ -147,8 +147,8 @@ export class GoogleDriveStore implements DriveStore {
    * The ONLY modifying request the app sends. Checked by writeGuard.decideUpdate before anything is sent.
    * The metadata part contains appProperties only — never name/parents (no rename/move).
    */
-  async updateFileContent(fileId: string, data: Blob, mimeType: string, options: UpdateOptions = {}): Promise<void> {
-    decideUpdate(await this.getFile(fileId), options)
+  async updateFileContent(fileId: string, data: Blob, mimeType: string): Promise<void> {
+    assertUpdatable(await this.getFile(fileId))
     const { body, contentType } = multipart({ appProperties: { ...APP_PROPERTIES } }, data, mimeType)
     await this.request(`${UPLOAD_API}/files/${encodeURIComponent(fileId)}?uploadType=multipart&fields=id`, {
       method: 'PATCH',

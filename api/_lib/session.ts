@@ -34,7 +34,10 @@ export function clearSessionCookie(): string {
   return clearCookie(SESSION_COOKIE, SESSION_PATH)
 }
 
-export function readSession(req: Request, clientSecret: string): SessionRead {
+/** A session older than this (by its issue time) is rejected even if the browser still sends the cookie (M4). */
+export const SESSION_MAX_AGE_MS = SESSION_MAX_AGE * 1000
+
+export function readSession(req: Request, clientSecret: string, nowMs: number): SessionRead {
   const raw = parseCookies(req.headers.get('Cookie'))[SESSION_COOKIE]
   if (!raw) return { kind: 'none' }
   const plain = unseal(raw, deriveKey(clientSecret))
@@ -42,7 +45,9 @@ export function readSession(req: Request, clientSecret: string): SessionRead {
   try {
     const s = JSON.parse(plain) as Partial<Session>
     if (s.v !== 1 || typeof s.rt !== 'string' || !s.rt || typeof s.email !== 'string') return { kind: 'invalid' }
-    return { kind: 'ok', session: { v: 1, rt: s.rt, email: s.email, iat: Number(s.iat ?? 0) } }
+    const iat = Number(s.iat)
+    if (!Number.isFinite(iat) || iat <= 0 || nowMs - iat * 1000 > SESSION_MAX_AGE_MS) return { kind: 'invalid' }
+    return { kind: 'ok', session: { v: 1, rt: s.rt, email: s.email, iat } }
   } catch {
     return { kind: 'invalid' }
   }

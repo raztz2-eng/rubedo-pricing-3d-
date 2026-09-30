@@ -1,5 +1,3 @@
-import type { UpdateOptions } from './writeGuard'
-
 /**
  * The ONLY way the app talks to storage. `googleDrive.ts` implements it against Drive REST v3;
  * `memoryDrive.ts` implements it in memory for tests and demo mode.
@@ -40,7 +38,7 @@ export interface DriveStore {
   /** Creates a file (marked as the app's). */
   uploadFile(parentId: string, name: string, data: Blob, mimeType: string): Promise<DriveFile>
   /** Replaces the content of a file carrying the app marker (bid.json, index, settings). Refuses anything else. */
-  updateFileContent(fileId: string, data: Blob, mimeType: string, options?: UpdateOptions): Promise<void>
+  updateFileContent(fileId: string, data: Blob, mimeType: string): Promise<void>
   readText(fileId: string): Promise<string>
   /** Downloads the content of any file (alt=media). */
   readBlob(fileId: string): Promise<Blob>

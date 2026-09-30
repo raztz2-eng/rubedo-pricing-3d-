@@ -1,6 +1,6 @@
 import { FOLDER_MIME } from '../bid'
 import { DriveError, type DriveFile, type DriveStore, type ListOptions } from './types'
-import { decideUpdate, type UpdateOptions } from './writeGuard'
+import { assertUpdatable } from './writeGuard'
 
 interface MemoryNode {
   id: string
@@ -131,13 +131,13 @@ export class MemoryDrive implements DriveStore {
     return this.toFile(n)
   }
 
-  async updateFileContent(fileId: string, data: Blob, mimeType: string, options: UpdateOptions = {}): Promise<void> {
+  async updateFileContent(fileId: string, data: Blob, mimeType: string): Promise<void> {
     this.maybeFail('updateFileContent', fileId)
     this.writeTargets.push({ op: 'updateFileContent', targetId: fileId })
     const n = this.nodes.get(fileId)
     if (!n || n.mimeType === FOLDER_MIME) throw new DriveError(`not found: ${fileId}`, 'הקובץ לא נמצא ב-Drive.', 404)
-    // Same guard as the real store; a legacy settings/index file gets the marker in the same update.
-    if (decideUpdate(this.toFile(n), options) === 'adopt') n.appCreated = true
+    // Same guard as the real store.
+    assertUpdatable(this.toFile(n))
     n.data = data
     n.mimeType = mimeType
     n.modifiedTime = new Date().toISOString()

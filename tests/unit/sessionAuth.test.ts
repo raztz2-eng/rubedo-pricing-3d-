@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { EXPIRY_MARGIN_MS, RECONNECT_MESSAGE, SessionAuth, SessionGoneError } from '../../src/lib/auth/sessionAuth'
 
-const TOKEN = 'ya29.SESSION-TOKEN'
+const TOKEN = 'fake-access-SESSION-TOKEN'
 
 type Answer = () => Response | Promise<Response>
 
@@ -30,10 +30,11 @@ function backend(first: Answer = () => Response.json({ access_token: TOKEN, expi
 const ok = (t = TOKEN, expiresIn = 3600) => () => Response.json({ access_token: t, expires_in: expiresIn, email: 'raztz2@gmail.com' })
 const gone = () => Response.json({ error: 'no_session' }, { status: 401 })
 
-function make(b = backend(), clock = { t: 1_000_000 }) {
+function make(b = backend(), clock = { t: 1_000_000 }, popup: unknown = {}) {
   const navigate = vi.fn()
-  const auth = new SessionAuth({ fetchImpl: b.fetchImpl, navigate, now: () => clock.t, log: () => {} })
-  return { auth, navigate, b, clock }
+  const openWindow = vi.fn(() => popup)
+  const auth = new SessionAuth({ fetchImpl: b.fetchImpl, navigate, openWindow, now: () => clock.t, log: () => {} })
+  return { auth, navigate, openWindow, b, clock }
 }
 
 afterEach(() => {
@@ -152,25 +153,70 @@ describe('SessionAuth — renewal', () => {
     expect(b.tokenCalls()).toBe(2)
   })
 
-  it('reconnect click: tries the session silently first; only a real 401 navigates to Google', async () => {
+  it('I4 reconnect click: opens /api/auth/login?popup=1 SYNCHRONOUSLY (no navigation, the page stays); retry() after the popup → signed in', async () => {
     const b = backend()
-    const { auth, navigate } = make(b)
+    const { auth, navigate, openWindow } = make(b)
     await auth.init()
     b.set(gone)
     await auth.refresh().catch(() => {})
-    // Transient: the session works again → reconnected in place.
-    b.set(ok('T3'))
-    await auth.signIn()
-    expect(auth.signedIn).toBe(true)
+    expect(auth.needsReconnect).toBe(true)
+
+    void auth.signIn() // the click
+    expect(openWindow).toHaveBeenCalledTimes(1) // before any await
+    expect(openWindow).toHaveBeenCalledWith('/api/auth/login?popup=1')
     expect(navigate).not.toHaveBeenCalled()
-    // Really gone → full-page login.
+
+    // Popup not finished yet: retry keeps "needs reconnect".
+    await expect(auth.retry()).rejects.toBeInstanceOf(SessionGoneError)
+    expect(auth.needsReconnect).toBe(true)
+    // The popup set a new session cookie: retry (focus / "המשך") → signed in, same page.
+    b.set(ok('T5'))
+    await auth.retry()
+    expect(auth.signedIn).toBe(true)
+    expect(await auth.getToken()).toBe('T5')
+    expect(navigate).not.toHaveBeenCalled()
+  })
+
+  it('I4 popup blocked → Hebrew error, still "needs reconnect", no navigation', async () => {
+    const b = backend()
+    const { auth, navigate } = make(b, { t: 1_000_000 }, null)
+    await auth.init()
     b.set(gone)
     await auth.refresh().catch(() => {})
     await auth.signIn()
-    expect(navigate).toHaveBeenCalledWith('/api/auth/login')
+    expect(auth.lastError).toMatch(/חסם/)
+    expect(auth.needsReconnect).toBe(true)
+    expect(navigate).not.toHaveBeenCalled()
   })
 
-  it('reconnect click during a network failure stays on the page (form kept) and reports the error', async () => {
+  it('first sign-in from signed out still navigates (no popup)', async () => {
+    const { auth, navigate, openWindow } = make(backend(gone))
+    await auth.init()
+    await auth.signIn()
+    expect(navigate).toHaveBeenCalledWith('/api/auth/login')
+    expect(openWindow).not.toHaveBeenCalled()
+  })
+
+  it('M10: sign-out while the token body is still being read → the late answer cannot sign back in', async () => {
+    const b = backend()
+    const { auth } = make(b)
+    await auth.init()
+    let releaseBody: (v: unknown) => void = () => {}
+    b.set(() => {
+      const res = new Response('{}', { status: 200 })
+      Object.defineProperty(res, 'json', { value: () => new Promise((r) => (releaseBody = r)) })
+      return res
+    })
+    const pending = auth.refresh().catch((e: unknown) => e)
+    await new Promise((r) => setTimeout(r, 0))
+    auth.signOut()
+    releaseBody({ access_token: 'LATE-BODY', expires_in: 3600 })
+    await pending
+    expect(auth.signedIn).toBe(false)
+    await expect(auth.getToken()).rejects.toThrow()
+  })
+
+  it('reconnect click during a network failure stays on the page (form kept); retry reports the error', async () => {
     const b = backend()
     const { auth, navigate } = make(b)
     await auth.init()
@@ -179,7 +225,7 @@ describe('SessionAuth — renewal', () => {
     b.set(() => {
       throw new TypeError('offline')
     })
-    await expect(auth.signIn()).rejects.toThrow()
+    await expect(auth.retry()).rejects.toThrow()
     expect(navigate).not.toHaveBeenCalled()
     expect(auth.needsReconnect).toBe(true)
   })
@@ -211,8 +257,8 @@ describe('SessionAuth — AC24: the access token is never persisted by the SPA',
     const { auth } = make()
     await auth.init()
     await auth.refresh()
-    for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain('ya29')
-    expect(document.cookie).not.toContain('ya29')
+    for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain('fake-access')
+    expect(document.cookie).not.toContain('fake-access')
     setItem.mockRestore()
   })
 })

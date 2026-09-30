@@ -105,17 +105,21 @@ export function hasDriveScope(scope: string | undefined): boolean {
   return (scope ?? '').split(/\s+/).includes(DRIVE_SCOPE)
 }
 
-/** Only Google-hosted thumbnail URLs are fetched (no SSRF): https + googleusercontent.com / google.com. */
+/** Hosts Drive serves thumbnails from. Nothing else is ever fetched by the proxy (no SSRF). */
+const THUMB_HOST_RE = /^(lh[3-6]\.googleusercontent\.com|drive\.google\.com|docs\.google\.com)$/
+
 export function isAllowedThumbnailUrl(url: string): boolean {
   try {
     const u = new URL(url)
     if (u.protocol !== 'https:' || u.username || u.password || u.port) return false
-    const h = u.hostname.toLowerCase()
-    return h === 'googleusercontent.com' || h.endsWith('.googleusercontent.com') || h === 'google.com' || h.endsWith('.google.com')
+    return THUMB_HOST_RE.test(u.hostname.toLowerCase())
   } catch {
     return false
   }
 }
+
+/** Image types the proxy passes through; anything else (SVG, HTML, …) is refused with 415. */
+export const THUMB_TYPES: readonly string[] = ['image/jpeg', 'image/png', 'image/webp', 'image/gif']
 
 /** Drive thumbnail links end in "=s220": ask for the requested size. Other links are used unchanged. */
 export function sizeThumbnailUrl(link: string, size: number): string {

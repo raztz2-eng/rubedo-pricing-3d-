@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { safeEqual, tokenFingerprint } from './crypto.js'
 import { readConfig, type EnvSource, type ServerConfig } from './env.js'
 import {
@@ -9,6 +9,7 @@ import {
   fetchUserEmail,
   hasDriveScope,
   isAllowedThumbnailUrl,
+  THUMB_TYPES,
   refreshAccessToken,
   revokeToken,
   sizeThumbnailUrl,
@@ -45,9 +46,12 @@ export interface Deps {
   now: () => number
   /** Access tokens minted for the thumbnail proxy, keyed by a hash of the refresh token (instance memory only). */
   tokenCache: Map<string, CachedToken>
+  /** In-flight token mints for the thumbnail proxy, same key (M9). Defaults to instance memory. */
+  mintsInFlight?: Map<string, Promise<TokenOutcome>>
 }
 
 const moduleCache = new Map<string, CachedToken>()
+const moduleMints = new Map<string, Promise<TokenOutcome>>()
 
 export function defaultDeps(): Deps {
   return {
@@ -57,10 +61,33 @@ export function defaultDeps(): Deps {
     random: (n) => randomBytes(n),
     now: () => Date.now(),
     tokenCache: moduleCache,
+    mintsInFlight: moduleMints,
   }
 }
 
 const CALLBACK_PATH = '/api/auth/callback'
+/** Suffix on the OAuth state marking a popup sign-in (it is covered by the state cookie check). */
+const POPUP_SUFFIX = '.p'
+
+const POPUP_SCRIPT = 'window.close()'
+const POPUP_SCRIPT_HASH = createHash('sha256').update(POPUP_SCRIPT).digest('base64')
+
+/** Popup sign-in finished: tell the Founder he can close it, and close it. Only this exact script may run. */
+function popupDonePage(headers: Headers): Response {
+  headers.set('Content-Type', 'text/html; charset=utf-8')
+  headers.set('Cache-Control', 'no-store')
+  headers.set('Content-Security-Policy', `default-src 'none'; script-src 'sha256-${POPUP_SCRIPT_HASH}'; style-src 'unsafe-inline'`)
+  const body = `<!doctype html>
+<html lang="he" dir="rtl">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>RUBEDO.3D — מחובר</title></head>
+<body style="font-family:system-ui,sans-serif;text-align:center;margin:3rem 1rem">
+<p style="font-size:1.2rem">מחובר — אפשר לסגור את החלון</p>
+<p dir="ltr" lang="en" style="color:#666;font-size:.9rem">Signed in — you can close this window.</p>
+<script>${POPUP_SCRIPT}</script>
+</body>
+</html>`
+  return new Response(body, { status: 200, headers })
+}
 
 function misconfiguredPage(missing: string[]): Response {
   return htmlPage(
@@ -89,7 +116,9 @@ export async function handleLogin(req: Request, deps: Deps): Promise<Response> {
   if (req.method !== 'GET') return methodNotAllowed('GET')
   const cfg = readConfig(deps.env)
   if (!cfg.ok) return misconfiguredPage(cfg.missing)
-  const state = deps.random(32).toString('base64url')
+  // popup=1 (reconnect from an open page): the callback answers with a tiny "close this window" page.
+  const popup = new URL(req.url).searchParams.get('popup') === '1'
+  const state = deps.random(32).toString('base64url') + (popup ? POPUP_SUFFIX : '')
   const params = new URLSearchParams({
     client_id: cfg.config.clientId,
     redirect_uri: `${requestOrigin(req)}${CALLBACK_PATH}`,
@@ -166,6 +195,12 @@ export async function handleCallback(req: Request, deps: Deps): Promise<Response
   }
   if (!user.verified || user.email !== allowedEmail) {
     deps.log('callback: account not allowed')
+    // M2: nothing of that account is kept — revoke what Google just issued (best effort).
+    try {
+      await revokeToken(deps.fetch, tokens.refresh_token ?? tokens.access_token)
+    } catch {
+      deps.log('callback: revoke of rejected account failed')
+    }
     return htmlPage(
       403,
       'החשבון אינו מורשה',
@@ -197,13 +232,14 @@ export async function handleCallback(req: Request, deps: Deps): Promise<Response
   const headers = new Headers()
   headers.append('Set-Cookie', sessionCookie(session, clientSecret))
   headers.append('Set-Cookie', clearCookie(STATE_COOKIE, STATE_PATH))
+  if (state.endsWith(POPUP_SUFFIX)) return popupDonePage(headers)
   return redirect('/', headers)
 }
 
 // ---------------------------------------------------------------------------------------------
 // Session → access token (shared by /token and /thumb)
 
-type TokenOutcome =
+export type TokenOutcome =
   | { ok: true; accessToken: string; expiresIn: number; session: Session; newRefreshToken?: string }
   | { ok: false; response: Response }
 
@@ -213,7 +249,7 @@ function unauthorized(clear: boolean): Response {
 }
 
 async function mintAccessToken(req: Request, deps: Deps, cfg: ServerConfig): Promise<TokenOutcome> {
-  const read = readSession(req, cfg.clientSecret)
+  const read = readSession(req, cfg.clientSecret, deps.now())
   if (read.kind === 'none') return { ok: false, response: unauthorized(false) }
   if (read.kind === 'invalid') {
     deps.log('session cookie invalid')
@@ -255,7 +291,7 @@ export async function handleLogout(req: Request, deps: Deps): Promise<Response> 
   const headers = new Headers({ 'Set-Cookie': clearSessionCookie(), 'Cache-Control': 'no-store' })
   const cfg = readConfig(deps.env)
   if (cfg.ok) {
-    const read = readSession(req, cfg.config.clientSecret)
+    const read = readSession(req, cfg.config.clientSecret, deps.now())
     if (read.kind === 'ok') {
       deps.tokenCache.delete(tokenFingerprint(read.session.rt))
       try {
@@ -287,28 +323,47 @@ export function clampSize(raw: string | null): number {
 }
 
 async function thumbToken(req: Request, deps: Deps, cfg: ServerConfig, forceNew: boolean): Promise<TokenOutcome & { key?: string }> {
-  const read = readSession(req, cfg.clientSecret)
-  if (read.kind === 'ok' && !forceNew) {
-    const key = tokenFingerprint(read.session.rt)
+  const read = readSession(req, cfg.clientSecret, deps.now())
+  // No/invalid session: mintAccessToken produces the right 401 (and clears a bad cookie).
+  if (read.kind !== 'ok') return mintAccessToken(req, deps, cfg)
+  const key = tokenFingerprint(read.session.rt)
+  if (!forceNew) {
     const hit = deps.tokenCache.get(key)
     if (hit && hit.expiresAt - CACHE_MARGIN_MS > deps.now()) {
       return { ok: true, accessToken: hit.token, expiresIn: Math.floor((hit.expiresAt - deps.now()) / 1000), session: read.session, key }
     }
   }
-  const t = await mintAccessToken(req, deps, cfg)
-  if (!t.ok) return t
-  const key = tokenFingerprint(t.session.rt)
-  if (deps.tokenCache.size >= CACHE_LIMIT) deps.tokenCache.clear()
-  deps.tokenCache.set(key, { token: t.accessToken, expiresAt: deps.now() + t.expiresIn * 1000 })
-  return { ...t, key }
+  // M9: a library page asks for many thumbnails at once — they share ONE token mint per session.
+  const inflight = deps.mintsInFlight ?? moduleMints
+  let pending = inflight.get(key)
+  if (!pending) {
+    pending = mintAccessToken(req, deps, cfg).then((t) => {
+      if (t.ok) {
+        if (deps.tokenCache.size >= CACHE_LIMIT) deps.tokenCache.clear()
+        deps.tokenCache.set(key, { token: t.accessToken, expiresAt: deps.now() + t.expiresIn * 1000 })
+      }
+      return t
+    })
+    const p = pending
+    inflight.set(key, p)
+    void p.finally(() => {
+      if (inflight.get(key) === p) inflight.delete(key)
+    })
+  }
+  const t = await pending
+  return t.ok ? { ...t, key } : t
 }
 
-/** Fetches an allowed Google host, following at most MAX_REDIRECTS redirects that stay on allowed hosts. */
+/**
+ * Fetches an allowed Google host, following at most MAX_REDIRECTS redirects that stay on allowed hosts.
+ * M8: the bearer token goes ONLY to the initial thumbnailLink host — never on a redirect hop.
+ */
 async function fetchThumbnail(deps: Deps, url: string, accessToken: string): Promise<Response | 'bad-host'> {
   let current = url
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     if (!isAllowedThumbnailUrl(current)) return 'bad-host'
-    const res = await deps.fetch(current, { headers: { Authorization: `Bearer ${accessToken}` }, redirect: 'manual' })
+    const headers: Record<string, string> = hop === 0 ? { Authorization: `Bearer ${accessToken}` } : {}
+    const res = await deps.fetch(current, { headers, redirect: 'manual' })
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get('Location')
       if (!loc) return res
@@ -367,10 +422,15 @@ export async function handleThumb(req: Request, deps: Deps): Promise<Response> {
     return json(502, { error: 'bad_thumbnail_host' })
   }
   if (img.status === 404) return json(404, { error: 'no_thumbnail' })
-  const type = img.headers.get('Content-Type') ?? ''
-  if (!img.ok || !type.toLowerCase().startsWith('image/')) {
+  if (!img.ok) {
     deps.log(`thumb: image ${img.status}`)
     return json(502, { error: 'thumbnail_unavailable' })
+  }
+  // I3: only plain raster images pass (no SVG/HTML that could run script on our origin).
+  const type = (img.headers.get('Content-Type') ?? '').split(';')[0].trim().toLowerCase()
+  if (!THUMB_TYPES.includes(type)) {
+    deps.log('thumb: refused content type')
+    return json(415, { error: 'unsupported_media_type' })
   }
   return new Response(img.body, {
     status: 200,
@@ -378,6 +438,7 @@ export async function handleThumb(req: Request, deps: Deps): Promise<Response> {
       'Content-Type': type,
       'Cache-Control': 'private, max-age=3600',
       'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'; sandbox",
     },
   })
 }

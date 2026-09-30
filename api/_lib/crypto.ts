@@ -14,7 +14,9 @@ export function deriveKey(clientSecret: string): Buffer {
   return Buffer.from(hkdfSync('sha256', Buffer.from(clientSecret, 'utf8'), Buffer.alloc(0), INFO, 32))
 }
 
-export function seal(plaintext: string, key: Buffer, iv: Buffer = randomBytes(IV_LEN)): string {
+/** Always uses a fresh random IV (callers cannot supply one: IV reuse would break GCM). */
+export function seal(plaintext: string, key: Buffer): string {
+  const iv = randomBytes(IV_LEN)
   const cipher = createCipheriv('aes-256-gcm', key, iv)
   cipher.setAAD(Buffer.from(INFO))
   const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()])

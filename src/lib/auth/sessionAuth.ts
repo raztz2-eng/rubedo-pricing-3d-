@@ -2,7 +2,9 @@ import type { TokenProvider } from '../drive/googleDrive'
 
 /**
  * Session client for the backend auth (brief v0.4 D-G / "Front-end changes").
- *  - Sign-in = full-page navigation to /api/auth/login (no popup → works on mobile Safari).
+ *  - First sign-in (signed out) = full-page navigation to /api/auth/login (no popup → works on mobile Safari).
+ *  - Reconnect while working = a popup to /api/auth/login?popup=1, opened synchronously in the click, so the page
+ *    and its unsaved form stay mounted (I4). The tab then retries on window focus or the "המשך" button.
  *  - Access tokens come from POST /api/auth/token (the session lives in an HttpOnly cookie JS cannot read).
  *  - The access token is kept in this object's memory only — never in localStorage/sessionStorage/cookies.
  *  - One shared in-flight token request; renewed ≈5 min before expiry.
@@ -10,6 +12,7 @@ import type { TokenProvider } from '../drive/googleDrive'
  */
 
 export const LOGIN_URL = '/api/auth/login'
+export const POPUP_LOGIN_URL = '/api/auth/login?popup=1'
 export const TOKEN_URL = '/api/auth/token'
 export const LOGOUT_URL = '/api/auth/logout'
 
@@ -20,6 +23,7 @@ export const RECONNECT_MESSAGE = "החיבור ל-Google פג — לחצו 'הת
 export const NOT_SIGNED_IN_MESSAGE = 'יש להתחבר עם Google תחילה.'
 export const SERVER_UNAVAILABLE_MESSAGE = 'שרת ההתחברות לא זמין כרגע. בדקו את החיבור לאינטרנט ונסו שוב.'
 export const SIGNED_OUT_MESSAGE = 'התנתקת.'
+export const POPUP_BLOCKED_MESSAGE = 'הדפדפן חסם את חלון ההתחברות. אפשרו חלונות קופצים לאתר הזה ולחצו שוב על „התחבר מחדש”.'
 
 export class AuthError extends Error {
   readonly userMessage: string
@@ -52,6 +56,8 @@ export interface SessionAuthOptions {
   fetchImpl?: typeof fetch
   /** Full-page navigation (window.location.assign). Injected in tests. */
   navigate?: (url: string) => void
+  /** Opens the reconnect popup (window.open); returns null when blocked. Injected in tests. */
+  openWindow?: (url: string) => unknown
   now?: () => number
   log?: (context: string, e: unknown) => void
 }
@@ -59,6 +65,7 @@ export interface SessionAuthOptions {
 export class SessionAuth implements TokenProvider {
   private readonly fetchImpl: typeof fetch
   private readonly navigate: (url: string) => void
+  private readonly openWindow: (url: string) => unknown
   private readonly now: () => number
   private readonly log: (context: string, e: unknown) => void
   private state: State = 'checking'
@@ -75,6 +82,7 @@ export class SessionAuth implements TokenProvider {
   constructor(options: SessionAuthOptions = {}) {
     this.fetchImpl = options.fetchImpl ?? ((...args) => fetch(...args))
     this.navigate = options.navigate ?? ((url) => window.location.assign(url))
+    this.openWindow = options.openWindow ?? ((url) => window.open(url, 'rubedo-login', 'popup,width=500,height=650'))
     this.now = options.now ?? (() => Date.now())
     this.log = options.log ?? ((c, e) => console.error(`[rubedo] ${c}`, e))
   }
@@ -117,20 +125,33 @@ export class SessionAuth implements TokenProvider {
   }
 
   /**
-   * Sign-in / reconnect click. Reconnect first tries the session silently (keeps the page and its form);
-   * only when the session is really gone does it navigate to Google.
+   * Sign-in click. Call it first thing in the click handler (no await before it):
+   *  - signed out → full-page navigation to Google;
+   *  - "needs reconnect" → the popup is opened synchronously (the page and its form stay mounted).
    */
-  async signIn(): Promise<void> {
+  signIn(): Promise<void> {
     if (this.state === 'reconnect') {
-      try {
-        await this.fetchToken()
-        return
-      } catch (e) {
-        // Network/server trouble: stay on the page (the form is kept); the user can click again.
-        if (!(e instanceof SessionGoneError)) throw e
-      }
+      this.reconnect()
+      return Promise.resolve()
     }
     this.navigate(LOGIN_URL)
+    return Promise.resolve()
+  }
+
+  /** Opens the reconnect popup. Synchronous — must run inside the click. */
+  reconnect(): void {
+    const w = this.openWindow(POPUP_LOGIN_URL)
+    this.error = w ? null : POPUP_BLOCKED_MESSAGE
+    this.emit()
+  }
+
+  /**
+   * "המשך" button / window focus while disconnected: ask the backend again (the popup may have renewed the
+   * session cookie). Success → signed in; still no session → stays "needs reconnect".
+   */
+  async retry(): Promise<void> {
+    if (this.state !== 'reconnect') return
+    await this.fetchToken()
   }
 
   /** A valid access token; renewed ≈5 minutes before expiry. Parallel calls share one request. */
@@ -199,6 +220,8 @@ export class SessionAuth implements TokenProvider {
     } catch {
       /* handled below */
     }
+    // M10: a sign-out may have happened while the body was being read.
+    if (gen !== this.generation) throw new AuthError('signed out', SIGNED_OUT_MESSAGE)
     if (!res.ok || !body.access_token) {
       return this.fail(gen, new AuthError(`token endpoint ${res.status}`, body.message || SERVER_UNAVAILABLE_MESSAGE))
     }

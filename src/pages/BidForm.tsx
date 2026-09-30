@@ -24,6 +24,7 @@ import {
 } from '../lib/bidForm'
 import {
   checkName,
+  LEGACY_BID_MESSAGE,
   loadBid,
   loadModelFolder,
   newSaveSession,
@@ -51,6 +52,7 @@ export function EditModelPage() {
 
 function EditLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   const [bid, setBid] = useState<Bid | null>(null)
+  const [legacy, setLegacy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [tick, setTick] = useState(0)
 
@@ -58,7 +60,11 @@ function EditLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) 
     let cancelled = false
     setError(null)
     loadBid(ctx.drive, folderId)
-      .then((r) => !cancelled && setBid(r.bid))
+      .then((r) => {
+        if (cancelled) return
+        setLegacy(r.legacy)
+        setBid(r.bid)
+      })
       .catch((e: unknown) => {
         logError('load bid for edit', e)
         if (!cancelled) setError(errorMessage(e, 'טעינת הדגם נכשלה.'))
@@ -70,6 +76,17 @@ function EditLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) 
 
   if (error) return <ErrorBox onRetry={() => setTick((t) => t + 1)}>{error}</ErrorBox>
   if (!bid) return <Spinner label="טוען דגם…" />
+  if (legacy) {
+    // I2: a bid saved before v0.4 is read-only; it can only be re-created next to the old one.
+    return (
+      <ErrorBox>
+        {LEGACY_BID_MESSAGE}{' '}
+        <Link className="underline" to={`/model/${encodeURIComponent(folderId)}/create`}>
+          צור הצעה מחדש
+        </Link>
+      </ErrorBox>
+    )
+  }
   return <BidForm ctx={ctx} existing={{ folderId, bid }} />
 }
 
@@ -85,6 +102,8 @@ interface FromFolder {
   draft: BidDraft
   /** The folder's sliced file could not be read: shown as an error, the form stays empty for manual entry. */
   sliceError?: string
+  /** Re-creating a pre-v0.4 (read-only) bid of this folder. */
+  recreate?: boolean
 }
 
 function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
@@ -98,8 +117,12 @@ function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }
     const run = async () => {
       // I4: only a direct, non-skipped subfolder of the models folder can receive a bid.
       await requireModelFolder(ctx.drive, ctx.folderId, folderId)
-      const { folder, contents, bid } = await loadModelFolder(ctx.drive, folderId)
-      if (bid) return { hasBid: true }
+      const { folder, contents, bid, legacyBid } = await loadModelFolder(ctx.drive, folderId)
+      if (bid && !legacyBid) return { hasBid: true }
+      if (bid && legacyBid) {
+        // I2 "re-create": prefilled from the old read-only bid; saving writes a NEW marked bid.json next to it.
+        return { fromFolder: { folderId, folderName: folder.name.trim(), draft: bidToDraft(bid), recreate: true } }
+      }
       const slicedFile = contents.sliced[0]
       const base: FromFolder = { folderId, folderName: folder.name.trim(), draft: draftFromFolder(folder.name, ctx.settings.materials) }
       if (!slicedFile) return { fromFolder: base }
@@ -335,7 +358,13 @@ function BidForm({
     <div className="pb-24">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-2xl font-bold">
-          {existing ? `עריכת ${existing.bid.name}` : fromFolder ? `הצעת מחיר ל${fromFolder.folderName}` : 'דגם חדש'}
+          {existing
+            ? `עריכת ${existing.bid.name}`
+            : fromFolder?.recreate
+              ? `הצעה חדשה ל${fromFolder.folderName}`
+              : fromFolder
+                ? `הצעת מחיר ל${fromFolder.folderName}`
+                : 'דגם חדש'}
         </h1>
         {backFolderId && (
           <Link to={`/model/${encodeURIComponent(backFolderId)}`} className="btn btn-ghost">

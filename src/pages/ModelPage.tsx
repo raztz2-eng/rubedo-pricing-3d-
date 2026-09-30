@@ -6,7 +6,7 @@ import { PricePanel } from '../components/PricePanel'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
 import { ErrorBox, Money, Notice, Spinner } from '../components/ui'
 import type { BidLine } from '../lib/bid'
-import { loadModelFolder, type ModelFolder } from '../lib/drive/bidRepository'
+import { LEGACY_BID_MESSAGE, loadModelFolder, type ModelFolder } from '../lib/drive/bidRepository'
 import { isGoogleNativeFile } from '../lib/drive/folderContents'
 import type { DriveFile } from '../lib/drive/types'
 import { errorMessage, logError } from '../lib/errors'
@@ -57,7 +57,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   if (error && error.folderId === folderId) return <ErrorBox onRetry={() => setTick((t) => t + 1)}>{error.message}</ErrorBox>
   if (!loaded || loaded.folderId !== folderId) return <Spinner label="טוען דגם…" />
 
-  const { folder, contents, bid } = loaded.data
+  const { folder, contents, bid, legacyBid } = loaded.data
   const slicedIds = new Set([
     ...contents.sliced.map((f) => f.id),
     ...(bid?.files ?? []).filter((f) => f.kind === 'sliced').map((f) => f.id),
@@ -179,10 +179,21 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
             {bid.updatedAt !== bid.createdAt && <> · עודכן {formatDate(bid.updatedAt)}</>}
           </p>
         </div>
-        <Link to={`/model/${encodeURIComponent(folderId)}/edit`} className="btn btn-secondary">
-          עריכה
-        </Link>
+        {legacyBid ? (
+          <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
+            צור הצעה מחדש
+          </Link>
+        ) : (
+          <Link to={`/model/${encodeURIComponent(folderId)}/edit`} className="btn btn-secondary">
+            עריכה
+          </Link>
+        )}
       </div>
+      {legacyBid && (
+        <Notice tone="warn">
+          <span data-testid="legacy-bid-notice">{LEGACY_BID_MESSAGE}</span>
+        </Notice>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-[1fr_320px] lg:items-start">
         <div className="flex min-w-0 flex-col gap-4">
