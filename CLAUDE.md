@@ -81,5 +81,8 @@ uptime 0.5, powerW 150, kwhPrice 0.64, buffer 1.3, material price ₪85/kg for P
 - Async state loaded "for" a key (folder, id) must be tagged with that key; render only when tag === current key. (round 3)
 - Google popups: load GIS at startup and call requestAccessToken synchronously in the click handler (mobile Safari
   blocks popups opened after an await). Share one in-flight token request; never cancel parallel callers. (round 1)
+- NEVER create Vercel deployments through the API/MCP (`create_deployment`). A manual API deploy of a branch was
+  promoted to PRODUCTION without approval (pilot, 29 Sep). Previews come ONLY from `git push` to a non-main branch;
+  production ONLY from the Founder merging to `main`. (COO incident)
 - jsdom: `URL.createObjectURL` throws on JSZip blobs → use `createObjectUrlSafe`; load fixtures with
   `resolve(process.cwd(), 'tests/fixtures', …)`. Tailwind v4 custom classes need `@utility`. (builder notes)
