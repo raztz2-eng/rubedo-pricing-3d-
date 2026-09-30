@@ -4,9 +4,10 @@ import { DriveImage } from '../components/DriveImage'
 import { createObjectUrlSafe } from '../components/useObjectUrl'
 import { PricePanel } from '../components/PricePanel'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
-import { ErrorBox, Money, Spinner } from '../components/ui'
-import type { Bid, BidFile, BidLine } from '../lib/bid'
-import { loadBid } from '../lib/drive/bidRepository'
+import { ErrorBox, Money, Notice, Spinner } from '../components/ui'
+import type { BidLine } from '../lib/bid'
+import { loadModelFolder, type ModelFolder } from '../lib/drive/bidRepository'
+import type { DriveFile } from '../lib/drive/types'
 import { errorMessage, logError } from '../lib/errors'
 import { formatDate, formatNumber } from '../lib/format'
 
@@ -15,7 +16,7 @@ export function ModelPageRoute() {
   return <RequireDrive>{(ctx) => <ModelPage ctx={ctx} folderId={id} />}</RequireDrive>
 }
 
-async function downloadDriveFile(ctx: DriveContext, file: BidFile) {
+async function downloadDriveFile(ctx: DriveContext, file: { id: string; name: string }) {
   const blob = await ctx.drive.readBlob(file.id)
   const url = createObjectUrlSafe(blob)
   if (!url) throw new Error('object URLs not supported')
@@ -28,9 +29,11 @@ async function downloadDriveFile(ctx: DriveContext, file: BidFile) {
   setTimeout(() => URL.revokeObjectURL(url), 10_000)
 }
 
+type Loaded = { folderId: string; data: ModelFolder }
+
 function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
-  const [bid, setBid] = useState<Bid | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [loaded, setLoaded] = useState<Loaded | null>(null)
+  const [error, setError] = useState<{ folderId: string; message: string } | null>(null)
   const [downloadError, setDownloadError] = useState<string | null>(null)
   const [downloading, setDownloading] = useState<string | null>(null)
   const [tick, setTick] = useState(0)
@@ -38,25 +41,30 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   useEffect(() => {
     let cancelled = false
     setError(null)
-    loadBid(ctx.drive, folderId)
-      .then((r) => !cancelled && setBid(r.bid))
+    loadModelFolder(ctx.drive, folderId)
+      .then((data) => !cancelled && setLoaded({ folderId, data }))
       .catch((e: unknown) => {
-        logError('load bid', e)
-        if (!cancelled) setError(errorMessage(e, 'טעינת הדגם נכשלה.'))
+        logError('load model folder', e)
+        if (!cancelled) setError({ folderId, message: errorMessage(e, 'טעינת הדגם נכשלה.') })
       })
     return () => {
       cancelled = true
     }
   }, [ctx.drive, folderId, tick])
 
-  if (error) return <ErrorBox onRetry={() => setTick((t) => t + 1)}>{error}</ErrorBox>
-  if (!bid) return <Spinner label="טוען דגם…" />
+  // Async state is tagged with the folder it was loaded for; render only the current folder's data.
+  if (error && error.folderId === folderId) return <ErrorBox onRetry={() => setTick((t) => t + 1)}>{error.message}</ErrorBox>
+  if (!loaded || loaded.folderId !== folderId) return <Spinner label="טוען דגם…" />
 
-  const images = bid.files.filter((f) => f.kind === 'image')
-  const sliced = bid.files.filter((f) => f.kind === 'sliced')
-  const models = bid.files.filter((f) => f.kind === 'model')
+  const { folder, contents, bid } = loaded.data
+  const slicedIds = new Set([
+    ...contents.sliced.map((f) => f.id),
+    ...(bid?.files ?? []).filter((f) => f.kind === 'sliced').map((f) => f.id),
+  ])
+  const sliced = contents.files.filter((f) => slicedIds.has(f.id))
+  const otherFiles = contents.files.filter((f) => !slicedIds.has(f.id))
 
-  const download = async (f: BidFile) => {
+  const download = async (f: DriveFile) => {
     setDownloadError(null)
     setDownloading(f.id)
     try {
@@ -67,6 +75,96 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
     } finally {
       setDownloading(null)
     }
+  }
+
+  const title = bid?.name ?? folder.name.trim()
+
+  const gallery = contents.images.length > 0 && (
+    <section className="card" aria-label="תמונות">
+      <h2 className="section-title">תמונות</h2>
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        {contents.images.map((f) => (
+          <a key={f.id} href={ctx.drive.fileUrl(f.id)} target="_blank" rel="noreferrer" title={`${f.name} — פתיחה בגודל מלא ב-Drive`}>
+            <DriveImage drive={ctx.drive} file={f} alt={f.name} className="aspect-square w-full rounded-lg object-cover" />
+          </a>
+        ))}
+      </div>
+    </section>
+  )
+
+  const filesSection = (
+    <section className="card flex flex-col gap-2" aria-label="קבצים">
+      <h2 className="section-title">קבצים</h2>
+      <div className="flex flex-wrap gap-2">
+        <a className="btn btn-secondary" href={ctx.drive.folderUrl(folderId)} target="_blank" rel="noreferrer">
+          פתיחת התיקייה ב-Drive
+        </a>
+        {sliced.map((f) => (
+          <button
+            key={f.id}
+            type="button"
+            className="btn btn-primary"
+            title="לאחר ההורדה, לחצו פעמיים על הקובץ כדי לפתוח אותו ב-Bambu Studio"
+            onClick={() => download(f)}
+            disabled={downloading === f.id}
+          >
+            {downloading === f.id ? 'מוריד…' : 'הורדה ל-Bambu Studio'}
+          </button>
+        ))}
+      </div>
+      {sliced.length > 0 && (
+        <p className="text-xs text-stone-500">לאחר ההורדה, לחצו פעמיים על הקובץ כדי לפתוח אותו ב-Bambu Studio.</p>
+      )}
+      {contents.files.length > 0 && (
+        <ul className="flex flex-col gap-1 text-sm" aria-label="קבצי הדגם">
+          {[...sliced, ...otherFiles].map((f) => (
+            <li key={f.id} className="flex items-center justify-between gap-2 rounded bg-stone-50 px-2 py-1">
+              <a className="truncate text-accent underline" dir="ltr" href={ctx.drive.fileUrl(f.id)} target="_blank" rel="noreferrer">
+                {f.name}
+              </a>
+              {!slicedIds.has(f.id) && (
+                <button type="button" className="shrink-0 text-accent underline" onClick={() => download(f)} disabled={downloading === f.id}>
+                  {downloading === f.id ? 'מוריד…' : 'הורדה'}
+                </button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {downloadError && <ErrorBox>{downloadError}</ErrorBox>}
+    </section>
+  )
+
+  if (!bid) {
+    const found = contents.sliced.length > 0
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="flex flex-wrap items-start gap-2">
+          <div className="me-auto min-w-0">
+            <h1 className="text-2xl font-bold">{title}</h1>
+            <span
+              className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
+                found ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-900'
+              }`}
+              data-testid="status-badge"
+            >
+              {found ? 'נמצא קובץ סלייס — צור הצעה' : 'דורש סלייס'}
+            </span>
+          </div>
+          <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
+            צור הצעת מחיר
+          </Link>
+        </div>
+        {!found && (
+          <Notice>
+            אין עדיין הצעת מחיר לדגם הזה. אפשר לפרוס אותו ב-Bambu Studio (File → Export → Export plate sliced file), לשמור את
+            הקובץ בתיקייה, ואז ללחוץ „צור הצעת מחיר” — או להזין את הנתונים ידנית.
+          </Notice>
+        )}
+        {gallery}
+        {filesSection}
+      </div>
+    )
   }
 
   return (
@@ -93,16 +191,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
             </section>
           )}
 
-          {images.length > 0 && (
-            <section className="card" aria-label="תמונות">
-              <h2 className="section-title">תמונות</h2>
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                {images.map((f) => (
-                  <DriveImage key={f.id} drive={ctx.drive} fileId={f.id} alt={f.name} className="aspect-square w-full rounded-lg object-cover" />
-                ))}
-              </div>
-            </section>
-          )}
+          {gallery}
 
           <section className="card" aria-label="חלקים">
             <h2 className="section-title">חלקים</h2>
@@ -141,44 +230,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
             <LinesTable title="אריזה ומשלוח" lines={bid.packaging} extra={{ label: 'משלוח', value: bid.shippingCost }} />
           )}
 
-          <section className="card flex flex-col gap-2" aria-label="קבצים">
-            <h2 className="section-title">קבצים</h2>
-            <div className="flex flex-wrap gap-2">
-              <a className="btn btn-secondary" href={ctx.drive.folderUrl(folderId)} target="_blank" rel="noreferrer">
-                פתיחת התיקייה ב-Drive
-              </a>
-              {sliced.map((f) => (
-                <button
-                  key={f.id}
-                  type="button"
-                  className="btn btn-primary"
-                  title="לאחר ההורדה, לחצו פעמיים על הקובץ כדי לפתוח אותו ב-Bambu Studio"
-                  onClick={() => download(f)}
-                  disabled={downloading === f.id}
-                >
-                  {downloading === f.id ? 'מוריד…' : 'הורדה ל-Bambu Studio'}
-                </button>
-              ))}
-            </div>
-            {sliced.length > 0 && (
-              <p className="text-xs text-stone-500">לאחר ההורדה, לחצו פעמיים על הקובץ כדי לפתוח אותו ב-Bambu Studio.</p>
-            )}
-            {models.length > 0 && (
-              <ul className="flex flex-col gap-1 text-sm">
-                {models.map((f) => (
-                  <li key={f.id} className="flex items-center justify-between gap-2 rounded bg-stone-50 px-2 py-1">
-                    <span className="truncate" dir="ltr">
-                      {f.name}
-                    </span>
-                    <button type="button" className="text-accent underline" onClick={() => download(f)}>
-                      הורדה
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            )}
-            {downloadError && <ErrorBox>{downloadError}</ErrorBox>}
-          </section>
+          {filesSection}
         </div>
 
         <aside className="lg:sticky lg:top-20">

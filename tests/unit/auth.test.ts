@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   AuthError,
   GoogleAuth,
+  hasRequiredScopes,
+  SCOPE_MISSING_MESSAGE,
   POPUP_BLOCKED_MESSAGE,
   POPUP_CLOSED_MESSAGE,
   RECONNECT_MESSAGE,
@@ -54,13 +56,41 @@ afterEach(() => {
   delete (window as Window).google
 })
 
+describe('scope check (AC17)', () => {
+  const FILE = 'https://www.googleapis.com/auth/drive.file'
+  const RO = 'https://www.googleapis.com/auth/drive.readonly'
+  it('needs both drive.file and drive.readonly in the granted scopes', () => {
+    expect(hasRequiredScopes(`${FILE} ${RO}`)).toBe(true)
+    expect(hasRequiredScopes(`${RO}  ${FILE} email`)).toBe(true)
+    expect(hasRequiredScopes(FILE)).toBe(false)
+    expect(hasRequiredScopes(RO)).toBe(false)
+    expect(hasRequiredScopes('')).toBe(false)
+  })
+
+  it('rejects a token when the user unticked the read permission', async () => {
+    installGis((c) => c.callback({ access_token: 'T', expires_in: 3600, scope: FILE }))
+    const auth = new GoogleAuth('client-id')
+    await expect(auth.signIn()).rejects.toMatchObject({ userMessage: SCOPE_MISSING_MESSAGE })
+    expect(auth.signedIn).toBe(false)
+  })
+
+  it('no scope broader than drive.file / drive.readonly is ever requested', () => {
+    expect(DRIVE_SCOPE.split(' ').sort()).toEqual([FILE, RO])
+    expect(DRIVE_SCOPE).not.toMatch(/auth\/drive(\s|$)/)
+  })
+})
+
 describe('GoogleAuth (AC12)', () => {
-  it('requests only drive.file and keeps the token in memory only', async () => {
+  it('requests exactly drive.file + drive.readonly (v0.3) and keeps the token in memory only', async () => {
     const gis = installGis(grant('SECRET-TOKEN'))
     const auth = new GoogleAuth('client-id')
     await auth.signIn()
 
-    expect(gis.getConfig()?.scope).toBe('https://www.googleapis.com/auth/drive.file')
+    expect(gis.getConfig()?.scope.split(' ').sort()).toEqual([
+      'https://www.googleapis.com/auth/drive.file',
+      'https://www.googleapis.com/auth/drive.readonly',
+    ])
+    expect(gis.getConfig()?.include_granted_scopes).toBe(false)
     expect(auth.signedIn).toBe(true)
     expect(await auth.getToken()).toBe('SECRET-TOKEN')
 

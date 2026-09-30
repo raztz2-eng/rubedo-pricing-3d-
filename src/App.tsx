@@ -1,6 +1,6 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
 import { Layout } from './components/Layout'
-import { EditModelPage, NewModelPage } from './pages/BidForm'
+import { CreateFromFolderPage, EditModelPage, NewModelPage } from './pages/BidForm'
 import { Home } from './pages/Home'
 import { LibraryPage } from './pages/Library'
 import { ModelPageRoute } from './pages/ModelPage'
@@ -18,6 +18,7 @@ export function AppRoutes() {
         <Route path="new" element={<NewModelPage />} />
         <Route path="model/:id" element={<ModelPageRoute />} />
         <Route path="model/:id/edit" element={<EditModelPage />} />
+        <Route path="model/:id/create" element={<CreateFromFolderPage />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

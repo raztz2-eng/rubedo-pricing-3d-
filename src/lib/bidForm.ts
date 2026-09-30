@@ -235,6 +235,45 @@ export function formatHours(h: number): string {
 
 export const SLICED_MIME = 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml'
 
+function platePictures(info: SlicedFileInfo, include: boolean): FileDraft[] {
+  return info.plates
+    .filter((p) => p.picture)
+    .map((p) => ({
+      key: newKey('plate'),
+      name: `plate-${p.index}.png`,
+      kind: 'image',
+      mimeType: 'image/png',
+      blob: p.picture as Blob,
+      origin: 'plate',
+      include,
+      plateIndex: p.index,
+    }))
+}
+
+function partsFromPlates(info: SlicedFileInfo, link: { slicedLocalKey?: string; slicedFileId?: string }): PartDraft[] {
+  return info.plates.map((plate) => ({
+    key: newKey('part'),
+    name: plate.name,
+    qty: '1',
+    grams: String(plate.grams),
+    hours: formatHours(plate.hours),
+    hoursExact: plate.hours,
+    source: '3mf',
+    ...link,
+  }))
+}
+
+function materialFromFile(d: BidDraft, info: SlicedFileInfo, materials: Material[]): Pick<BidDraft, 'materialName' | 'pricePerKg'> {
+  let { materialName, pricePerKg } = d
+  const type = info.plates.find((p) => p.materialType)?.materialType
+  const match = type ? materials.find((m) => m.name.trim().toLowerCase() === type.toLowerCase()) : undefined
+  if (match) {
+    materialName = match.name
+    pricePerKg = String(match.pricePerKg)
+  }
+  return { materialName, pricePerKg }
+}
+
 /**
  * Applies a parsed sliced file to the draft: one part per plate, the sliced file attached,
  * plate pictures offered (included by default), material pre-selected if it exists in Settings.
@@ -246,28 +285,6 @@ export function applySlicedFile(
   materials: Material[],
 ): BidDraft {
   const slicedKey = newKey('sliced')
-  const parts: PartDraft[] = info.plates.map((plate) => ({
-    key: newKey('part'),
-    name: plate.name,
-    qty: '1',
-    grams: String(plate.grams),
-    hours: formatHours(plate.hours),
-    hoursExact: plate.hours,
-    source: '3mf',
-    slicedLocalKey: slicedKey,
-  }))
-  const pictures: FileDraft[] = info.plates
-    .filter((p) => p.picture)
-    .map((p) => ({
-      key: newKey('plate'),
-      name: `plate-${p.index}.png`,
-      kind: 'image',
-      mimeType: 'image/png',
-      blob: p.picture as Blob,
-      origin: 'plate',
-      include: true,
-      plateIndex: p.index,
-    }))
   const sliced: FileDraft = {
     key: slicedKey,
     name: file.name,
@@ -277,21 +294,33 @@ export function applySlicedFile(
     origin: 'sliced',
     include: true,
   }
-
-  let { materialName, pricePerKg } = d
-  const type = info.plates.find((p) => p.materialType)?.materialType
-  const match = type ? materials.find((m) => m.name.trim().toLowerCase() === type.toLowerCase()) : undefined
-  if (match) {
-    materialName = match.name
-    pricePerKg = String(match.pricePerKg)
-  }
-
   return {
     ...d,
-    materialName,
-    pricePerKg,
-    parts: [...d.parts, ...parts],
-    files: [...d.files, ...pictures, sliced],
+    ...materialFromFile(d, info, materials),
+    parts: [...d.parts, ...partsFromPlates(info, { slicedLocalKey: slicedKey })],
+    files: [...d.files, ...platePictures(info, true), sliced],
+  }
+}
+
+/**
+ * N2: a draft for an existing model folder without bid.json. Name = folder name. If the folder's sliced file was
+ * parsed (`sliced`), its plates become the parts, linked to that EXISTING Drive file (slicedFileId — never
+ * re-uploaded). Plate pictures are offered but NOT ticked: saving then writes only bid.json into the Founder's
+ * folder unless he adds something himself.
+ */
+export function draftFromFolder(
+  folderName: string,
+  materials: Material[],
+  sliced?: { file: BidFile; info: SlicedFileInfo },
+): BidDraft {
+  const d: BidDraft = { ...emptyDraft(materials), name: folderName.trim() }
+  if (!sliced) return d
+  return {
+    ...d,
+    ...materialFromFile(d, sliced.info, materials),
+    parts: partsFromPlates(sliced.info, { slicedFileId: sliced.file.id }),
+    files: platePictures(sliced.info, false),
+    existingFiles: [sliced.file],
   }
 }
 

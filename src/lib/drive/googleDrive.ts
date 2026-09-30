@@ -1,14 +1,15 @@
 import { FOLDER_MIME } from '../bid'
-import { DriveError, type DriveFile, type DriveStore, type ListOptions } from './types'
+import { DriveError, NOT_APP_FILE_MESSAGE, type DriveFile, type DriveStore, type ListOptions } from './types'
 
 /**
- * DriveStore backed by Google Drive REST v3 (plain fetch). Scope: drive.file.
- * Never deletes anything; updates only touch files the app created (bid.json / index / settings).
+ * DriveStore backed by Google Drive REST v3 (plain fetch). Scopes: drive.file + drive.readonly.
+ * Reads anything; never deletes or moves anything; updates only touch files the app created
+ * (bid.json / index / settings) — checked via `isAppAuthorized` before every update (AC17).
  */
 
 const API = 'https://www.googleapis.com/drive/v3'
 const UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3'
-const FILE_FIELDS = 'id,name,mimeType,modifiedTime'
+const FILE_FIELDS = 'id,name,mimeType,modifiedTime,thumbnailLink,isAppAuthorized'
 
 export interface TokenProvider {
   getToken(): Promise<string>
@@ -19,6 +20,33 @@ export interface TokenProvider {
 /** Escapes a value for use inside single quotes in a Drive `q` expression. */
 export function escapeQueryValue(value: string): string {
   return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+interface RawFile {
+  id: string
+  name: string
+  mimeType: string
+  modifiedTime?: string
+  thumbnailLink?: string
+  isAppAuthorized?: boolean
+}
+
+function toDriveFile(raw: RawFile): DriveFile {
+  const f: DriveFile = { id: raw.id, name: raw.name, mimeType: raw.mimeType }
+  if (raw.modifiedTime) f.modifiedTime = raw.modifiedTime
+  if (raw.thumbnailLink) f.thumbnailLink = raw.thumbnailLink
+  if (typeof raw.isAppAuthorized === 'boolean') f.appCreated = raw.isAppAuthorized
+  return f
+}
+
+/** Only Google-hosted thumbnail URLs get the bearer token. */
+export function isGoogleThumbnailUrl(url: string): boolean {
+  try {
+    const u = new URL(url)
+    return u.protocol === 'https:' && (u.hostname.endsWith('.googleusercontent.com') || u.hostname.endsWith('.google.com'))
+  } catch {
+    return false
+  }
 }
 
 export function buildListQuery(folderId: string, options: ListOptions = {}): string {
@@ -58,8 +86,8 @@ export class GoogleDriveStore implements DriveStore {
       })
       if (pageToken) params.set('pageToken', pageToken)
       const res = await this.request(`${API}/files?${params}`, { method: 'GET' })
-      const body = (await res.json()) as { files?: DriveFile[]; nextPageToken?: string }
-      out.push(...(body.files ?? []))
+      const body = (await res.json()) as { files?: RawFile[]; nextPageToken?: string }
+      out.push(...(body.files ?? []).map(toDriveFile))
       pageToken = body.nextPageToken
     } while (pageToken)
     return out
@@ -71,7 +99,7 @@ export class GoogleDriveStore implements DriveStore {
       headers: { 'Content-Type': 'application/json; charset=UTF-8' },
       body: JSON.stringify({ name, mimeType: FOLDER_MIME, parents: [parentId] }),
     })
-    return (await res.json()) as DriveFile
+    return toDriveFile((await res.json()) as RawFile)
   }
 
   async uploadFile(parentId: string, name: string, data: Blob, mimeType: string): Promise<DriveFile> {
@@ -92,10 +120,20 @@ export class GoogleDriveStore implements DriveStore {
       headers: { 'Content-Type': `multipart/related; boundary=${boundary}` },
       body,
     })
-    return (await res.json()) as DriveFile
+    return toDriveFile((await res.json()) as RawFile)
+  }
+
+  async getFile(fileId: string): Promise<DriveFile> {
+    const res = await this.request(`${API}/files/${encodeURIComponent(fileId)}?fields=${FILE_FIELDS}`, { method: 'GET' })
+    return toDriveFile((await res.json()) as RawFile)
   }
 
   async updateFileContent(fileId: string, data: Blob, mimeType: string): Promise<void> {
+    // Guard (AC17): never modify a file the app did not create, even if Google would allow it.
+    const meta = await this.getFile(fileId)
+    if (meta.appCreated !== true) {
+      throw new DriveError(`refused: ${fileId} was not created by the app`, NOT_APP_FILE_MESSAGE, 403)
+    }
     await this.request(`${UPLOAD_API}/files/${encodeURIComponent(fileId)}?uploadType=media&fields=id`, {
       method: 'PATCH',
       headers: { 'Content-Type': mimeType },
@@ -113,8 +151,32 @@ export class GoogleDriveStore implements DriveStore {
     return res.blob()
   }
 
+  /**
+   * Thumbnails live on googleusercontent.com and may need the bearer token for private files.
+   * Deliberately NOT the 401→refresh path: a failing preview must never push the session into "reconnect";
+   * the caller falls back to downloading the file (images.ts).
+   */
+  async readThumbnail(thumbnailLink: string): Promise<Blob> {
+    if (!isGoogleThumbnailUrl(thumbnailLink)) {
+      throw new DriveError(`unexpected thumbnail host: ${thumbnailLink}`, 'התמונה לא נטענה.')
+    }
+    const token = await this.tokens.getToken()
+    let res: Response
+    try {
+      res = await this.fetchImpl(thumbnailLink, { method: 'GET', headers: { Authorization: `Bearer ${token}` } })
+    } catch (e) {
+      throw new DriveError(`thumbnail network error: ${String(e)}`, 'התמונה לא נטענה.')
+    }
+    if (!res.ok) throw new DriveError(`thumbnail ${res.status}`, 'התמונה לא נטענה.', res.status)
+    return res.blob()
+  }
+
   folderUrl(folderId: string): string {
     return `https://drive.google.com/drive/folders/${encodeURIComponent(folderId)}`
+  }
+
+  fileUrl(fileId: string): string {
+    return `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view`
   }
 
   private async request(url: string, init: RequestInit, retried = false): Promise<Response> {

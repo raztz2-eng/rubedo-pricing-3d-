@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { DriveImage } from '../components/DriveImage'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
 import { ErrorBox, Money, Notice, Spinner } from '../components/ui'
-import type { IndexEntry } from '../lib/bid'
-import { loadLibrary, rebuildIndex } from '../lib/drive/bidRepository'
+import { isPriced, type IndexEntry } from '../lib/bid'
+import { loadLibraryState, rebuildIndex } from '../lib/drive/bidRepository'
 import { errorMessage, logError } from '../lib/errors'
 
 export function LibraryPage() {
@@ -18,21 +18,10 @@ function Library({ ctx }: { ctx: DriveContext }) {
   const [skipped, setSkipped] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [query, setQuery] = useState('')
+  // N5: auto-refresh at most once per opening of the library (per models folder).
+  const autoRefreshedFor = useRef<string | null>(null)
 
-  const load = useCallback(async () => {
-    setError(null)
-    setBusy(true)
-    try {
-      setEntries(await loadLibrary(drive, folderId))
-    } catch (e) {
-      logError('load library', e)
-      setError(errorMessage(e, 'טעינת הספרייה נכשלה.'))
-    } finally {
-      setBusy(false)
-    }
-  }, [drive, folderId])
-
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     setError(null)
     setBusy(true)
     try {
@@ -45,7 +34,28 @@ function Library({ ctx }: { ctx: DriveContext }) {
     } finally {
       setBusy(false)
     }
-  }
+  }, [drive, folderId])
+
+  const load = useCallback(async () => {
+    setError(null)
+    setBusy(true)
+    let stale = false
+    try {
+      const state = await loadLibraryState(drive, folderId)
+      setEntries(state.entries)
+      if (state.rebuilt) setSkipped(state.rebuilt.skipped)
+      stale = state.stale
+    } catch (e) {
+      logError('load library', e)
+      setError(errorMessage(e, 'טעינת הספרייה נכשלה.'))
+    } finally {
+      setBusy(false)
+    }
+    if (stale && autoRefreshedFor.current !== folderId) {
+      autoRefreshedFor.current = folderId
+      await refresh()
+    }
+  }, [drive, folderId, refresh])
 
   useEffect(() => {
     void load()
@@ -84,24 +94,65 @@ function Library({ ctx }: { ctx: DriveContext }) {
       )}
       <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
         {filtered.map((e) => (
-          <li key={e.id}>
-            <Link
-              to={`/model/${encodeURIComponent(e.id)}`}
-              className="card flex h-full flex-col gap-2 p-2 transition hover:border-stone-400 hover:shadow"
-              data-testid="library-card"
-            >
-              <DriveImage drive={drive} fileId={e.coverFileId} alt={e.name} className="aspect-square w-full rounded-lg object-cover" />
-              <div className="flex flex-1 flex-col px-1 pb-1">
-                <span className="line-clamp-2 font-semibold">{e.name}</span>
-                {e.revision && e.revision !== 'V1' && <span className="text-xs text-stone-500">{e.revision}</span>}
-                <span className="mt-auto pt-1 text-lg font-bold text-accent">
-                  <Money value={e.price70} />
-                </span>
-              </div>
-            </Link>
-          </li>
+          <li key={e.id}>{isPriced(e) ? <PricedCard entry={e} ctx={ctx} /> : <NeedsSlicingCard entry={e} ctx={ctx} />}</li>
         ))}
       </ul>
+    </div>
+  )
+}
+
+function PricedCard({ entry: e, ctx }: { entry: IndexEntry; ctx: DriveContext }) {
+  return (
+    <Link
+      to={`/model/${encodeURIComponent(e.id)}`}
+      className="card flex h-full flex-col gap-2 p-2 transition hover:border-stone-400 hover:shadow"
+      data-testid="library-card"
+      data-status="priced"
+    >
+      <DriveImage drive={ctx.drive} fileId={e.coverFileId} alt={e.name} className="aspect-square w-full rounded-lg object-cover" />
+      <div className="flex flex-1 flex-col px-1 pb-1">
+        <span className="line-clamp-2 font-semibold">{e.name}</span>
+        {e.revision && e.revision !== 'V1' && <span className="text-xs text-stone-500">{e.revision}</span>}
+        {e.price70 !== undefined && (
+          <span className="mt-auto pt-1 text-lg font-bold text-accent">
+            <Money value={e.price70} />
+          </span>
+        )}
+      </div>
+    </Link>
+  )
+}
+
+export const NEEDS_SLICING_BADGE = 'דורש סלייס'
+export const SLICED_FOUND_BADGE = 'נמצא קובץ סלייס — צור הצעה'
+
+/** N1: an existing model folder without bid.json — no price; badge; link to create a bid. */
+function NeedsSlicingCard({ entry: e, ctx }: { entry: IndexEntry; ctx: DriveContext }) {
+  const found = !!e.slicedFileId
+  return (
+    <div className="flex h-full flex-col gap-1">
+      <Link
+        to={`/model/${encodeURIComponent(e.id)}`}
+        className="card flex flex-1 flex-col gap-2 p-2 transition hover:border-stone-400 hover:shadow"
+        data-testid="library-card"
+        data-status="needs-slicing"
+      >
+        <DriveImage drive={ctx.drive} fileId={e.coverFileId} alt={e.name} className="aspect-square w-full rounded-lg object-cover" />
+        <div className="flex flex-1 flex-col gap-1 px-1 pb-1">
+          <span className="line-clamp-2 font-semibold">{e.name}</span>
+          <span
+            className={`mt-auto w-fit rounded-full px-2 py-0.5 text-xs font-medium ${
+              found ? 'bg-emerald-50 text-emerald-800' : 'bg-amber-50 text-amber-900'
+            }`}
+            data-testid="status-badge"
+          >
+            {found ? SLICED_FOUND_BADGE : NEEDS_SLICING_BADGE}
+          </span>
+        </div>
+      </Link>
+      <Link to={`/model/${encodeURIComponent(e.id)}/create`} className="btn btn-secondary text-sm">
+        צור הצעת מחיר
+      </Link>
     </div>
   )
 }

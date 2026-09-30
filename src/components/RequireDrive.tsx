@@ -59,7 +59,7 @@ export function RequireDrive({ children }: { children: (ctx: DriveContext) => Re
   if (!sessionActive) {
     return (
       <div className="card flex flex-col items-start gap-3">
-        <p>כדי לעבוד עם הדגמים יש להתחבר לחשבון Google (גישה רק לקבצים שהאפליקציה יוצרת).</p>
+        <p>כדי לעבוד עם הדגמים יש להתחבר לחשבון Google (צפייה בקבצים ב-Drive; שינוי רק של קבצים שהאפליקציה יצרה).</p>
         <button
           type="button"
           className="btn btn-primary"

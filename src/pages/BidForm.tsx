@@ -5,11 +5,13 @@ import { PartsEditor } from '../components/PartsEditor'
 import { PricePanel } from '../components/PricePanel'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
 import { BlobImage, Dialog, ErrorBox, Field, Money, Spinner } from '../components/ui'
-import type { Bid } from '../lib/bid'
+import type { Bid, BidFile } from '../lib/bid'
 import {
   applySlicedFile,
   bidToDraft,
   canSave,
+  draftFromFolder,
+  SLICED_MIME,
   draftToContent,
   draftToPricingInput,
   emptyDraft,
@@ -23,6 +25,7 @@ import {
 import {
   checkName,
   loadBid,
+  loadModelFolder,
   newSaveSession,
   saveNewBid,
   updateBid,
@@ -69,13 +72,88 @@ function EditLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) 
   return <BidForm ctx={ctx} existing={{ folderId, bid }} />
 }
 
-function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: string; bid: Bid } }) {
+/** N2: "create bid" for an existing model folder without bid.json. */
+export function CreateFromFolderPage() {
+  const { id = '' } = useParams()
+  return <RequireDrive>{(ctx) => <FolderLoader key={id} ctx={ctx} folderId={id} />}</RequireDrive>
+}
+
+interface FromFolder {
+  folderId: string
+  folderName: string
+  draft: BidDraft
+  /** The folder's sliced file could not be read: shown as an error, the form stays empty for manual entry. */
+  sliceError?: string
+}
+
+function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
+  const [state, setState] = useState<{ fromFolder?: FromFolder; hasBid?: boolean } | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [tick, setTick] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    setError(null)
+    const run = async () => {
+      const { folder, contents, bid } = await loadModelFolder(ctx.drive, folderId)
+      if (bid) return { hasBid: true }
+      const slicedFile = contents.sliced[0]
+      const base: FromFolder = { folderId, folderName: folder.name.trim(), draft: draftFromFolder(folder.name, ctx.settings.materials) }
+      if (!slicedFile) return { fromFolder: base }
+      try {
+        // Read-only: the existing sliced file is parsed in the browser and referenced, never re-uploaded.
+        const info = await parseSlicedThreeMF(await ctx.drive.readBlob(slicedFile.id))
+        const file: BidFile = { id: slicedFile.id, name: slicedFile.name, kind: 'sliced', mimeType: slicedFile.mimeType || SLICED_MIME }
+        const draft = draftFromFolder(folder.name, ctx.settings.materials, { file, info })
+        return { fromFolder: { ...base, draft } }
+      } catch (e) {
+        logError('parse existing sliced file', e)
+        return { fromFolder: { ...base, sliceError: `${errorMessage(e, 'לא ניתן לקרוא את הקובץ.')} (${slicedFile.name})` } }
+      }
+    }
+    run()
+      .then((r) => !cancelled && setState(r))
+      .catch((e: unknown) => {
+        logError('load folder for create', e)
+        if (!cancelled) setError(errorMessage(e, 'טעינת התיקייה נכשלה.'))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [ctx.drive, ctx.settings.materials, folderId, tick])
+
+  if (error) return <ErrorBox onRetry={() => setTick((t) => t + 1)}>{error}</ErrorBox>
+  if (!state) return <Spinner label="טוען תיקייה…" />
+  if (state.hasBid) {
+    return (
+      <ErrorBox>
+        לתיקייה הזו כבר יש הצעת מחיר.{' '}
+        <Link className="underline" to={`/model/${encodeURIComponent(folderId)}`}>
+          מעבר לדגם
+        </Link>
+      </ErrorBox>
+    )
+  }
+  return <BidForm ctx={ctx} fromFolder={state.fromFolder} />
+}
+
+function BidForm({
+  ctx,
+  existing,
+  fromFolder,
+}: {
+  ctx: DriveContext
+  existing?: { folderId: string; bid: Bid }
+  fromFolder?: FromFolder
+}) {
   const { drive, folderId: modelsFolderId, settings } = ctx
   const navigate = useNavigate()
-  const [draft, setDraft] = useState<BidDraft>(() => (existing ? bidToDraft(existing.bid) : emptyDraft(settings.materials)))
+  const [draft, setDraft] = useState<BidDraft>(() =>
+    existing ? bidToDraft(existing.bid) : fromFolder ? fromFolder.draft : emptyDraft(settings.materials),
+  )
   // New bids use current Settings; an existing bid keeps its snapshot unless the user recalculates.
   const [snapshot, setSnapshot] = useState<PricingSettings>(() => existing?.bid.settingsSnapshot ?? settings.pricing)
-  const [sliceError, setSliceError] = useState<string | null>(null)
+  const [sliceError, setSliceError] = useState<string | null>(fromFolder?.sliceError ?? null)
   const [parsing, setParsing] = useState(false)
   const [fileError, setFileError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -155,7 +233,15 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
   const saveNew = async (folderName: string, d: BidDraft) => {
     folderNameRef.current = folderName
     const content = draftToContent(d, effectiveSnapshot, computePrice(draftToPricingInput(d), effectiveSnapshot))
-    const saved = await saveNewBid(drive, modelsFolderId, { folderName, content, files: filesToUpload(d) }, sessionRef.current)
+    const saved = await saveNewBid(
+      drive,
+      modelsFolderId,
+      fromFolder
+        ? // N2: into the existing folder — no new folder; files already there are referenced, not re-uploaded.
+          { folderName, existingFolderId: fromFolder.folderId, existingFiles: d.existingFiles, content, files: filesToUpload(d) }
+        : { folderName, content, files: filesToUpload(d) },
+      sessionRef.current,
+    )
     navigate(`/model/${encodeURIComponent(saved.folderId)}`)
   }
 
@@ -166,7 +252,7 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
       await fn()
     } catch (e) {
       logError('save bid', e)
-      if (!existing && sessionRef.current.folderId) setNameLocked(true)
+      if (!existing && !fromFolder && sessionRef.current.folderId) setNameLocked(true)
       setSaveError(`${errorMessage(e, 'השמירה נכשלה.')} הנתונים בטופס נשמרו — אפשר ללחוץ שוב על "שמירה" כדי להמשיך מאותה נקודה.`)
     } finally {
       setSaving(false)
@@ -195,6 +281,17 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
           sessionRef.current,
         )
         navigate(`/model/${encodeURIComponent(existing.folderId)}`)
+        return
+      }
+      if (fromFolder) {
+        // The folder is fixed (no name-conflict dialog for it); the name must still not collide with ANOTHER bid.
+        const check = await checkName(drive, modelsFolderId, draft.name, fromFolder.folderId)
+        if (check.taken) {
+          setRenameError(`כבר קיים דגם אחר בשם „${draft.name.trim()}”. בחרו שם אחר — שום הצעה לא נדרסה.`)
+          nameInputRef.current?.focus()
+          return
+        }
+        await saveNew(fromFolder.folderName, draft)
         return
       }
       // A retry after a partial failure reuses the folder that was already created.
@@ -226,6 +323,7 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
     nameInputRef.current?.select()
   }
 
+  const backFolderId = existing?.folderId ?? fromFolder?.folderId
   const plateFiles = draft.files.filter((f) => f.origin === 'plate')
   const userImages = draft.files.filter((f) => f.origin === 'user' && f.kind === 'image')
   const otherFiles = draft.files.filter((f) => f.kind !== 'image')
@@ -233,9 +331,11 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
   return (
     <div className="pb-24">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-2xl font-bold">{existing ? `עריכת ${existing.bid.name}` : 'דגם חדש'}</h1>
-        {existing && (
-          <Link to={`/model/${encodeURIComponent(existing.folderId)}`} className="btn btn-ghost">
+        <h1 className="text-2xl font-bold">
+          {existing ? `עריכת ${existing.bid.name}` : fromFolder ? `הצעת מחיר ל${fromFolder.folderName}` : 'דגם חדש'}
+        </h1>
+        {backFolderId && (
+          <Link to={`/model/${encodeURIComponent(backFolderId)}`} className="btn btn-ghost">
             ביטול
           </Link>
         )}
@@ -428,7 +528,7 @@ function BidForm({ ctx, existing }: { ctx: DriveContext; existing?: { folderId: 
             )}
             {draft.existingFiles.length > 0 && (
               <div className="text-sm">
-                <p className="mb-1 text-stone-600">קבצים שכבר שמורים עם הדגם:</p>
+                <p className="mb-1 text-stone-600">{fromFolder ? 'קבצים מהתיקייה ב-Drive (לא יועלו שוב):' : 'קבצים שכבר שמורים עם הדגם:'}</p>
                 <ul className="flex flex-col gap-1">
                   {draft.existingFiles.map((f) => (
                     <li key={f.id} className="truncate rounded bg-stone-50 px-2 py-1" dir="ltr">

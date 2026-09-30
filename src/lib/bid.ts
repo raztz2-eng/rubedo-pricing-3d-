@@ -53,16 +53,42 @@ export interface Bid {
   coverFileId?: string
 }
 
+export type EntryStatus = 'priced' | 'needs-slicing'
+
+/**
+ * One library card. `priced` = the folder has a valid bid.json. `needs-slicing` = an existing model folder without
+ * bid.json (brief v0.3 N1): no price; `slicedFileId` set when a sliced .gcode.3mf was found in it.
+ * Index entries written before v0.3 have no `status` and are priced.
+ */
 export interface IndexEntry {
   /** Drive folder ID of the model. */
   id: string
   name: string
+  status?: EntryStatus
   revision: string
-  price70: number
-  landed: number
+  /** 70% price — priced entries only (a needs-slicing entry has no price). */
+  price70?: number
+  landed?: number
   coverFileId?: string
+  /** needs-slicing only: a sliced .gcode.3mf found in the folder. */
+  slicedFileId?: string
   updatedAt: string
 }
+
+export function isPriced(e: IndexEntry): boolean {
+  return e.status !== 'needs-slicing'
+}
+
+/** Index file content (v0.3). Older files are a bare IndexEntry[] (treated as stale → rebuilt). */
+export interface IndexFile {
+  schemaVersion: 2
+  /** When the index was last fully rebuilt from Drive (ISO). */
+  builtAt: string
+  entries: IndexEntry[]
+}
+
+/** The library auto-refreshes once on open when the index is older than this (brief v0.3 N5). */
+export const INDEX_MAX_AGE_MS = 10 * 60 * 1000
 
 export interface AppSettings {
   schemaVersion: 1
@@ -128,6 +154,7 @@ export function indexEntryFromBid(folderId: string, bid: Bid): IndexEntry {
   return {
     id: folderId,
     name: bid.name,
+    status: 'priced',
     revision: bid.revision,
     price70: bid.result.price70,
     landed: bid.result.landed,

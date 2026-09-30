@@ -15,6 +15,7 @@ interface GoogleTokenClient {
 interface GoogleTokenClientConfig {
   client_id: string
   scope: string
+  include_granted_scopes?: boolean
   callback: (response: GoogleTokenResponse) => void
   error_callback?: (error: { type: string; message?: string }) => void
 }

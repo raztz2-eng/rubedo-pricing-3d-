@@ -1,6 +1,8 @@
+import { mapLimit } from '../concurrency'
 import {
   BID_FILE_NAME,
   INDEX_FILE_NAME,
+  INDEX_MAX_AGE_MS,
   SETTINGS_FILE_NAME,
   defaultAppSettings,
   indexEntryFromBid,
@@ -14,8 +16,13 @@ import {
   type BidPart,
   type FileKind,
   type IndexEntry,
+  type IndexFile,
 } from '../bid'
+import { classifyFolder, isPlatePictureName, isSkippedFolderName, pickCover, type FolderContents } from './folderContents'
 import { DriveError, type DriveFile, type DriveStore } from './types'
+
+/** How many model folders are listed in parallel when (re)building the library. */
+export const FOLDER_SCAN_CONCURRENCY = 5
 
 /**
  * Bid persistence on top of any DriveStore (brief §4–§5).
@@ -116,11 +123,24 @@ export async function saveSettings(store: DriveStore, modelsFolderId: string, se
 
 // ---------- Index / library ----------
 
+export interface IndexData {
+  entries: IndexEntry[]
+  /** When the index was last fully rebuilt; undefined for pre-v0.3 index files (→ stale). */
+  builtAt?: string
+}
+
+function isIndexEntry(e: unknown): e is IndexEntry {
+  if (!e || typeof e !== 'object') return false
+  const x = e as IndexEntry
+  if (typeof x.id !== 'string' || typeof x.name !== 'string') return false
+  return x.status === 'needs-slicing' || typeof x.price70 === 'number'
+}
+
 /**
- * Reads the index cache. Returns null (→ caller rebuilds) when it is missing, not valid JSON or not an array.
- * Drive/network errors are rethrown.
+ * Reads the index cache. Returns null (→ caller rebuilds) when it is missing, not valid JSON or malformed.
+ * Accepts the pre-v0.3 format (bare array, no builtAt). Drive/network errors are rethrown.
  */
-export async function readIndex(store: DriveStore, modelsFolderId: string): Promise<IndexEntry[] | null> {
+export async function readIndex(store: DriveStore, modelsFolderId: string): Promise<IndexData | null> {
   const file = await findFile(store, modelsFolderId, INDEX_FILE_NAME)
   if (!file) return null
   let raw: unknown
@@ -130,10 +150,25 @@ export async function readIndex(store: DriveStore, modelsFolderId: string): Prom
     if (e instanceof InvalidJsonError) return null
     throw e
   }
-  if (!Array.isArray(raw)) return null
-  return raw.filter(
-    (e): e is IndexEntry => !!e && typeof e.id === 'string' && typeof e.name === 'string' && typeof e.price70 === 'number',
-  )
+  if (Array.isArray(raw)) return { entries: raw.filter(isIndexEntry) }
+  if (raw && typeof raw === 'object' && Array.isArray((raw as IndexFile).entries)) {
+    const f = raw as IndexFile
+    return { entries: f.entries.filter(isIndexEntry), builtAt: typeof f.builtAt === 'string' ? f.builtAt : undefined }
+  }
+  return null
+}
+
+async function writeIndex(store: DriveStore, modelsFolderId: string, entries: IndexEntry[], builtAt: string): Promise<void> {
+  const file: IndexFile = { schemaVersion: 2, builtAt, entries: sortIndex(entries) }
+  await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, file)
+}
+
+/** True when the index was never fully rebuilt by v0.3 or is older than 10 minutes (N5). */
+export function isIndexStale(builtAt: string | undefined, now: Date = new Date()): boolean {
+  if (!builtAt) return true
+  const t = Date.parse(builtAt)
+  if (!Number.isFinite(t)) return true
+  return now.getTime() - t > INDEX_MAX_AGE_MS
 }
 
 export interface RebuildResult {
@@ -142,55 +177,112 @@ export interface RebuildResult {
   skipped: string[]
 }
 
+type FolderScan = { entry: IndexEntry } | { skipped: string } | null
+
+async function scanModelFolder(store: DriveStore, folder: DriveFile): Promise<FolderScan> {
+  const contents = classifyFolder(await store.listChildren(folder.id))
+  if (!contents.bidFile) {
+    // A folder the app created but never finished (save failed before bid.json) is not a model (brief §5).
+    if (folder.appCreated === true) return null
+    const entry: IndexEntry = {
+      id: folder.id,
+      name: folder.name.trim(),
+      status: 'needs-slicing',
+      revision: '',
+      coverFileId: pickCover(contents.images),
+      updatedAt: folder.modifiedTime ?? '',
+    }
+    if (!entry.coverFileId) delete entry.coverFileId
+    if (contents.sliced[0]) entry.slicedFileId = contents.sliced[0].id
+    return { entry }
+  }
+  let raw: unknown
+  try {
+    raw = await readJson(store, contents.bidFile.id, BID_FILE_NAME)
+  } catch (e) {
+    if (e instanceof InvalidJsonError) return { skipped: folder.name }
+    throw e
+  }
+  if (!isBid(raw)) return { skipped: folder.name }
+  const entry = indexEntryFromBid(folder.id, raw)
+  entry.coverFileId = pickCover(contents.images, raw.coverFileId)
+  if (!entry.coverFileId) delete entry.coverFileId
+  return { entry }
+}
+
 /**
- * Rebuilds the index from every `<model>/bid.json`. Folders without bid.json are ignored; folders whose
- * bid.json is corrupt are reported in `skipped`. Any Drive error aborts the rebuild WITHOUT writing the index.
+ * Rebuilds the index from every direct subfolder of the models folder (brief v0.3 N1): folders with bid.json →
+ * priced; folders without → needs-slicing. Skips "_…" and "Models photo". Folders whose bid.json is corrupt are
+ * reported in `skipped`. Any Drive error aborts the rebuild WITHOUT writing the index. Only reads model folders.
  */
-export async function rebuildIndex(store: DriveStore, modelsFolderId: string): Promise<RebuildResult> {
-  const folders = await store.listChildren(modelsFolderId, { foldersOnly: true })
+export async function rebuildIndex(store: DriveStore, modelsFolderId: string, now: Date = new Date()): Promise<RebuildResult> {
+  const folders = (await store.listChildren(modelsFolderId, { foldersOnly: true })).filter((f) => !isSkippedFolderName(f.name))
+  const scans = await mapLimit(folders, FOLDER_SCAN_CONCURRENCY, (f) => scanModelFolder(store, f))
   const entries: IndexEntry[] = []
   const skipped: string[] = []
-  for (const folder of folders) {
-    const bidFile = await findFile(store, folder.id, BID_FILE_NAME)
-    if (!bidFile) continue
-    let raw: unknown
-    try {
-      raw = await readJson(store, bidFile.id, BID_FILE_NAME)
-    } catch (e) {
-      if (e instanceof InvalidJsonError) {
-        skipped.push(folder.name)
-        continue
-      }
-      throw e
-    }
-    if (!isBid(raw)) {
-      skipped.push(folder.name)
-      continue
-    }
-    entries.push(indexEntryFromBid(folder.id, raw))
+  for (const s of scans) {
+    if (!s) continue
+    if ('entry' in s) entries.push(s.entry)
+    else skipped.push(s.skipped)
   }
   const sorted = sortIndex(entries)
-  await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, sorted)
+  await writeIndex(store, modelsFolderId, sorted, now.toISOString())
   return { entries: sorted, skipped }
 }
 
 /** Library entries (newest first). Rebuilds the index if it does not exist yet. */
 export async function loadLibrary(store: DriveStore, modelsFolderId: string): Promise<IndexEntry[]> {
+  return (await loadLibraryState(store, modelsFolderId)).entries
+}
+
+/** Library entries plus whether the cached index is stale (→ the Library refreshes once, N5). */
+export async function loadLibraryState(
+  store: DriveStore,
+  modelsFolderId: string,
+  now: Date = new Date(),
+): Promise<{ entries: IndexEntry[]; stale: boolean; rebuilt?: RebuildResult }> {
   const index = await readIndex(store, modelsFolderId)
-  if (index === null) return (await rebuildIndex(store, modelsFolderId)).entries
-  return sortIndex(index)
+  if (index === null) {
+    const rebuilt = await rebuildIndex(store, modelsFolderId, now)
+    return { entries: rebuilt.entries, stale: false, rebuilt }
+  }
+  return { entries: sortIndex(index.entries), stale: isIndexStale(index.builtAt, now) }
 }
 
 async function upsertIndexEntry(store: DriveStore, modelsFolderId: string, entry: IndexEntry): Promise<void> {
   const index = await readIndex(store, modelsFolderId)
   if (index === null) {
-    // No cache yet: rebuild from bid.json files (includes the bid just written).
+    // No cache yet: rebuild from the folders (includes the bid just written).
     await rebuildIndex(store, modelsFolderId)
     return
   }
-  const next = index.filter((e) => e.id !== entry.id)
+  // Replaces any entry of the same folder (e.g. a needs-slicing card that just got its bid).
+  const next = index.entries.filter((e) => e.id !== entry.id)
   next.push(entry)
-  await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, sortIndex(next))
+  // Keep the original build time: an upsert is not a full rebuild (legacy index → still stale → rebuilt on open).
+  await writeIndex(store, modelsFolderId, next, index.builtAt ?? new Date(0).toISOString())
+}
+
+// ---------- Model folder (page) ----------
+
+export interface ModelFolder {
+  folder: DriveFile
+  contents: FolderContents
+  /** Present when the folder has a valid bid.json. */
+  bid?: Bid
+}
+
+/**
+ * Everything the model page shows (N3/N4): the folder, all its files and its bid (if any). Read-only.
+ * A bid.json that exists but is corrupt is an error (never shown as "needs slicing").
+ */
+export async function loadModelFolder(store: DriveStore, folderId: string): Promise<ModelFolder> {
+  const [folder, children] = await Promise.all([store.getFile(folderId), store.listChildren(folderId)])
+  const contents = classifyFolder(children)
+  if (!contents.bidFile) return { folder, contents }
+  const raw = await readJson(store, contents.bidFile.id, BID_FILE_NAME)
+  if (!isBid(raw)) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
+  return { folder, contents, bid: raw }
 }
 
 // ---------- Name check ----------
@@ -218,7 +310,7 @@ export async function checkName(
   const folderNames = folders.map((f) => f.name)
   const taken =
     folders.some((f) => f.id !== excludeFolderId && sameName(f.name, name)) ||
-    (index ?? []).some((e) => e.id !== excludeFolderId && sameName(e.name, name))
+    (index?.entries ?? []).some((e) => e.id !== excludeFolderId && sameName(e.name, name))
   let n = 2
   while (folderNames.some((f) => sameName(f, `${name.trim()} V${n}`))) n += 1
   return { taken, nextRevision: { folderName: `${name.trim()} V${n}`, revision: `V${n}` } }
@@ -258,8 +350,15 @@ function firstImage(files: BidFile[]): string | undefined {
 }
 
 export interface SaveNewParams {
-  /** Folder to create under the models folder (the name, or "<name> V2" …). */
+  /** Folder to create under the models folder (the name, or "<name> V2" …). Ignored with `existingFolderId`. */
   folderName: string
+  /**
+   * N2: write the bid INTO this existing model folder (not created by the app) instead of creating a folder.
+   * Only new files are created in it (uploads + bid.json); nothing already there is modified.
+   */
+  existingFolderId?: string
+  /** Files already in that folder that the bid refers to (e.g. the sliced .gcode.3mf) — not re-uploaded. */
+  existingFiles?: BidFile[]
   content: BidContent
   /** Files in display order; the first image becomes the cover. */
   files: LocalFile[]
@@ -276,6 +375,13 @@ export async function saveNewBid(
   params: SaveNewParams,
   session: SaveSession,
 ): Promise<{ folderId: string; bid: Bid }> {
+  if (params.existingFolderId) {
+    session.folderId = params.existingFolderId
+    // Never overwrite a bid that is already there (e.g. saved meanwhile from another tab).
+    if (!session.bidFileId && (await findFile(store, params.existingFolderId, BID_FILE_NAME))) {
+      throw new DriveError('bid.json already exists', 'כבר קיימת הצעת מחיר בתיקייה הזו. רעננו את הספרייה ופתחו אותה משם.', 409)
+    }
+  }
   if (!session.folderId) {
     const folder = await store.createFolder(modelsFolderId, params.folderName)
     session.folderId = folder.id
@@ -287,7 +393,8 @@ export async function saveNewBid(
   const now = (params.now ?? new Date()).toISOString()
   session.bidId ??= newId()
   session.createdAt ??= now
-  const files = params.files.map((f) => session.uploaded[f.key])
+  const uploadedFiles = params.files.map((f) => session.uploaded[f.key])
+  const files = [...uploadedFiles, ...(params.existingFiles ?? [])]
   const bid: Bid = {
     schemaVersion: 1,
     id: session.bidId,
@@ -296,7 +403,9 @@ export async function saveNewBid(
     ...params.content,
     parts: resolveParts(params.content.parts, session),
     files,
-    coverFileId: firstImage(files),
+    // In an existing folder a plate picture must not hide the Founder's own photos: no explicit cover then,
+    // so the cover rule (first photo by name, else plate picture) applies (N3).
+    coverFileId: params.existingFolderId ? firstImage(uploadedFiles.filter((f) => !isPlatePictureName(f.name))) : firstImage(files),
   }
   if (!bid.coverFileId) delete bid.coverFileId
 
@@ -307,7 +416,12 @@ export async function saveNewBid(
     session.bidFileId = created.id
   }
 
-  await upsertIndexEntry(store, modelsFolderId, indexEntryFromBid(folderId, bid))
+  const entry = indexEntryFromBid(folderId, bid)
+  if (params.existingFolderId && !entry.coverFileId) {
+    entry.coverFileId = pickCover(classifyFolder(await store.listChildren(folderId)).images)
+    if (!entry.coverFileId) delete entry.coverFileId
+  }
+  await upsertIndexEntry(store, modelsFolderId, entry)
   return { folderId, bid }
 }
 
@@ -349,6 +463,12 @@ export async function updateBid(
   if (!bidFile) throw new DriveError('bid.json missing', 'לא נמצא קובץ bid.json בתיקיית הדגם.', 404)
   await store.updateFileContent(bidFile.id, jsonBlob(bid), JSON_MIME)
 
-  await upsertIndexEntry(store, modelsFolderId, indexEntryFromBid(folderId, bid))
+  const entry = indexEntryFromBid(folderId, bid)
+  if (!entry.coverFileId) {
+    // Photos the Founder added to the folder later can be the cover (N3).
+    entry.coverFileId = pickCover(classifyFolder(await store.listChildren(folderId)).images)
+    if (!entry.coverFileId) delete entry.coverFileId
+  }
+  await upsertIndexEntry(store, modelsFolderId, entry)
   return bid
 }

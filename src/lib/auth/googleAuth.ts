@@ -1,8 +1,8 @@
-import { DRIVE_SCOPE } from '../config'
+import { DRIVE_SCOPE, DRIVE_SCOPES } from '../config'
 import { GIS_SRC, loadScript } from '../google/loadScript'
 
 /**
- * Google Identity Services token client. Scope: drive.file ONLY.
+ * Google Identity Services token client. Scopes: exactly drive.file + drive.readonly (brief v0.3 D-A).
  * The access token lives in this object's memory only — never in localStorage/sessionStorage/cookies.
  */
 
@@ -31,6 +31,15 @@ export const TIMEOUT_MESSAGE = 'Google לא הגיב לבקשת ההתחברות
 export const REQUEST_TIMEOUT_MS = 120_000
 /** An explicit sign-in click may re-open the popup if the pending request is older than this. */
 export const STALE_REQUEST_MS = 10_000
+
+export const SCOPE_MISSING_MESSAGE =
+  'יש לאשר את שתי ההרשאות של Drive: צפייה בקבצים ויצירת קבצים של האפליקציה. התחברו שוב וסמנו את שתיהן.'
+
+/** True when the granted scope string includes every required scope (drive.file AND drive.readonly). */
+export function hasRequiredScopes(granted: string): boolean {
+  const list = granted.split(/\s+/).filter(Boolean)
+  return DRIVE_SCOPES.every((s) => list.includes(s))
+}
 
 export function gisErrorMessage(type: string): string {
   if (type === 'popup_failed_to_open') return POPUP_BLOCKED_MESSAGE
@@ -203,6 +212,8 @@ export class GoogleAuth {
       const client = oauth2.initTokenClient({
         client_id: this.clientId,
         scope: DRIVE_SCOPE,
+        // Only the scopes requested here — never inherit broader scopes granted to this client earlier.
+        include_granted_scopes: false,
         callback: (resp) => {
           if (gen === this.generation) this.onToken(resp)
         },
@@ -234,10 +245,9 @@ export class GoogleAuth {
       this.finish(new AuthError(`token error: ${resp.error}`, AUTH_FAILED_MESSAGE))
       return
     }
-    // The user may untick the Drive permission on the consent screen — then we cannot work.
-    const scopes = (resp.scope ?? DRIVE_SCOPE).split(' ')
-    if (!scopes.includes(DRIVE_SCOPE)) {
-      this.finish(new AuthError('scope not granted', 'יש לאשר גישה לקבצים שהאפליקציה יוצרת ב-Drive.'))
+    // The user may untick a Drive permission on the consent screen — then we cannot work.
+    if (!hasRequiredScopes(resp.scope ?? DRIVE_SCOPE)) {
+      this.finish(new AuthError('scope not granted', SCOPE_MISSING_MESSAGE))
       return
     }
     this.token = resp.access_token

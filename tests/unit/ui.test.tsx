@@ -267,8 +267,19 @@ class TokenGatedDrive implements DriveStore {
     await this.token()
     return this.inner.readBlob(id)
   }
+  async getFile(id: string) {
+    await this.token()
+    return this.inner.getFile(id)
+  }
+  async readThumbnail(link: string) {
+    await this.token()
+    return this.inner.readThumbnail(link)
+  }
   folderUrl(id: string) {
     return this.inner.folderUrl(id)
+  }
+  fileUrl(id: string) {
+    return this.inner.fileUrl(id)
   }
 }
 
