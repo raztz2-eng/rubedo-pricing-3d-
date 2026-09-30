@@ -49,6 +49,8 @@ interface TokenBody {
   access_token?: string
   expires_in?: number
   email?: string
+  /** Granted OAuth scopes (v0.5 Q5). Absent from older backends → unknown (null). */
+  scopes?: unknown
   message?: string
 }
 
@@ -72,6 +74,7 @@ export class SessionAuth implements TokenProvider {
   private token: string | null = null
   private expiresAt = 0
   private accountEmail: string | null = null
+  private grantedScopes: readonly string[] | null = null
   private error: string | null = null
   /** One shared in-flight token request: parallel callers all wait on it. */
   private inflight: Promise<string> | null = null
@@ -102,6 +105,23 @@ export class SessionAuth implements TokenProvider {
 
   get email(): string | null {
     return this.accountEmail
+  }
+
+  /** Scopes granted to the current session (from /api/auth/token); null = not known. */
+  get scopes(): readonly string[] | null {
+    return this.grantedScopes
+  }
+
+  /**
+   * After the extra-permission popup (v0.5 Q5): ask the backend for a new token so the new scopes are known.
+   * Works while signed in (the popup replaced the session cookie) and while "needs reconnect".
+   */
+  async recheck(): Promise<void> {
+    if (this.state === 'reconnect') {
+      await this.fetchToken()
+      return
+    }
+    await this.refresh()
   }
 
   /** Last start-up/renewal problem that is not "signed out" (plain Hebrew), for the header. */
@@ -182,6 +202,7 @@ export class SessionAuth implements TokenProvider {
     this.token = null
     this.expiresAt = 0
     this.accountEmail = null
+    this.grantedScopes = null
     this.error = null
     this.setState('signed-out')
     this.fetchImpl(LOGOUT_URL, { method: 'POST', credentials: 'same-origin' }).catch((e: unknown) => this.log('logout', e))
@@ -228,6 +249,7 @@ export class SessionAuth implements TokenProvider {
     this.token = body.access_token
     this.expiresAt = this.now() + Number(body.expires_in ?? 3600) * 1000
     this.accountEmail = body.email ?? null
+    this.grantedScopes = Array.isArray(body.scopes) ? body.scopes.filter((x): x is string => typeof x === 'string') : null
     this.error = null
     this.setState('signed-in')
     return body.access_token

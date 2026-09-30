@@ -8,7 +8,12 @@ export const DRIVE_FILES_URL = 'https://www.googleapis.com/drive/v3/files'
 
 /** Brief v0.4 D-F: full Drive scope (the app's own write rules are enforced in code). */
 export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive'
-export const LOGIN_SCOPES = ['openid', 'email', DRIVE_SCOPE].join(' ')
+/**
+ * Brief v0.5 D-J: Gmail compose — the app only creates drafts (the Founder presses Send in Gmail himself).
+ * Optional at callback (Q5): a session without it still works; only the quote screen asks for it.
+ */
+export const GMAIL_COMPOSE_SCOPE = 'https://www.googleapis.com/auth/gmail.compose'
+export const LOGIN_SCOPES = ['openid', 'email', DRIVE_SCOPE, GMAIL_COMPOSE_SCOPE].join(' ')
 
 export interface TokenResponse {
   access_token?: string
@@ -19,7 +24,7 @@ export interface TokenResponse {
 }
 
 export type RefreshResult =
-  | { ok: true; accessToken: string; expiresIn: number; refreshToken?: string }
+  | { ok: true; accessToken: string; expiresIn: number; refreshToken?: string; scopes: string[] }
   /** `revoked`: Google says the refresh token is no longer valid → the session is gone. Otherwise: temporary. */
   | { ok: false; revoked: boolean; status: number }
 
@@ -81,6 +86,7 @@ export async function refreshAccessToken(
     ok: true,
     accessToken: body.access_token,
     expiresIn: Number(body.expires_in ?? 3600),
+    scopes: splitScopes(body.scope),
     ...(body.refresh_token ? { refreshToken: body.refresh_token } : {}),
   }
 }
@@ -101,8 +107,13 @@ export async function revokeToken(fetchImpl: typeof fetch, token: string): Promi
   })
 }
 
+/** The space-separated `scope` field of a token response as a list (missing → empty list). */
+export function splitScopes(scope: string | undefined): string[] {
+  return (typeof scope === 'string' ? scope : '').split(/\s+/).filter((x) => x !== '')
+}
+
 export function hasDriveScope(scope: string | undefined): boolean {
-  return (scope ?? '').split(/\s+/).includes(DRIVE_SCOPE)
+  return splitScopes(scope).includes(DRIVE_SCOPE)
 }
 
 /** Hosts Drive serves thumbnails from. Nothing else is ever fetched by the proxy (no SSRF). */

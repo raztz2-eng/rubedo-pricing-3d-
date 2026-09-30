@@ -470,7 +470,16 @@ function BidForm({
 
           <section className="card" aria-label="חומרה">
             <h2 className="section-title">חומרה (רכיבים שנקנו)</h2>
-            <LineItemsEditor lines={draft.hardware} onChange={(l) => set('hardware', l)} addLabel="הוספת רכיב" itemLabel="רכיב" />
+            <LineItemsEditor
+              lines={draft.hardware}
+              onChange={(l) => set('hardware', l)}
+              addLabel="הוספת רכיב"
+              itemLabel="רכיב"
+              includable
+            />
+            {draft.hardware.length > 0 && (
+              <p className="mt-2 text-xs text-stone-500">רכיב שאינו מסומן „כלול במחיר” נשמר עם הדגם אך לא נספר במחיר.</p>
+            )}
           </section>
 
           <section className="card flex flex-col gap-3" aria-label="אריזה ומשלוח">

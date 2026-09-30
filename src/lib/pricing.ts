@@ -43,12 +43,20 @@ export interface PricedLine {
   unitCost: number
 }
 
+/**
+ * A hardware line (v0.5 D-I). `included: false` = optional hardware left out of this price.
+ * Missing `included` (bids saved before v0.5) counts as included, so old bids price exactly as before.
+ */
+export interface PricedHardwareLine extends PricedLine {
+  included?: boolean
+}
+
 export interface PricingInput {
   /** Material price, ₪ per kg. */
   pricePerKg: number
   parts: PricedPart[]
   laborMinutes: number
-  hardware: PricedLine[]
+  hardware: PricedHardwareLine[]
   hasShipping: boolean
   packaging: PricedLine[]
   shippingCost: number
@@ -86,13 +94,19 @@ function sumLines(lines: PricedLine[]): number {
   return lines.reduce((acc, l) => acc + l.qty * l.unitCost, 0)
 }
 
+/** True unless the line was explicitly left out (`included: false`). */
+export function isIncluded(line: { included?: boolean }): boolean {
+  return line.included !== false
+}
+
 export function computePrice(input: PricingInput, s: PricingSettings): PriceResult {
   const printerRate = computePrinterRate(s)
   const totalGrams = input.parts.reduce((acc, p) => acc + p.grams * p.qty, 0)
   const totalHours = input.parts.reduce((acc, p) => acc + p.hours * p.qty, 0)
 
   const filament = (totalGrams / 1000) * input.pricePerKg * s.efficiency
-  const hardware = sumLines(input.hardware)
+  // v0.5 Q2: only included hardware rows count.
+  const hardware = sumLines(input.hardware.filter(isIncluded))
   const labor = (input.laborMinutes / 60) * s.laborRate
   const packaging = input.hasShipping ? sumLines(input.packaging) + input.shippingCost : 0
   const machine = totalHours * printerRate

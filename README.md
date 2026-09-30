@@ -7,12 +7,16 @@ Pricing app for 3D-printed models (RUBEDO.3D). Built by the AI Company "Software
 ## Architecture (brief addendum v0.4)
 - `src/` — React SPA (Vite). Talks to Google Drive directly with a short-lived access token kept in memory only.
 - `api/` — Vercel Serverless Functions, auth + thumbnails only (no database):
-  - `GET /api/auth/login` → Google consent (scope `drive` + `openid email`, offline access)
+  - `GET /api/auth/login` → Google consent (scopes `drive` + `gmail.compose` + `openid email`, offline access)
   - `GET /api/auth/callback` → checks state + allowed account, stores the refresh token in an encrypted
     (AES-256-GCM) `HttpOnly; Secure; SameSite=Lax; Path=/api` cookie
-  - `POST /api/auth/token` → fresh access token for the SPA (the refresh token never reaches the browser JS)
+  - `POST /api/auth/token` → fresh access token + granted `scopes` for the SPA (the refresh token never reaches the browser JS)
   - `POST /api/auth/logout` → revoke + clear cookie
   - `GET /api/thumb?id=&s=` → Drive thumbnail proxy (works for iPhone HEIC photos)
+- Quote e-mail (addendum v0.5): the quote screen (`/model/:id/quote`) creates a Gmail **draft** only
+  (`users.drafts.create`); the Founder reviews it and presses Send in Gmail. Each draft is logged in
+  `<model>/quotes/quote-YYYYMMDD-HHmm.json`. Sessions created before v0.5 lack `gmail.compose`: the quote screen offers
+  "אישור הרשאה ל-Gmail" (the login popup); nothing else is blocked.
 - Drive write rules: the app only creates files/folders (marked `appProperties.rubedo="1"`) and updates the
   content of marked files. It never deletes, trashes, moves, renames or changes permissions.
 
@@ -21,6 +25,9 @@ See `.env.example`. In Vercel (Project → Settings → Environment Variables):
 - `VITE_GOOGLE_CLIENT_ID`, `VITE_GOOGLE_API_KEY`, `VITE_GOOGLE_APP_ID` (as before)
 - `GOOGLE_CLIENT_SECRET` — **new, required**, mark as Sensitive. The Founder adds it; agents never handle it.
 - `ALLOWED_EMAIL` — optional (default `raztz2@gmail.com`); `GOOGLE_CLIENT_ID` — optional (default `VITE_GOOGLE_CLIENT_ID`).
+
+In Google Cloud Console (v0.5, free): **APIs & Services → Library → enable "Gmail API"**, and add the scope
+`https://www.googleapis.com/auth/gmail.compose` to the OAuth consent screen (Data access / Scopes).
 
 In Google Cloud Console → the OAuth client → **Authorized redirect URIs**, add (exact match, no wildcards):
 - the production domain: `https://<production-domain>/api/auth/callback`
@@ -37,7 +44,7 @@ in, the popup closes and the app reconnects when you return to the tab (or click
 Security headers (`vercel.json`): a Content-Security-Policy for the app (self + the Google Picker hosts
 `apis.google.com`, `accounts.google.com`, `docs.google.com`, `*.googleusercontent.com` frames; images only from self /
 `data:` / `blob:`, Drive thumbnails come through `/api/thumb`), `Referrer-Policy: strict-origin-when-cross-origin` and
-`X-Content-Type-Options: nosniff`. The `/api` responses set their own CSP. After changing the CSP, check on the preview
+`X-Content-Type-Options: nosniff`. `connect-src` also allows `https://gmail.googleapis.com` (drafts, v0.5). The `/api` responses set their own CSP. After changing the CSP, check on the preview
 that "בחירת תיקיית דגמים" (Google Picker) still opens — look for CSP errors in the browser console.
 
 ## Local development

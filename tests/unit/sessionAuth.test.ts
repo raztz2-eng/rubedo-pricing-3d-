@@ -262,3 +262,38 @@ describe('SessionAuth — AC24: the access token is never persisted by the SPA',
     setItem.mockRestore()
   })
 })
+
+describe('v0.5 Q5 — granted scopes', () => {
+  const GMAIL = 'https://www.googleapis.com/auth/gmail.compose'
+  const DRIVE = 'https://www.googleapis.com/auth/drive'
+  const withScopes = (scopes: unknown) => () => Response.json({ access_token: TOKEN, expires_in: 3600, email: 'raztz2@gmail.com', scopes })
+
+  it('keeps the scopes reported by /api/auth/token (memory only); unknown when absent; cleared on sign-out', async () => {
+    const { auth, b } = make(backend(withScopes([DRIVE])))
+    await auth.init()
+    expect(auth.scopes).toEqual([DRIVE])
+    b.set(withScopes('not-a-list'))
+    await auth.refresh()
+    expect(auth.scopes).toBeNull()
+    b.set(ok())
+    await auth.refresh()
+    expect(auth.scopes).toBeNull()
+    auth.signOut()
+    expect(auth.scopes).toBeNull()
+    expect(JSON.stringify({ ...localStorage })).not.toContain(GMAIL)
+  })
+
+  it('extra permission: reconnect() opens the popup synchronously; recheck() then picks up gmail.compose and notifies', async () => {
+    const { auth, b, openWindow } = make(backend(withScopes([DRIVE])))
+    await auth.init()
+    const seen: boolean[] = []
+    auth.subscribe((s) => seen.push(s))
+    auth.reconnect()
+    expect(openWindow).toHaveBeenCalledWith('/api/auth/login?popup=1')
+    b.set(withScopes([DRIVE, GMAIL]))
+    await auth.recheck()
+    expect(auth.scopes).toEqual([DRIVE, GMAIL])
+    expect(auth.signedIn).toBe(true)
+    expect(seen.at(-1)).toBe(true)
+  })
+})

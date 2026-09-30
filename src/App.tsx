@@ -4,6 +4,7 @@ import { CreateFromFolderPage, EditModelPage, NewModelPage } from './pages/BidFo
 import { Home } from './pages/Home'
 import { LibraryPage } from './pages/Library'
 import { ModelPageRoute } from './pages/ModelPage'
+import { QuotePageRoute } from './pages/QuotePage'
 import { SettingsPage } from './pages/Settings'
 import { AppProvider } from './state/AppContext'
 import type { AppServices } from './state/services'
@@ -19,6 +20,7 @@ export function AppRoutes() {
         <Route path="model/:id" element={<ModelPageRoute />} />
         <Route path="model/:id/edit" element={<EditModelPage />} />
         <Route path="model/:id/create" element={<CreateFromFolderPage />} />
+        <Route path="model/:id/quote" element={<QuotePageRoute />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

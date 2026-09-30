@@ -26,6 +26,7 @@ const RT = '1//refresh-token-DO-NOT-LEAK'
 const RT2 = '1//rotated-refresh-token-DO-NOT-LEAK'
 const EMAIL = 'raztz2@gmail.com'
 const DRIVE = 'https://www.googleapis.com/auth/drive'
+const GMAIL = 'https://www.googleapis.com/auth/gmail.compose'
 const FILE_ID = 'heicFile_ID-1234567890'
 
 interface Call {
@@ -148,7 +149,7 @@ describe('api/_lib/env', () => {
 
 // ---------------------------------------------------------------------------------------------
 describe('GET /api/auth/login', () => {
-  it('redirects to Google with drive + openid email, offline, consent, no granted-scope inheritance, and a state cookie', async () => {
+  it('redirects to Google with drive + gmail.compose + openid email (v0.5), offline, consent, no granted-scope inheritance, and a state cookie', async () => {
     const { deps } = makeDeps()
     const res = await handleLogin(req('/api/auth/login'), deps)
     expect(res.status).toBe(302)
@@ -158,7 +159,7 @@ describe('GET /api/auth/login', () => {
     expect(p.get('client_id')).toBe(CLIENT_ID)
     expect(p.get('redirect_uri')).toBe(`${ORIGIN}/api/auth/callback`)
     expect(p.get('response_type')).toBe('code')
-    expect((p.get('scope') ?? '').split(' ').sort()).toEqual(['email', 'openid', DRIVE].sort())
+    expect((p.get('scope') ?? '').split(' ').sort()).toEqual(['email', 'openid', DRIVE, GMAIL].sort())
     expect(p.get('access_type')).toBe('offline')
     expect(p.get('prompt')).toBe('consent')
     expect(p.get('include_granted_scopes')).toBe('false')
@@ -320,12 +321,13 @@ describe('GET /api/auth/callback', () => {
 
 // ---------------------------------------------------------------------------------------------
 describe('POST /api/auth/token (AC20)', () => {
-  it('valid session → {access_token, expires_in, email}, no-store; refreshes with the stored refresh token', async () => {
+  it('valid session → {access_token, expires_in, email, scopes}, no-store; refreshes with the stored refresh token', async () => {
     const { deps, g } = makeDeps()
     const res = await handleToken(req('/api/auth/token', { method: 'POST', cookie: validSessionCookie(), origin: ORIGIN }), deps)
     expect(res.status).toBe(200)
     expect(res.headers.get('Cache-Control')).toBe('no-store')
-    expect(await res.json()).toEqual({ access_token: 'fake-access-fresh', expires_in: 3599, email: EMAIL })
+    // The scripted refresh answer has no `scope` field → an empty list (never undefined).
+    expect(await res.json()).toEqual({ access_token: 'fake-access-fresh', expires_in: 3599, email: EMAIL, scopes: [] })
     const call = g.calls[0]
     expect(call.url).toBe('https://oauth2.googleapis.com/token')
     expect(new URLSearchParams(call.body).get('refresh_token')).toBe(RT)
@@ -698,5 +700,46 @@ describe('AC24 — the refresh token and the client secret never reach a respons
       expect(re.test('/library'), r.source).toBe(true)
       expect(re.test('/model/abc/edit'), r.source).toBe(true)
     }
+  })
+})
+
+// ---------------------------------------------------------------------------------------------
+describe('v0.5 Q5 — gmail.compose: requested at login, optional at callback, reported by /api/auth/token', () => {
+  const STATE = 'state-v05'
+  const cb = (query: string) => {
+    const headers = new Headers({ Cookie: `${STATE_COOKIE}=${STATE}` })
+    return new Request(`${ORIGIN}/api/auth/callback?${query}`, { headers })
+  }
+
+  it('/api/auth/token returns `scopes` as a list from the refresh response `scope` field', async () => {
+    const { deps } = makeDeps(
+      google({ refresh: () => Response.json({ access_token: 'fake-access-fresh', expires_in: 3599, scope: `${DRIVE} openid  ${GMAIL}` }) }),
+    )
+    const res = await handleToken(req('/api/auth/token', { method: 'POST', cookie: validSessionCookie(), origin: ORIGIN }), deps)
+    expect(await visible(res)).not.toContain(RT)
+    const body = (await res.json()) as { scopes: string[] }
+    expect(body.scopes).toEqual([DRIVE, 'openid', GMAIL])
+  })
+
+  it('a pre-v0.5 session (no gmail.compose) still signs in; scopes then lack gmail.compose', async () => {
+    const { deps } = makeDeps(google({ refresh: () => Response.json({ access_token: 'a', expires_in: 3599, scope: `${DRIVE} openid` }) }))
+    const res = await handleToken(req('/api/auth/token', { method: 'POST', cookie: validSessionCookie(), origin: ORIGIN }), deps)
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { scopes: string[] }).scopes).not.toContain(GMAIL)
+  })
+
+  it('callback: drive + gmail.compose → session; drive only → session (gmail optional); gmail without drive → refused', async () => {
+    const withBoth = makeDeps(google({ token: () => Response.json({ access_token: 'a', refresh_token: RT, scope: `openid ${DRIVE} ${GMAIL}` }) }))
+    const r1 = await handleCallback(cb(`code=C&state=${STATE}`), withBoth.deps)
+    expect(r1.status).toBe(302)
+    expect(setCookies(r1).some((c) => c.startsWith(`${SESSION_COOKIE}=`) && !/Max-Age=0\b/.test(c))).toBe(true)
+
+    const driveOnly = makeDeps(google({ token: () => Response.json({ access_token: 'a', refresh_token: RT, scope: `openid ${DRIVE}` }) }))
+    expect((await handleCallback(cb(`code=C&state=${STATE}`), driveOnly.deps)).status).toBe(302)
+
+    const gmailOnly = makeDeps(google({ token: () => Response.json({ access_token: 'a', refresh_token: RT, scope: `openid ${GMAIL}` }) }))
+    const r3 = await handleCallback(cb(`code=C&state=${STATE}`), gmailOnly.deps)
+    expect(r3.status).toBe(400)
+    expect(setCookies(r3).some((c) => c.startsWith(`${SESSION_COOKIE}=`) && !/Max-Age=0\b/.test(c))).toBe(false)
   })
 })

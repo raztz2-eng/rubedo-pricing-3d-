@@ -15,6 +15,14 @@ export interface AppState {
   authChecking: boolean
   /** Start-up/renewal problem (Hebrew) other than "signed out". */
   authError: string | null
+  /** Signed-in Google account e-mail, when known. */
+  accountEmail: string | null
+  /** OAuth scopes granted to the session (v0.5 Q5); null = not known. */
+  grantedScopes: readonly string[] | null
+  /** Opens the sign-in popup to grant an extra permission (gmail.compose). Call synchronously in the click. */
+  requestExtraPermission: () => void
+  /** After the popup: refresh the session so newly granted scopes are known. */
+  recheckPermissions: () => Promise<void>
   /** I2: the settings file of the CURRENT folder was just created (one-time notice until dismissed). */
   settingsJustCreated: boolean
   /** How it was created: from defaults, or copied from an old unmarked settings file. */
@@ -51,6 +59,8 @@ export function AppProvider({ services, children }: { services: AppServices; chi
   const [needsReconnect, setNeedsReconnect] = useState(services.auth?.needsReconnect ?? false)
   const [authChecking, setAuthChecking] = useState(services.auth?.checking ?? false)
   const [authError, setAuthError] = useState<string | null>(services.auth?.lastError ?? null)
+  const [accountEmail, setAccountEmail] = useState<string | null>(services.auth?.email ?? null)
+  const [grantedScopes, setGrantedScopes] = useState<readonly string[] | null>(services.auth?.scopes ?? null)
   // I2: tagged with the folder whose settings file was just created.
   const [createdFor, setCreatedFor] = useState<{ folderId: string; from: 'defaults' | 'copied' } | null>(null)
   const sessionActive = signedIn || needsReconnect
@@ -63,6 +73,8 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       setNeedsReconnect(auth.needsReconnect ?? false)
       setAuthChecking(auth.checking ?? false)
       setAuthError(auth.lastError ?? null)
+      setAccountEmail(auth.email ?? null)
+      setGrantedScopes(auth.scopes ?? null)
     }
     const unsubscribe = auth.subscribe(sync)
     // The start-up check may have finished between the first render and this subscription.
@@ -115,6 +127,14 @@ export function AppProvider({ services, children }: { services: AppServices; chi
     await services.auth?.retry?.()
   }, [services.auth])
 
+  const requestExtraPermission = useCallback(() => {
+    services.auth?.reconnect?.()
+  }, [services.auth])
+
+  const recheckPermissions = useCallback(async () => {
+    await services.auth?.recheck?.()
+  }, [services.auth])
+
   const signOut = useCallback(() => {
     services.auth?.signOut()
   }, [services.auth])
@@ -148,6 +168,10 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       sessionActive,
       authChecking,
       authError,
+      accountEmail,
+      grantedScopes,
+      requestExtraPermission,
+      recheckPermissions,
       settingsJustCreated,
       settingsCreatedFrom,
       dismissSettingsCreated,
@@ -163,7 +187,7 @@ export function AppProvider({ services, children }: { services: AppServices; chi
       reloadSettings,
       saveSettings,
     }),
-    [services, signedIn, needsReconnect, sessionActive, authChecking, authError, settingsJustCreated, settingsCreatedFrom, dismissSettingsCreated, folderId, settings, settingsFolderId, settingsLoading, settingsError, signIn, retrySession, signOut, pickFolder, reloadSettings, saveSettings],
+    [services, signedIn, needsReconnect, sessionActive, authChecking, authError, accountEmail, grantedScopes, requestExtraPermission, recheckPermissions, settingsJustCreated, settingsCreatedFrom, dismissSettingsCreated, folderId, settings, settingsFolderId, settingsLoading, settingsError, signIn, retrySession, signOut, pickFolder, reloadSettings, saveSettings],
   )
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>

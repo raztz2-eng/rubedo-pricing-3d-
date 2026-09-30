@@ -1,4 +1,4 @@
-import { DEFAULT_PRICING_SETTINGS, type PriceResult, type PricingSettings } from './pricing'
+import { DEFAULT_PRICING_SETTINGS, type PriceResult, type PricingInput, type PricingSettings } from './pricing'
 
 /** Data model for bids, settings and the library index (brief §4). */
 
@@ -25,6 +25,15 @@ export interface BidLine {
   unitCost: number
 }
 
+/** A hardware row (v0.5 D-I): the model keeps its full list; `included` says whether the row counts in the price. */
+export interface HardwareLine extends BidLine {
+  included: boolean
+}
+
+/** bid.json schema written by this version. v1 files (no `included`) are still read (included = true). */
+export const BID_SCHEMA_VERSION = 2
+export type BidSchemaVersion = 1 | 2
+
 export interface BidFile {
   id: string
   name: string
@@ -33,7 +42,7 @@ export interface BidFile {
 }
 
 export interface Bid {
-  schemaVersion: 1
+  schemaVersion: BidSchemaVersion
   id: string
   name: string
   revision: string
@@ -43,7 +52,7 @@ export interface Bid {
   material: Material
   parts: BidPart[]
   laborMinutes: number
-  hardware: BidLine[]
+  hardware: HardwareLine[]
   hasShipping: boolean
   packaging: BidLine[]
   shippingCost: number
@@ -140,7 +149,7 @@ export function isBid(raw: unknown): raw is Bid {
   if (!raw || typeof raw !== 'object') return false
   const b = raw as Partial<Bid>
   return (
-    b.schemaVersion === 1 &&
+    (b.schemaVersion === 1 || b.schemaVersion === 2) &&
     typeof b.id === 'string' &&
     typeof b.name === 'string' &&
     Array.isArray(b.parts) &&
@@ -148,6 +157,40 @@ export function isBid(raw: unknown): raw is Bid {
     typeof b.result.price70 === 'number' &&
     !!b.settingsSnapshot
   )
+}
+
+/**
+ * Validates a bid.json read from Drive and normalises it for the app: hardware rows without `included` (schemaVersion 1)
+ * are included. Returns null when the content is not a bid. `schemaVersion` keeps the value of the file.
+ */
+export function parseBid(raw: unknown): Bid | null {
+  if (!isBid(raw)) return null
+  const hardware = Array.isArray(raw.hardware) ? raw.hardware : []
+  return {
+    ...raw,
+    hardware: hardware.map((h) => ({ ...h, included: (h as Partial<HardwareLine>).included !== false })),
+    packaging: Array.isArray(raw.packaging) ? raw.packaging : [],
+  }
+}
+
+/**
+ * Pricing input of a saved bid. `includedOverride[i]` replaces the saved `included` flag of hardware row i
+ * (quote screen, v0.5 Q3). The math itself lives in pricing.ts.
+ */
+export function bidPricingInput(bid: Bid, includedOverride?: readonly boolean[]): PricingInput {
+  return {
+    pricePerKg: bid.material.pricePerKg,
+    parts: bid.parts.map((p) => ({ qty: p.qty, grams: p.grams, hours: p.hours })),
+    laborMinutes: bid.laborMinutes,
+    hardware: bid.hardware.map((h, i) => ({
+      qty: h.qty,
+      unitCost: h.unitCost,
+      included: includedOverride?.[i] ?? h.included !== false,
+    })),
+    hasShipping: bid.hasShipping,
+    packaging: bid.packaging.map((l) => ({ qty: l.qty, unitCost: l.unitCost })),
+    shippingCost: bid.shippingCost,
+  }
 }
 
 export function indexEntryFromBid(folderId: string, bid: Bid): IndexEntry {

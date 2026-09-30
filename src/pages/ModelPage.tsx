@@ -5,7 +5,7 @@ import { createObjectUrlSafe } from '../components/useObjectUrl'
 import { PricePanel } from '../components/PricePanel'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
 import { ErrorBox, Money, Notice, Spinner } from '../components/ui'
-import type { BidLine } from '../lib/bid'
+import type { BidLine, HardwareLine } from '../lib/bid'
 import { LEGACY_BID_MESSAGE, loadModelFolder, type ModelFolder } from '../lib/drive/bidRepository'
 import { isGoogleNativeFile } from '../lib/drive/folderContents'
 import type { DriveFile } from '../lib/drive/types'
@@ -179,15 +179,20 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
             {bid.updatedAt !== bid.createdAt && <> · עודכן {formatDate(bid.updatedAt)}</>}
           </p>
         </div>
-        {legacyBid ? (
-          <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
-            צור הצעה מחדש
+        <div className="flex flex-wrap gap-2">
+          <Link to={`/model/${encodeURIComponent(folderId)}/quote`} className="btn btn-primary">
+            שליחת הצעת מחיר
           </Link>
-        ) : (
-          <Link to={`/model/${encodeURIComponent(folderId)}/edit`} className="btn btn-secondary">
-            עריכה
-          </Link>
-        )}
+          {legacyBid ? (
+            <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-secondary">
+              צור הצעה מחדש
+            </Link>
+          ) : (
+            <Link to={`/model/${encodeURIComponent(folderId)}/edit`} className="btn btn-secondary">
+              עריכה
+            </Link>
+          )}
+        </div>
       </div>
       {legacyBid && (
         <Notice tone="warn">
@@ -254,7 +259,15 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   )
 }
 
-function LinesTable({ title, lines, extra }: { title: string; lines: BidLine[]; extra?: { label: string; value: number } }) {
+function LinesTable({
+  title,
+  lines,
+  extra,
+}: {
+  title: string
+  lines: (BidLine | HardwareLine)[]
+  extra?: { label: string; value: number }
+}) {
   return (
     <section className="card" aria-label={title}>
       <h2 className="section-title">{title}</h2>
@@ -269,7 +282,14 @@ function LinesTable({ title, lines, extra }: { title: string; lines: BidLine[]; 
         <tbody>
           {lines.map((l, i) => (
             <tr key={i} className="border-t border-stone-100">
-              <td className="py-1.5">{l.name}</td>
+              <td className="py-1.5">
+                {l.name}
+                {'included' in l && l.included === false && (
+                  <span className="ms-1 rounded bg-stone-100 px-1.5 text-xs text-stone-500" data-testid="hardware-excluded">
+                    לא כלול במחיר
+                  </span>
+                )}
+              </td>
               <td className="py-1.5"><span className="num">{l.qty}</span></td>
               <td className="py-1.5">
                 <Money value={l.unitCost} />

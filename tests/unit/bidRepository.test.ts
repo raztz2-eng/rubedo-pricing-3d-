@@ -92,7 +92,7 @@ describe('saveNewBid (AC7)', () => {
     expect(stored.coverFileId).toBe(stored.files[0].id)
     expect(stored.parts[0].slicedFileId).toBe(stored.files[2].id)
     expect(stored.parts[0]).not.toHaveProperty('slicedLocalKey')
-    expect(stored.schemaVersion).toBe(1)
+    expect(stored.schemaVersion).toBe(2)
 
     const lib = await loadLibrary(drive, root)
     expect(lib).toHaveLength(1)

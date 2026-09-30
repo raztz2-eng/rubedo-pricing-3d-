@@ -1,15 +1,16 @@
 import { mapLimit } from '../concurrency'
 import {
   BID_FILE_NAME,
+  BID_SCHEMA_VERSION,
   FOLDER_MIME,
   INDEX_FILE_NAME,
   INDEX_MAX_AGE_MS,
   SETTINGS_FILE_NAME,
   defaultAppSettings,
   indexEntryFromBid,
-  isBid,
   newId,
   normaliseSettings,
+  parseBid,
   sortIndex,
   type AppSettings,
   type Bid,
@@ -224,9 +225,10 @@ async function scanModelFolder(store: DriveStore, folder: DriveFile): Promise<Fo
     if (e instanceof InvalidJsonError) return { skipped: folder.name }
     throw e
   }
-  if (!isBid(raw)) return { skipped: folder.name }
-  const entry = indexEntryFromBid(folder.id, raw)
-  entry.coverFileId = pickCover(contents.images, raw.coverFileId)
+  const bid = parseBid(raw)
+  if (!bid) return { skipped: folder.name }
+  const entry = indexEntryFromBid(folder.id, bid)
+  entry.coverFileId = pickCover(contents.images, bid.coverFileId)
   if (!entry.coverFileId) delete entry.coverFileId
   return { entry }
 }
@@ -306,9 +308,9 @@ export async function loadModelFolder(store: DriveStore, folderId: string): Prom
   const [folder, children] = await Promise.all([store.getFile(folderId), store.listChildren(folderId)])
   const contents = classifyFolder(children)
   if (!contents.bidFile) return { folder, contents }
-  const raw = await readJson(store, contents.bidFile.id, BID_FILE_NAME)
-  if (!isBid(raw)) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
-  return { folder, contents, bid: raw, ...(contents.bidFile.appCreated === true ? {} : { legacyBid: true }) }
+  const bid = parseBid(await readJson(store, contents.bidFile.id, BID_FILE_NAME))
+  if (!bid) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
+  return { folder, contents, bid, ...(contents.bidFile.appCreated === true ? {} : { legacyBid: true }) }
 }
 
 // ---------- Existing model folder check (I4) ----------
@@ -363,9 +365,9 @@ export async function checkName(
 export async function loadBid(store: DriveStore, folderId: string): Promise<{ bid: Bid; bidFileId: string; legacy: boolean }> {
   const file = await findFile(store, folderId, BID_FILE_NAME)
   if (!file) throw new DriveError('bid.json missing', 'לא נמצא קובץ bid.json בתיקיית הדגם.', 404)
-  const raw = await readJson(store, file.id, BID_FILE_NAME)
-  if (!isBid(raw)) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
-  return { bid: raw, bidFileId: file.id, legacy: file.appCreated !== true }
+  const bid = parseBid(await readJson(store, file.id, BID_FILE_NAME))
+  if (!bid) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
+  return { bid, bidFileId: file.id, legacy: file.appCreated !== true }
 }
 
 // ---------- Save / edit ----------
@@ -440,7 +442,7 @@ export async function saveNewBid(
   const uploadedFiles = params.files.map((f) => session.uploaded[f.key])
   const files = [...uploadedFiles, ...(params.existingFiles ?? [])]
   const bid: Bid = {
-    schemaVersion: 1,
+    schemaVersion: BID_SCHEMA_VERSION,
     id: session.bidId,
     createdAt: session.createdAt,
     updatedAt: now,
@@ -498,7 +500,7 @@ export async function updateBid(
   const bid: Bid = {
     ...existing,
     ...params.content,
-    schemaVersion: 1,
+    schemaVersion: BID_SCHEMA_VERSION,
     id: existing.id,
     createdAt: existing.createdAt,
     updatedAt: (params.now ?? new Date()).toISOString(),

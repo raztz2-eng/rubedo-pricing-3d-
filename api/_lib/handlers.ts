@@ -240,7 +240,7 @@ export async function handleCallback(req: Request, deps: Deps): Promise<Response
 // Session → access token (shared by /token and /thumb)
 
 export type TokenOutcome =
-  | { ok: true; accessToken: string; expiresIn: number; session: Session; newRefreshToken?: string }
+  | { ok: true; accessToken: string; expiresIn: number; session: Session; newRefreshToken?: string; scopes?: string[] }
   | { ok: false; response: Response }
 
 function unauthorized(clear: boolean): Response {
@@ -263,7 +263,14 @@ async function mintAccessToken(req: Request, deps: Deps, cfg: ServerConfig): Pro
     if (r.revoked) return { ok: false, response: unauthorized(true) }
     return { ok: false, response: json(502, { error: 'google_unavailable', message: 'Google לא זמין כרגע. נסו שוב בעוד רגע.' }) }
   }
-  return { ok: true, accessToken: r.accessToken, expiresIn: r.expiresIn, session, ...(r.refreshToken ? { newRefreshToken: r.refreshToken } : {}) }
+  return {
+    ok: true,
+    accessToken: r.accessToken,
+    expiresIn: r.expiresIn,
+    session,
+    scopes: r.scopes,
+    ...(r.refreshToken ? { newRefreshToken: r.refreshToken } : {}),
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -279,7 +286,8 @@ export async function handleToken(req: Request, deps: Deps): Promise<Response> {
   const headers: HeaderInput = t.newRefreshToken
     ? { 'Set-Cookie': sessionCookie({ ...t.session, rt: t.newRefreshToken }, cfg.config.clientSecret) }
     : {}
-  return json(200, { access_token: t.accessToken, expires_in: t.expiresIn, email: t.session.email }, headers)
+  // v0.5 Q5: the SPA learns which permissions this session has (e.g. gmail.compose missing on older sessions).
+  return json(200, { access_token: t.accessToken, expires_in: t.expiresIn, email: t.session.email, scopes: t.scopes ?? [] }, headers)
 }
 
 // ---------------------------------------------------------------------------------------------

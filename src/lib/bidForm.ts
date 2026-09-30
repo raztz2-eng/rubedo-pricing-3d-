@@ -29,6 +29,8 @@ export interface LineDraft {
   name: string
   qty: string
   unitCost: string
+  /** Hardware rows only (v0.5 Q1): "כלול במחיר". Missing = included. */
+  included?: boolean
 }
 
 export type FileOrigin = 'user' | 'plate' | 'sliced'
@@ -100,12 +102,16 @@ function lineNumbers(l: LineDraft) {
   return { qty: parseNumber(l.qty), unitCost: parseNumber(l.unitCost) }
 }
 
+function hardwareNumbers(l: LineDraft) {
+  return { ...lineNumbers(l), included: l.included !== false }
+}
+
 export function draftToPricingInput(d: BidDraft): PricingInput {
   return {
     pricePerKg: parseNumber(d.pricePerKg),
     parts: d.parts.map((p) => ({ qty: parseNumber(p.qty), grams: parseNumber(p.grams), hours: partHours(p) })),
     laborMinutes: parseNumber(d.laborMinutes),
-    hardware: d.hardware.map(lineNumbers),
+    hardware: d.hardware.map(hardwareNumbers),
     hasShipping: d.hasShipping,
     packaging: d.packaging.map(lineNumbers),
     shippingCost: parseNumber(d.shippingCost),
@@ -152,6 +158,13 @@ function linesToBid(lines: LineDraft[]) {
     .filter((l) => l.name !== '' || l.unitCost !== 0)
 }
 
+/** Hardware rows keep their `included` flag in bid.json — unticked rows are stored too (v0.5 Q1, AC25). */
+function hardwareToBid(lines: LineDraft[]) {
+  return lines
+    .map((l) => ({ name: l.name.trim(), ...hardwareNumbers(l) }))
+    .filter((l) => l.name !== '' || l.unitCost !== 0)
+}
+
 /** Final file list to upload (plate pictures that were un-ticked are dropped; names resolved). */
 export function filesToUpload(d: BidDraft): LocalFile[] {
   const base = d.name.trim() || 'model'
@@ -189,7 +202,7 @@ export function draftToContent(d: BidDraft, settingsSnapshot: PricingSettings, r
       return part
     }),
     laborMinutes: pi.laborMinutes,
-    hardware: linesToBid(d.hardware),
+    hardware: hardwareToBid(d.hardware),
     hasShipping: d.hasShipping,
     packaging: d.hasShipping ? linesToBid(d.packaging) : [],
     shippingCost: d.hasShipping ? pi.shippingCost : 0,
@@ -200,6 +213,10 @@ export function draftToContent(d: BidDraft, settingsSnapshot: PricingSettings, r
 
 function toLineDraft(l: { name: string; qty: number; unitCost: number }): LineDraft {
   return { key: newKey('line'), name: l.name, qty: String(l.qty), unitCost: String(l.unitCost) }
+}
+
+function toHardwareDraft(l: { name: string; qty: number; unitCost: number; included?: boolean }): LineDraft {
+  return { ...toLineDraft(l), included: l.included !== false }
 }
 
 export function bidToDraft(bid: Bid): BidDraft {
@@ -220,7 +237,7 @@ export function bidToDraft(bid: Bid): BidDraft {
       slicedFileId: p.slicedFileId,
     })),
     laborMinutes: String(bid.laborMinutes),
-    hardware: bid.hardware.map(toLineDraft),
+    hardware: bid.hardware.map(toHardwareDraft),
     hasShipping: bid.hasShipping,
     packaging: bid.packaging.map(toLineDraft),
     shippingCost: String(bid.shippingCost),
