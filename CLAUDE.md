@@ -50,6 +50,7 @@ All four of typecheck, lint, test, build must pass before any agent reports "don
 - Do not buy, subscribe to, or enable any paid service or plan. Ever.
 - Backend = Vercel functions in `/api` ONLY for auth + thumbnails (Founder decision 30 Sep, addendum v0.4). No database, Supabase, Firebase or other services.
 - Drive scope: `drive` (addendum v0.4). Allowed writes: create new files/folders; update content ONLY of files with `appProperties.rubedo="1"`. NEVER delete, trash, move, rename or change permissions.
+- Gmail: scope gmail.compose; ONLY users.drafts.create may be called. Never send, read, modify or delete mail. (v0.5)
 - Access token: memory only in the SPA. Refresh token: ONLY inside the encrypted HttpOnly session cookie, never in JS, logs or responses. GOOGLE_CLIENT_SECRET only in Vercel env.
 - Do not commit secrets, `.env*` (except `.env.example`), keys, or tokens. The pre-commit hook blocks them.
 - Do not add dependencies beyond the stack above without writing why in your summary.
@@ -61,7 +62,7 @@ All four of typecheck, lint, test, build must pass before any agent reports "don
 printerRate = ((printerCost + upgrades + maintenancePerYear × lifeYears) / (lifeYears × 8760 × uptime)
               + powerW/1000 × kwhPrice) × buffer                       // = ₪0.66498/h with defaults
 filament   = Σ(part.grams × part.qty) / 1000 × pricePerKg × efficiency
-hardware   = Σ(qty × unitCost)
+hardware   = Σ(qty × unitCost) over rows with included !== false   // v0.5
 labor      = laborMinutes / 60 × laborRate                              // laborRate default ₪80/h
 packaging  = hasShipping ? Σ(qty × unitCost) + shippingCost : 0
 machine    = Σ(part.hours × part.qty) × printerRate

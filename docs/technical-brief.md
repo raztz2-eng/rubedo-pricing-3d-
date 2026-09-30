@@ -212,3 +212,49 @@ AC21 bid.json can be created inside an existing Founder folder (N2) — in tests
 AC22 No code path can delete/trash/move/rename, or update content of a file lacking `appProperties.rubedo="1"`.
 AC23 `/api/thumb` returns an image for a HEIC file's thumbnail, rejects invalid ids and non-Google hosts.
 AC24 No secret or refresh token is ever sent to the browser JS, logged, or committed.
+
+---
+# Addendum v0.5 — Optional hardware + quote email as Gmail draft (Founder decisions, 1 Oct 2026)
+
+## Decisions
+- D-I **Optional hardware, chosen per quote:** a model stores its full hardware list; each line has
+  `included: boolean` (default true; missing = true for old bids). Only included lines count in the price.
+  Example: "RootLab — 5-Tube Plant Propagation Station" sold with or without a plant.
+- D-J **Quote email = Gmail DRAFT.** The app creates a draft in the Founder's Gmail (text + selected photos
+  attached); the Founder reviews and clicks Send in Gmail. The app NEVER sends email itself.
+  Scope added: `https://www.googleapis.com/auth/gmail.compose`. Only `users.drafts.create` may be called —
+  no messages.send, drafts.send, modify, delete, or reading mail. Enforced in code + static test.
+
+## Behaviour
+Q1 **Bid form:** each hardware row gets a checkbox "כלול במחיר" (default on). Live price uses included rows only.
+   Saved bid.json keeps all rows with their `included` flag (schemaVersion 2; v1 read as included=true).
+Q2 **Pricing:** `hardware = Σ(qty × unitCost) for included rows`. Formula otherwise unchanged (CLAUDE.md updated).
+Q3 **"שליחת הצעת מחיר" screen** (from a priced model page), route `/model/:id/quote`:
+   - Hardware checklist (pre-ticked from the bid) → price recalculated live with the bid's settingsSnapshot.
+   - Price shown to the customer: editable field, default = 70% price rounded UP to the whole shekel.
+   - Customer name, customer email (validated), optional delivery-time text, optional note.
+   - Photo picker: all images in the model folder as thumbnails with checkboxes (default: cover only).
+   - Hebrew email preview (RTL HTML + plain-text alternative), subject and body editable before creating the draft:
+     subject `הצעת מחיר — {model} | RUBEDO.3D`; body: greeting with name, description, "מה כלול" (included
+     hardware names; if none, omit section), price line `מחיר: ₪{price}`, delivery time if filled, note if filled,
+     signature `RUBEDO.3D — הדפסות תלת-ממד בהתאמה אישית` + Founder email. No internal costs/margins ever appear.
+   - Button "צור טיוטה ב-Gmail" → creates the draft → success box with a link to open Gmail drafts
+     (`https://mail.google.com/mail/#drafts`).
+   - Photos are attached as JPEG via the thumb proxy at 1600 px (so HEIC works); total attachments capped at
+     20 MB with a clear Hebrew error if exceeded.
+Q4 **Quote log:** after a draft is created, the app writes `quotes/quote-YYYYMMDD-HHmm.json` inside the model folder
+   (app-created subfolder `quotes`, marked) with: date, customer name+email, included hardware, price shown,
+   the bid's landed cost & 70% price, draft id. (Business memory for later analysis.)
+Q5 **Scope handling:** login requests drive + gmail.compose. `/api/auth/token` also returns `scopes`. If gmail.compose
+   is missing (sessions created before v0.5), the quote screen shows "נדרש אישור נוסף ל-Gmail" with a button that runs
+   the popup reconnect; nothing else in the app is blocked.
+
+## Acceptance criteria
+AC25 Unticking a hardware row removes exactly its qty×unitCost from landed cost; saved bid keeps the row with included=false.
+AC26 Old bid.json (no `included`) prices identically to before.
+AC27 Quote screen: toggling hardware updates price live; default customer price = ceil(price70 of current selection).
+AC28 Draft MIME is valid (multipart/mixed with multipart/alternative text+html, UTF-8 Hebrew subject RFC 2047-encoded,
+     attachments base64 image/jpeg); created via drafts.create only.
+AC29 Static test: no Gmail endpoint other than drafts.create appears in src/ or api/; no internal cost fields in the email.
+AC30 Quote log file is written (marked) in `<model>/quotes/` after a successful draft; nothing written if draft fails.
+AC31 Session without gmail.compose → quote screen shows the extra-permission prompt; rest of app works.
