@@ -8,6 +8,9 @@ import { localFolderPointer, type AppServices } from '../../src/state/services'
 import { addManualPart, newServices, renderApp, saveButton, setValue } from './helpers'
 
 const DRIVE_FILE = 'https://www.googleapis.com/auth/drive.file'
+const DRIVE_READONLY = 'https://www.googleapis.com/auth/drive.readonly'
+/** Brief addendum v0.3, D-A (Founder, 30 Sep 2026): exactly these two scopes, nothing broader. */
+const EXPECTED_SCOPES = [DRIVE_FILE, DRIVE_READONLY].sort()
 const TOKEN = 'ya29.ACCEPTANCE-SECRET-TOKEN'
 
 function srcFiles(dir = resolve(process.cwd(), 'src')): string[] {
@@ -30,7 +33,7 @@ function allPersisted(): string {
 }
 
 // ---------------------------------------------------------------------------------------------
-describe('AC12 — only drive.file scope; access token never persisted', () => {
+describe('AC12 (amended by addendum v0.3 D-A) — scopes exactly drive.file + drive.readonly; access token never persisted', () => {
   afterEach(() => {
     delete (window as Window).google
     localStorage.clear()
@@ -38,7 +41,7 @@ describe('AC12 — only drive.file scope; access token never persisted', () => {
     vi.restoreAllMocks()
   })
 
-  it('AC12.ui: signing in through the header requests exactly drive.file; token not in local/sessionStorage or cookies; sign-out revokes', async () => {
+  it('AC12.ui: signing in through the header requests exactly drive.file + drive.readonly; token not in local/sessionStorage or cookies; sign-out revokes', async () => {
     const configs: GoogleTokenClientConfig[] = []
     const requests: unknown[] = []
     const revoke = vi.fn()
@@ -50,7 +53,7 @@ describe('AC12 — only drive.file scope; access token never persisted', () => {
             return {
               requestAccessToken: (o?: unknown) => {
                 requests.push(o)
-                setTimeout(() => c.callback({ access_token: TOKEN, expires_in: 3600, scope: DRIVE_FILE }), 0)
+                setTimeout(() => c.callback({ access_token: TOKEN, expires_in: 3600, scope: `${DRIVE_FILE} ${DRIVE_READONLY}` }), 0)
               },
             }
           },
@@ -84,8 +87,9 @@ describe('AC12 — only drive.file scope; access token never persisted', () => {
     await screen.findByText('מחובר ל-Google')
 
     expect(configs).toHaveLength(1)
-    expect(configs[0].scope).toBe(DRIVE_FILE)
-    expect(configs[0].scope.split(/\s+/)).toEqual([DRIVE_FILE])
+    expect(configs[0].scope.trim().split(/\s+/).sort()).toEqual(EXPECTED_SCOPES)
+    // Never inherit broader scopes granted to this client earlier.
+    expect(configs[0].include_granted_scopes).not.toBe(true)
     expect(await auth.getToken()).toBe(TOKEN)
 
     // The folder pointer is the only thing the app may persist — and it is an ID, not a token.
@@ -101,7 +105,7 @@ describe('AC12 — only drive.file scope; access token never persisted', () => {
     await expect(auth.getToken()).rejects.toThrow()
   })
 
-  it('AC12.static: no other OAuth scope and no token persistence anywhere in src/', () => {
+  it('AC12.static: the only OAuth scopes in src/ are drive.file + drive.readonly; no token persistence anywhere in src/', () => {
     const scopes = new Set<string>()
     const offenders: string[] = []
     for (const f of srcFiles()) {
@@ -113,7 +117,7 @@ describe('AC12 — only drive.file scope; access token never persisted', () => {
         if (!/MODELS_FOLDER_KEY/.test(m[1])) offenders.push(`${f}: localStorage.setItem(${m[1]})`)
       }
     }
-    expect([...scopes]).toEqual([DRIVE_FILE])
+    expect([...scopes].sort()).toEqual(EXPECTED_SCOPES)
     expect(offenders).toEqual([])
   })
 })
