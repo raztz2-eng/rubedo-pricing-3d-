@@ -13,7 +13,7 @@ import loginFn from '../../api/auth/login'
 import logoutFn from '../../api/auth/logout'
 import tokenFn from '../../api/auth/token'
 import thumbFn from '../../api/thumb'
-import { Browser, bytes, CLIENT_SECRET, FOUNDER, GoogleWorld, ORIGIN, SESSION_COOKIE_NAME } from './google-world'
+import { Browser, bytes, CLIENT_SECRET, DRIVE_SCOPE, FOUNDER, GMAIL_COMPOSE_SCOPE, GoogleWorld, ORIGIN, SESSION_COOKIE_NAME } from './google-world'
 
 const HEBREW = /[֐-׿]/
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 7, 7, 7])
@@ -88,13 +88,16 @@ describe('AC19 — a non-allowed Google account is rejected at callback; no sess
 
 // ---------------------------------------------------------------------------------------------
 describe('AC20 — /api/auth/token: no cookie → 401; tampered cookie → 401 + cleared; cross-origin Origin → 403', () => {
-  it('AC20.ok: valid session → 200 {access_token, expires_in, email}, Cache-Control no-store; the token works at Google', async () => {
+  it('AC20.ok (v0.5 Q5): valid session → 200 {access_token, expires_in, email, scopes}, Cache-Control no-store; the token works at Google', async () => {
     const { world, browser } = await signedIn()
     const res = await post(browser, '/api/auth/token')
     expect(res.status).toBe(200)
     expect(res.headers.get('Cache-Control') ?? '').toMatch(/no-store/)
-    const body = (await res.json()) as { access_token: string; expires_in: number; email: string }
-    expect(Object.keys(body).sort()).toEqual(['access_token', 'email', 'expires_in'])
+    const body = (await res.json()) as { access_token: string; expires_in: number; email: string; scopes: unknown }
+    expect(Object.keys(body).sort()).toEqual(['access_token', 'email', 'expires_in', 'scopes'])
+    // v0.5 Q5: the granted scopes (a v0.5 login granted drive + gmail.compose).
+    expect(Array.isArray(body.scopes)).toBe(true)
+    expect(body.scopes).toEqual(expect.arrayContaining([DRIVE_SCOPE, GMAIL_COMPOSE_SCOPE]))
     expect(world.accessTokens.has(body.access_token)).toBe(true)
     expect(body.expires_in).toBeGreaterThan(0)
     expect(body.email).toBe(FOUNDER)

@@ -94,7 +94,7 @@ describe('AC7 — save creates <models>/<name>/ with bid.json + all files; bid.j
 
     // bid.json references every uploaded file with the right kind, and follows the schema.
     const { json: bid } = await readBid(services.drive, folders[0].id)
-    expect(bid.schemaVersion).toBe(1)
+    expect(bid.schemaVersion).toBe(2) // v0.5 Q1
     expect(bid.name).toBe('Stand')
     expect(bid.revision).toBe('V1')
     expect(bid.description).toBe('desc')

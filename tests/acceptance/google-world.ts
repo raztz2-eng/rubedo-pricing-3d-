@@ -9,6 +9,9 @@
  *    jar's cookies, and — like a real browser — Set-Cookie is stripped before JS sees the response. Everything JS
  *    could see is recorded in `seenByJs`.
  *
+ * v0.5: refresh tokens remember the scopes granted at consent (a refresh answers with them, like Google), access
+ * tokens carry their scopes, and a fake Gmail API accepts drafts.create only (403 without gmail.compose).
+ *
  * Nothing here is a real credential: all secrets/tokens are generated fake values with an "acceptance" marker.
  */
 import { randomBytes } from 'node:crypto'
@@ -29,6 +32,9 @@ export const CLIENT_SECRET = `acceptance-fake-client-secret-${randomBytes(6).toS
 export const FOUNDER = 'raztz2@gmail.com'
 export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive'
 export const USERINFO_EMAIL_SCOPE = 'https://www.googleapis.com/auth/userinfo.email'
+export const GMAIL_COMPOSE_SCOPE = 'https://www.googleapis.com/auth/gmail.compose'
+/** Gmail drafts.create (media upload form) — the one Gmail call the brief allows (v0.5 D-J). */
+export const GMAIL_DRAFTS_CREATE_PATHS = ['/upload/gmail/v1/users/me/drafts', '/gmail/v1/users/me/drafts']
 export const FOLDER_MIME = 'application/vnd.google-apps.folder'
 export const SESSION_COOKIE_NAME = 'rubedo_session'
 export const APP_MARK = { rubedo: '1' }
@@ -129,8 +135,12 @@ export class GoogleWorld {
   readonly logs: string[] = []
   /** Server instance memory of the /api functions. */
   readonly tokenCache = new Map<string, CachedToken>()
-  readonly refreshTokens = new Map<string, { email: string; revoked: boolean }>()
-  readonly accessTokens = new Map<string, { email: string }>()
+  readonly refreshTokens = new Map<string, { email: string; revoked: boolean; scope: string }>()
+  readonly accessTokens = new Map<string, { email: string; scope: string }>()
+  /** Drafts stored in the fake Gmail (raw RFC 822 message as received). */
+  readonly drafts: { id: string; raw: string }[] = []
+  /** When true, Gmail answers 503 to every request. */
+  gmailDown = false
   /** When set, the next refresh also rotates the refresh token. */
   rotateOnNextRefresh = false
   /** When true the OAuth token endpoint answers 503. */
@@ -171,26 +181,31 @@ export class GoogleWorld {
         .split(/\s+/)
         .map((s) => (s === 'email' ? USERINFO_EMAIL_SCOPE : s))
         .join(' ')
-    const rt = o.withRefreshToken === false ? null : this.newRefreshToken(email)
+    const rt = o.withRefreshToken === false ? null : this.newRefreshToken(email, scope)
     this.codes.set(code, { email, scope, rt, redirectUri, verified: o.emailVerified ?? true })
     return code
   }
 
-  private newRefreshToken(email: string): string {
+  private newRefreshToken(email: string, scope: string): string {
     const rt = this.uid('rt-acceptance-NOT-REAL')
-    this.refreshTokens.set(rt, { email, revoked: false })
+    this.refreshTokens.set(rt, { email, revoked: false, scope })
     return rt
   }
 
-  private newAccessToken(email: string): string {
+  private newAccessToken(email: string, scope: string): string {
     const at = this.uid('at-acceptance-NOT-REAL')
-    this.accessTokens.set(at, { email })
+    this.accessTokens.set(at, { email, scope })
     return at
   }
 
   /** A fresh access token for the Founder — as if some other client got one (for direct store tests). */
-  mintAccessToken(email = FOUNDER): string {
-    return this.newAccessToken(email)
+  mintAccessToken(email = FOUNDER, scope = `openid ${USERINFO_EMAIL_SCOPE} ${DRIVE_SCOPE} ${GMAIL_COMPOSE_SCOPE}`): string {
+    return this.newAccessToken(email, scope)
+  }
+
+  /** Every request the Gmail API received. */
+  gmailCalls(): Recorded[] {
+    return this.calls.filter((c) => new URL(c.url).hostname === 'gmail.googleapis.com' || /googleapis\.com\/(upload\/)?gmail\//.test(c.url))
   }
 
   // ---------------- Drive content ----------------
@@ -262,18 +277,19 @@ export class GoogleWorld {
         const c = this.codes.get(p.get('code') ?? '')
         if (!c || c.redirectUri !== p.get('redirect_uri')) return json({ error: 'invalid_grant' }, 400)
         this.codes.delete(p.get('code') ?? '')
-        const at = this.newAccessToken(c.email)
-        if (!c.verified) this.accessTokens.set(at, { email: `${c.email}#unverified` })
+        const at = this.newAccessToken(c.email, c.scope)
+        if (!c.verified) this.accessTokens.set(at, { email: `${c.email}#unverified`, scope: c.scope })
         return json({ access_token: at, expires_in: 3599, token_type: 'Bearer', scope: c.scope, ...(c.rt ? { refresh_token: c.rt } : {}) })
       }
       if (p.get('grant_type') === 'refresh_token') {
         const r = this.refreshTokens.get(p.get('refresh_token') ?? '')
         if (!r || r.revoked) return json({ error: 'invalid_grant', error_description: 'Token has been expired or revoked.' }, 400)
-        const at = this.newAccessToken(r.email)
-        const body: Record<string, unknown> = { access_token: at, expires_in: 3599, token_type: 'Bearer', scope: `${DRIVE_SCOPE} openid` }
+        const at = this.newAccessToken(r.email, r.scope)
+        // Like Google: a refresh reports the scopes granted to that refresh token.
+        const body: Record<string, unknown> = { access_token: at, expires_in: 3599, token_type: 'Bearer', scope: r.scope }
         if (this.rotateOnNextRefresh) {
           this.rotateOnNextRefresh = false
-          body.refresh_token = this.newRefreshToken(r.email)
+          body.refresh_token = this.newRefreshToken(r.email, r.scope)
         }
         return json(body)
       }
@@ -308,6 +324,37 @@ export class GoogleWorld {
     if (url.hostname === 'www.googleapis.com' && /^\/(upload\/)?drive\/v3\//.test(url.pathname)) {
       if (!authed) return json({ error: { code: 401, message: 'Invalid Credentials' } }, 401)
       return this.drive(method, url, headers, raw, rec)
+    }
+
+    // ---- Gmail API ----
+    if (url.hostname === 'gmail.googleapis.com') {
+      if (this.gmailDown) return json({ error: { code: 503, message: 'Backend Error' } }, 503)
+      if (!authed) return json({ error: { code: 401, message: 'Invalid Credentials', status: 'UNAUTHENTICATED' } }, 401)
+      const scopes = this.accessTokens.get(bearer)!.scope.split(/\s+/)
+      if (!scopes.includes(GMAIL_COMPOSE_SCOPE)) {
+        return json(
+          {
+            error: {
+              code: 403,
+              message: 'Request had insufficient authentication scopes.',
+              status: 'PERMISSION_DENIED',
+              details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', reason: 'ACCESS_TOKEN_SCOPE_INSUFFICIENT' }],
+            },
+          },
+          403,
+        )
+      }
+      if (method === 'POST' && GMAIL_DRAFTS_CREATE_PATHS.includes(url.pathname)) {
+        let message = latin1(raw)
+        if (url.pathname.startsWith('/gmail/')) {
+          const m = JSON.parse(Buffer.from(raw).toString('utf8')) as { message?: { raw?: string } }
+          message = Buffer.from(m.message?.raw ?? '', 'base64url').toString('latin1')
+        }
+        const id = this.uid('r-draft')
+        this.drafts.push({ id, raw: message })
+        return json({ id, message: { id: this.uid('msg'), threadId: this.uid('thr'), labelIds: ['DRAFT'] } })
+      }
+      return json({ error: { code: 400, message: `acceptance fake: Gmail call not allowed by the brief: ${method} ${url.pathname}` } }, 400)
     }
 
     // Any other host (e.g. an attacker's): recorded above, answers with an "image" so a leak would be visible.

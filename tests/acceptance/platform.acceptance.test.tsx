@@ -2,7 +2,7 @@
  * AC12 (amended by Addendum v0.4, D-F/D-G) and AC13.
  * AC12 now: the SPA keeps the Google access token in memory only (never localStorage/sessionStorage/cookies), the
  * refresh token lives only in the encrypted HttpOnly session cookie and never reaches browser JS; the login asks for
- * exactly `openid email drive` (D-F). Tested end-to-end: real SessionAuth + GoogleDriveStore + real /api handlers,
+ * exactly `openid email drive` (D-F) + `gmail.compose` (v0.5 Q5). Tested end-to-end: real SessionAuth + GoogleDriveStore + real /api handlers,
  * against a fake Google (google-world.ts).
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs'
@@ -11,7 +11,7 @@ import { cleanup, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { addManualPart, newServices, renderApp, saveButton, setValue } from './helpers'
-import { Browser, CLIENT_ID, DRIVE_SCOPE, GoogleWorld, ORIGIN, SESSION_COOKIE_NAME } from './google-world'
+import { Browser, CLIENT_ID, DRIVE_SCOPE, GMAIL_COMPOSE_SCOPE, GoogleWorld, ORIGIN, SESSION_COOKIE_NAME } from './google-world'
 import { allPersisted, sessionServices } from './session-helpers'
 
 const MODELS_FOLDER_KEY = 'rubedo.modelsFolderId'
@@ -121,14 +121,14 @@ describe('AC12 (amended by addendum v0.4 D-F/D-G) — access token in memory onl
     expect(services.auth.signedIn).toBe(false)
   })
 
-  it('AC12.scope (D-F): /api/auth/login asks Google for exactly openid + email + drive, offline, consent, no inherited scopes; state is random and in an HttpOnly cookie', async () => {
+  it('AC12.scope (D-F, v0.5 Q5): /api/auth/login asks Google for exactly openid + email + drive + gmail.compose, offline, consent, no inherited scopes; state is random and in an HttpOnly cookie', async () => {
     const browser = new Browser(new GoogleWorld())
     const first = await browser.request('/api/auth/login')
     expect(first.status).toBe(302)
     const loc = new URL(first.headers.get('Location') ?? '')
     expect(`${loc.origin}${loc.pathname}`).toBe('https://accounts.google.com/o/oauth2/v2/auth')
     const p = loc.searchParams
-    expect((p.get('scope') ?? '').trim().split(/\s+/).sort()).toEqual(['email', 'openid', DRIVE_SCOPE].sort())
+    expect((p.get('scope') ?? '').trim().split(/\s+/).sort()).toEqual(['email', 'openid', DRIVE_SCOPE, GMAIL_COMPOSE_SCOPE].sort())
     expect(p.get('access_type')).toBe('offline')
     expect(p.get('prompt')).toBe('consent')
     expect(p.get('include_granted_scopes')).toBe('false')
