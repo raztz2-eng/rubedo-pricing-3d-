@@ -1,17 +1,23 @@
+/**
+ * AC12 (amended by Addendum v0.4, D-F/D-G) and AC13.
+ * AC12 now: the SPA keeps the Google access token in memory only (never localStorage/sessionStorage/cookies), the
+ * refresh token lives only in the encrypted HttpOnly session cookie and never reaches browser JS; the login asks for
+ * exactly `openid email drive` (D-F). Tested end-to-end: real SessionAuth + GoogleDriveStore + real /api handlers,
+ * against a fake Google (google-world.ts).
+ */
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { screen, waitFor } from '@testing-library/react'
+import { cleanup, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { GoogleAuth } from '../../src/lib/auth/googleAuth'
-import { localFolderPointer, type AppServices } from '../../src/state/services'
 import { addManualPart, newServices, renderApp, saveButton, setValue } from './helpers'
+import { Browser, CLIENT_ID, DRIVE_SCOPE, GoogleWorld, ORIGIN, SESSION_COOKIE_NAME } from './google-world'
+import { allPersisted, sessionServices } from './session-helpers'
 
-const DRIVE_FILE = 'https://www.googleapis.com/auth/drive.file'
-const DRIVE_READONLY = 'https://www.googleapis.com/auth/drive.readonly'
-/** Brief addendum v0.3, D-A (Founder, 30 Sep 2026): exactly these two scopes, nothing broader. */
-const EXPECTED_SCOPES = [DRIVE_FILE, DRIVE_READONLY].sort()
-const TOKEN = 'ya29.ACCEPTANCE-SECRET-TOKEN'
+const MODELS_FOLDER_KEY = 'rubedo.modelsFolderId'
+const SIGN_IN = 'התחברות עם Google'
+const SIGNED_IN = 'מחובר ל-Google'
+const SIGN_OUT = 'התנתקות'
 
 function srcFiles(dir = resolve(process.cwd(), 'src')): string[] {
   return readdirSync(dir).flatMap((n) => {
@@ -20,51 +26,25 @@ function srcFiles(dir = resolve(process.cwd(), 'src')): string[] {
   })
 }
 
-function allPersisted(): string {
-  const vals: string[] = []
-  for (const s of [localStorage, sessionStorage]) {
-    for (let i = 0; i < s.length; i++) {
-      const k = s.key(i) as string
-      vals.push(k, s.getItem(k) ?? '')
-    }
-  }
-  vals.push(document.cookie)
-  return vals.join('|')
+function sessionSetCookies(browser: Browser): string[] {
+  return browser.exchanges.flatMap((e) => e.setCookies).filter((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`) && !/Max-Age=0\b/i.test(c))
 }
 
 // ---------------------------------------------------------------------------------------------
-describe('AC12 (amended by addendum v0.3 D-A) — scopes exactly drive.file + drive.readonly; access token never persisted', () => {
+describe('AC12 (amended by addendum v0.4 D-F/D-G) — access token in memory only; the refresh token never reaches browser JS', () => {
   afterEach(() => {
-    delete (window as Window).google
     localStorage.clear()
     sessionStorage.clear()
     vi.restoreAllMocks()
   })
 
-  it('AC12.ui: signing in through the header requests exactly drive.file + drive.readonly; token not in local/sessionStorage or cookies; sign-out revokes', async () => {
-    const configs: GoogleTokenClientConfig[] = []
-    const requests: unknown[] = []
-    const revoke = vi.fn()
-    window.google = {
-      accounts: {
-        oauth2: {
-          initTokenClient: (c: GoogleTokenClientConfig) => {
-            configs.push(c)
-            return {
-              requestAccessToken: (o?: unknown) => {
-                requests.push(o)
-                setTimeout(() => c.callback({ access_token: TOKEN, expires_in: 3600, scope: `${DRIVE_FILE} ${DRIVE_READONLY}` }), 0)
-              },
-            }
-          },
-          revoke,
-        },
-      },
-    } as unknown as Window['google']
-    vi.spyOn(document.head, 'appendChild').mockImplementation((el) => {
-      queueMicrotask(() => (el as HTMLScriptElement).onload?.(new Event('load')))
-      return el
-    })
+  it('AC12.ui: header sign-in → Google → back signed in; token never in local/sessionStorage/cookies; refresh token never visible to JS; sign-out ends the session', async () => {
+    const world = new GoogleWorld()
+    const root = world.addFolder('founder-drive-root', 'models')
+    world.addFolder(root, 'Owl lamp')
+    localStorage.setItem(MODELS_FOLDER_KEY, root)
+    const browser = new Browser(world)
+
     const setItem = vi.spyOn(Storage.prototype, 'setItem')
     const cookieWrites: string[] = []
     const cookieDesc = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie')
@@ -73,52 +53,126 @@ describe('AC12 (amended by addendum v0.3 D-A) — scopes exactly drive.file + dr
       cookieDesc?.set?.call(document, v)
     })
 
-    const auth = new GoogleAuth('test-client-id')
-    const services: AppServices = {
-      mode: 'google',
-      drive: null,
-      auth,
-      folderPointer: localFolderPointer,
-      pickFolder: async () => ({ id: 'picked-folder-id', name: 'models' }),
-    }
     const user = userEvent.setup()
+    let services = sessionServices(browser)
     renderApp(services, '/')
-    await user.click(screen.getByRole('button', { name: 'התחברות עם Google' }))
-    await screen.findByText('מחובר ל-Google')
+    await user.click((await screen.findAllByRole('button', { name: SIGN_IN }))[0])
+    // Full-page redirect to the backend (no popup).
+    expect(services.navigations).toEqual(['/api/auth/login'])
 
-    expect(configs).toHaveLength(1)
-    expect(configs[0].scope.trim().split(/\s+/).sort()).toEqual(EXPECTED_SCOPES)
-    // Never inherit broader scopes granted to this client earlier.
-    expect(configs[0].include_granted_scopes).not.toBe(true)
-    expect(await auth.getToken()).toBe(TOKEN)
+    // The browser leaves the app: Google consent → /api/auth/callback → 302 back to "/".
+    const cb = await browser.signInAtGoogle()
+    expect(cb.status).toBe(302)
+    expect(cb.headers.get('Location')).toBe('/')
+    expect(browser.hasSession()).toBe(true)
 
-    // The folder pointer is the only thing the app may persist — and it is an ID, not a token.
-    localFolderPointer.set('picked-folder-id')
-    expect(allPersisted()).not.toContain(TOKEN)
-    for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain(TOKEN)
-    for (const c of cookieWrites) expect(c).not.toContain(TOKEN)
-    expect(localStorage.getItem('rubedo.modelsFolderId')).toBe('picked-folder-id')
+    // The app loads again: signed in, Drive works with the minted access token.
+    cleanup()
+    services = sessionServices(browser)
+    renderApp(services, '/library')
+    await screen.findByText(SIGNED_IN)
+    await waitFor(() => expect(screen.getAllByTestId('library-card').some((c) => (c.textContent ?? '').includes('Owl lamp'))).toBe(true))
+    const token = await services.auth.getToken()
+    expect(world.accessTokens.has(token), 'token was minted by Google via /api/auth/token').toBe(true)
 
-    await user.click(screen.getByRole('button', { name: 'התנתקות' }))
-    expect(revoke).toHaveBeenCalledWith(TOKEN)
-    await screen.findByRole('button', { name: 'התחברות עם Google' })
-    await expect(auth.getToken()).rejects.toThrow()
+    // Access token: memory only.
+    expect(allPersisted()).not.toContain(token)
+    for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain(token)
+    for (const c of cookieWrites) expect(c).not.toContain(token)
+    expect(localStorage.getItem(MODELS_FOLDER_KEY)).toBe(root) // the only thing persisted: a folder ID
+
+    // Refresh token: only inside the encrypted HttpOnly cookie, never in anything JS could read.
+    const rts = [...world.refreshTokens.keys()]
+    expect(rts).toHaveLength(1)
+    const rt = rts[0]
+    expect(browser.seenByJs.length).toBeGreaterThan(0)
+    for (const seen of browser.seenByJs) {
+      expect(`${seen.headers}\n${seen.body}`, `${seen.method} ${seen.path}`).not.toContain(rt)
+      expect(seen.headers.toLowerCase(), 'no Set-Cookie readable by JS').not.toContain('set-cookie')
+    }
+    const session = sessionSetCookies(browser)
+    expect(session.length).toBeGreaterThan(0)
+    for (const sc of session) {
+      expect(sc).toMatch(/;\s*HttpOnly/i)
+      expect(sc).toMatch(/;\s*Secure/i)
+      expect(sc).toMatch(/;\s*SameSite=Lax/i)
+      expect(sc).toMatch(/;\s*Path=\/api(;|$)/)
+      expect(sc).toMatch(/;\s*Max-Age=15552000(;|$)/) // 180 days
+      expect(sc).not.toContain(rt)
+      expect(sc).not.toContain(Buffer.from(rt).toString('base64url'))
+      expect(sc).not.toContain(Buffer.from(rt).toString('base64'))
+    }
+    expect(document.cookie).not.toContain(SESSION_COOKIE_NAME)
+    expect(allPersisted()).not.toContain(rt)
+    for (const call of setItem.mock.calls) expect(String(call[1])).not.toContain(rt)
+
+    // Sign-out: the session cookie is cleared, the refresh token revoked at Google, no more tokens.
+    await user.click(screen.getByRole('button', { name: SIGN_OUT }))
+    await screen.findAllByRole('button', { name: SIGN_IN })
+    await waitFor(() => expect(browser.hasSession()).toBe(false))
+    await waitFor(() => expect(world.refreshTokens.get(rt)?.revoked).toBe(true))
+    await expect(services.auth.getToken()).rejects.toThrow()
+
+    // Reload after sign-out: signed out.
+    cleanup()
+    services = sessionServices(browser)
+    renderApp(services, '/')
+    await screen.findAllByRole('button', { name: SIGN_IN })
+    expect(services.auth.signedIn).toBe(false)
   })
 
-  it('AC12.static: the only OAuth scopes in src/ are drive.file + drive.readonly; no token persistence anywhere in src/', () => {
-    const scopes = new Set<string>()
+  it('AC12.scope (D-F): /api/auth/login asks Google for exactly openid + email + drive, offline, consent, no inherited scopes; state is random and in an HttpOnly cookie', async () => {
+    const browser = new Browser(new GoogleWorld())
+    const first = await browser.request('/api/auth/login')
+    expect(first.status).toBe(302)
+    const loc = new URL(first.headers.get('Location') ?? '')
+    expect(`${loc.origin}${loc.pathname}`).toBe('https://accounts.google.com/o/oauth2/v2/auth')
+    const p = loc.searchParams
+    expect((p.get('scope') ?? '').trim().split(/\s+/).sort()).toEqual(['email', 'openid', DRIVE_SCOPE].sort())
+    expect(p.get('access_type')).toBe('offline')
+    expect(p.get('prompt')).toBe('consent')
+    expect(p.get('include_granted_scopes')).toBe('false')
+    expect(p.get('redirect_uri')).toBe(`${ORIGIN}/api/auth/callback`)
+    expect(p.get('client_id')).toBe(CLIENT_ID)
+    expect(p.get('response_type')).toBe('code')
+    const state = p.get('state') ?? ''
+    expect(state.length).toBeGreaterThanOrEqual(16)
+    const stateCookie = first.headers.getSetCookie().find((c) => c.includes(`=${state}`))
+    expect(stateCookie, 'state stored in a cookie').toBeTruthy()
+    expect(stateCookie).toMatch(/;\s*HttpOnly/i)
+    const second = new URL((await browser.request('/api/auth/login')).headers.get('Location') ?? '')
+    expect(second.searchParams.get('state')).not.toBe(state)
+  })
+
+  it('AC12.callback-requirements: without the drive scope, without a refresh token, or with a forged state → no session', async () => {
+    for (const [label, opts] of [
+      ['drive scope not granted', { grantedScope: 'openid https://www.googleapis.com/auth/userinfo.email' }],
+      ['no refresh token', { withRefreshToken: false }],
+      ['forged state', { tamperState: true }],
+    ] as const) {
+      const browser = new Browser(new GoogleWorld())
+      const res = await browser.signInAtGoogle(undefined, opts)
+      expect(res.status, label).not.toBe(302)
+      expect(browser.hasSession(), label).toBe(false)
+      expect((await browser.request('/api/auth/token', { method: 'POST', origin: ORIGIN })).status, label).toBe(401)
+    }
+  })
+
+  it('AC12.static: src/ never writes/reads cookies, never uses sessionStorage/indexedDB, localStorage only for the folder pointer, never handles a refresh token', () => {
     const offenders: string[] = []
     for (const f of srcFiles()) {
       const code = readFileSync(f, 'utf8')
-      for (const m of code.matchAll(/https:\/\/www\.googleapis\.com\/auth\/[\w.\-/]+/g)) scopes.add(m[0])
-      if (/document\.cookie\s*=/.test(code)) offenders.push(`${f}: writes document.cookie`)
+      if (/document\.cookie/.test(code)) offenders.push(`${f}: touches document.cookie`)
       if (/sessionStorage\.setItem|indexedDB\.open/.test(code)) offenders.push(`${f}: sessionStorage/indexedDB write`)
       for (const m of code.matchAll(/localStorage\.setItem\(([^)]*)\)/g)) {
         if (!/MODELS_FOLDER_KEY/.test(m[1])) offenders.push(`${f}: localStorage.setItem(${m[1]})`)
       }
+      if (/refresh_token|refreshToken/.test(code)) offenders.push(`${f}: refresh token in SPA code`)
     }
-    expect([...scopes].sort()).toEqual(EXPECTED_SCOPES)
     expect(offenders).toEqual([])
+    // The old GIS token client is gone (brief v0.4 "Remove GIS token client").
+    const all = srcFiles().map((f) => readFileSync(f, 'utf8')).join('\n')
+    expect(all).not.toMatch(/initTokenClient|accounts\.google\.com\/gsi\/client/)
   })
 })
 

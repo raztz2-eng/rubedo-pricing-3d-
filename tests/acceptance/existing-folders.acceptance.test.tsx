@@ -1,5 +1,5 @@
 /**
- * Acceptance tests for brief Addendum v0.3 (Founder decisions, 30 Sep 2026): AC14–AC17.
+ * Acceptance tests for brief Addendum v0.3 (Founder decisions, 30 Sep 2026): AC14–AC17 (AC17 scope part superseded by v0.4).
  * Outside-in: render the App on the in-memory Drive; the Founder's own Drive content is simulated with
  * addForeignFolder / addForeignFile (not created by the app). Expected numbers come from the brief (T2 = ₪23.17).
  */
@@ -7,11 +7,11 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { cleanup, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { GoogleAuth } from '../../src/lib/auth/googleAuth'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { newSaveSession, rebuildIndex, saveNewBid, loadSettings, updateBid, type BidContent } from '../../src/lib/drive/bidRepository'
 import { GoogleDriveStore } from '../../src/lib/drive/googleDrive'
 import { computePrice, DEFAULT_PRICING_SETTINGS } from '../../src/lib/pricing'
+import { bytes, GoogleWorld } from './google-world'
 import {
   addManualPart,
   fixtureBytes,
@@ -33,8 +33,6 @@ const NEEDS_SLICING = 'דורש סלייס'
 const SLICED_FOUND = 'נמצא קובץ סלייס — צור הצעה'
 const CREATE_BID = 'צור הצעת מחיר'
 const SLICED_MIME = 'application/vnd.ms-package.3dmanufacturing-3dmodel+xml'
-const DRIVE_FILE = 'https://www.googleapis.com/auth/drive.file'
-const DRIVE_READONLY = 'https://www.googleapis.com/auth/drive.readonly'
 
 function jpeg(): Blob {
   return new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3])], { type: 'image/jpeg' })
@@ -332,71 +330,6 @@ function content(name: string, grams: number, hours: number): BidContent {
   }
 }
 
-interface RestNode {
-  id: string
-  name: string
-  mimeType: string
-  parents: string[]
-  appAuthorized: boolean
-  content: string
-}
-
-/** Minimal Drive REST v3 double: records every request; creates are app-authorized, seeded nodes are not. */
-function fakeDriveRest(seed: Omit<RestNode, 'appAuthorized'>[]) {
-  const nodes = new Map<string, RestNode>()
-  for (const n of seed) nodes.set(n.id, { ...n, appAuthorized: false })
-  const calls: { method: string; url: string; body: string }[] = []
-  let seq = 0
-  const json = (v: unknown, status = 200) => new Response(JSON.stringify(v), { status, headers: { 'Content-Type': 'application/json' } })
-  const meta = (n: RestNode) => ({ id: n.id, name: n.name, mimeType: n.mimeType, isAppAuthorized: n.appAuthorized })
-
-  const fetchImpl = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
-    const url = new URL(String(input))
-    const method = (init.method ?? 'GET').toUpperCase()
-    const body = init.body instanceof Blob ? await init.body.text() : typeof init.body === 'string' ? init.body : ''
-    calls.push({ method, url: url.toString(), body })
-    const path = url.pathname
-    const idMatch = path.match(/\/files\/([^/]+)$/)
-    if (method === 'GET' && /^\/drive\/v3\/files$/.test(path)) {
-      const q = url.searchParams.get('q') ?? ''
-      const parent = q.match(/'([^']+)' in parents/)?.[1]
-      const name = q.match(/name = '([^']+)'/)?.[1]
-      const foldersOnly = q.includes("mimeType = 'application/vnd.google-apps.folder'")
-      const files = [...nodes.values()].filter(
-        (n) => n.parents.includes(parent ?? '') && (name === undefined || n.name === name) && (!foldersOnly || n.mimeType === 'application/vnd.google-apps.folder'),
-      )
-      return json({ files: files.map(meta) })
-    }
-    if (method === 'GET' && idMatch) {
-      const n = nodes.get(decodeURIComponent(idMatch[1]))
-      if (!n) return json({ error: 'nf' }, 404)
-      return url.searchParams.get('alt') === 'media' ? new Response(n.content) : json(meta(n))
-    }
-    if (method === 'POST' && /^\/drive\/v3\/files$/.test(path)) {
-      const m = JSON.parse(body) as { name: string; mimeType: string; parents: string[] }
-      const n: RestNode = { id: `new-${++seq}`, name: m.name, mimeType: m.mimeType, parents: m.parents, appAuthorized: true, content: '' }
-      nodes.set(n.id, n)
-      return json(meta(n))
-    }
-    if (method === 'POST' && /\/upload\/drive\/v3\/files$/.test(path)) {
-      const parts = body.split(/\r\n\r\n/)
-      const m = JSON.parse(parts[1].split('\r\n--')[0]) as { name: string; mimeType: string; parents: string[] }
-      const data = parts.slice(2).join('\r\n\r\n').replace(/\r\n--[^\r\n]*--$/, '')
-      const n: RestNode = { id: `new-${++seq}`, name: m.name, mimeType: m.mimeType, parents: m.parents, appAuthorized: true, content: data }
-      nodes.set(n.id, n)
-      return json(meta(n))
-    }
-    if (method === 'PATCH' && idMatch) {
-      const n = nodes.get(decodeURIComponent(idMatch[1]))
-      if (!n) return json({ error: 'nf' }, 404)
-      n.content = body // accepted here on purpose: the test checks the APP never sends it for foreign files
-      return json({ id: n.id })
-    }
-    return json({ error: `unhandled ${method} ${path}` }, 400)
-  }) as typeof fetch
-  return { nodes, calls, fetchImpl }
-}
-
 function srcFiles(dir = resolve(process.cwd(), 'src')): string[] {
   return readdirSync(dir).flatMap((n) => {
     const p = join(dir, n)
@@ -404,39 +337,9 @@ function srcFiles(dir = resolve(process.cwd(), 'src')): string[] {
   })
 }
 
-describe('AC17 — scopes exactly drive.file + drive.readonly; no write/delete targets a file the app did not create', () => {
-  afterEach(() => {
-    delete (window as Window).google
-    vi.restoreAllMocks()
-  })
-
-  it('AC17.scopes: the token client is initialised with exactly drive.file + drive.readonly', async () => {
-    const configs: GoogleTokenClientConfig[] = []
-    window.google = {
-      accounts: {
-        oauth2: {
-          initTokenClient: (c: GoogleTokenClientConfig) => {
-            configs.push(c)
-            return {
-              requestAccessToken: () =>
-                setTimeout(() => c.callback({ access_token: 'tok', expires_in: 3600, scope: `${DRIVE_READONLY} ${DRIVE_FILE}` }), 0),
-            }
-          },
-          revoke: vi.fn(),
-        },
-      },
-    } as unknown as Window['google']
-    // GIS script "loads" instantly (no network in tests).
-    vi.spyOn(document.head, 'appendChild').mockImplementation((el) => {
-      queueMicrotask(() => (el as HTMLScriptElement).onload?.(new Event('load')))
-      return el
-    })
-    const auth = new GoogleAuth('cid')
-    await auth.signIn()
-    expect(configs.length).toBeGreaterThan(0)
-    for (const c of configs) expect(c.scope.trim().split(/\s+/).sort()).toEqual([DRIVE_FILE, DRIVE_READONLY].sort())
-    expect(await auth.getToken()).toBe('tok')
-  })
+// AC17's scope half ("exactly drive.file + drive.readonly") is superseded by addendum v0.4 D-F (scope = drive; see AC12.scope).
+// Its write half still applies and is tightened by AC22 (session.acceptance.test.tsx).
+describe('AC17 (scope half superseded by v0.4 D-F) — no write/delete call targets a file the app did not create', () => {
 
   it('AC17.ui-flows: library, create-from-folder (sliced and manual), edit, new bid, settings, refresh → no write targets a foreign file; foreign files unchanged', async () => {
     const restore = stubObjectUrls()
@@ -517,46 +420,46 @@ describe('AC17 — scopes exactly drive.file + drive.readonly; no write/delete t
     }
   })
 
-  it('AC17.real-store: GoogleDriveStore through rebuild + create-in-existing-folder + edit + settings sends no DELETE/move and no write to a foreign file', async () => {
-    const FOLDER = 'application/vnd.google-apps.folder'
-    const rest = fakeDriveRest([
-      { id: 'root', name: 'models', mimeType: FOLDER, parents: ['drive-root'], content: '' },
-      { id: 'fA', name: 'Stand A', mimeType: FOLDER, parents: ['root'], content: '' },
-      { id: 'slicedA', name: 'rooting-stand.gcode.3mf', mimeType: SLICED_MIME, parents: ['fA'], content: 'zip' },
-      { id: 'photoA', name: 'a.jpg', mimeType: 'image/jpeg', parents: ['fA'], content: 'jpg' },
-      { id: 'fB', name: 'Vase B', mimeType: FOLDER, parents: ['root'], content: '' },
-      { id: 'notes', name: 'notes.txt', mimeType: 'text/plain', parents: ['root'], content: 'n' },
-      // A foreign file named like an app file: the app must not rewrite it.
-      { id: 'foreignBid', name: 'bid.json', mimeType: 'application/json', parents: ['fB'], content: '{"not":"a bid"}' },
-    ])
-    const store = new GoogleDriveStore({ getToken: async () => 't', refresh: async () => 't' }, rest.fetchImpl)
-    const foreign = new Set([...rest.nodes.keys()])
+  it('AC17.real-store: GoogleDriveStore (Drive REST reports parents + appProperties) through rebuild + create-in-existing-folder + edit + settings sends no DELETE/move and no write to a foreign file', async () => {
+    const world = new GoogleWorld()
+    const token = world.mintAccessToken()
+    const root = world.addFolder('drive-root', 'models', { id: 'root_models' })
+    const fA = world.addFolder(root, 'Stand A', { id: 'folder_A_stand' })
+    const slicedA = world.addFile(fA, 'rooting-stand.gcode.3mf', bytes('zip'), SLICED_MIME, { id: 'sliced_A_file' })
+    const photoA = world.addFile(fA, 'a.jpg', bytes('jpg'), 'image/jpeg', { id: 'photo_A_file' })
+    const fB = world.addFolder(root, 'Vase B', { id: 'folder_B_vase' })
+    world.addFile(root, 'notes.txt', bytes('n'), 'text/plain', { id: 'notes_file_1' })
+    // A foreign file named like an app file: the app must not rewrite it.
+    const foreignBid = world.addFile(fB, 'bid.json', bytes('{"not":"a bid"}'), 'application/json', { id: 'foreign_bid_B' })
+    const store = new GoogleDriveStore({ getToken: async () => token, refresh: async () => token }, world.fetch)
+    const foreign = new Set([...world.nodes.keys()])
+    const before = world.snapshot(foreign)
 
-    await loadSettings(store, 'root')
-    await rebuildIndex(store, 'root')
+    await loadSettings(store, root)
+    await rebuildIndex(store, root)
     const session = newSaveSession()
     const c = content('Stand A', 55.94, 9312 / 3600)
     const saved = await saveNewBid(
       store,
-      'root',
+      root,
       {
         folderName: 'Stand A',
-        existingFolderId: 'fA',
-        existingFiles: [{ id: 'slicedA', name: 'rooting-stand.gcode.3mf', kind: 'sliced', mimeType: SLICED_MIME }],
+        existingFolderId: fA,
+        existingFiles: [{ id: slicedA, name: 'rooting-stand.gcode.3mf', kind: 'sliced', mimeType: SLICED_MIME }],
         content: c,
         files: [],
       },
       session,
     )
-    expect(saved.folderId).toBe('fA')
-    await updateBid(store, 'root', { folderId: 'fA', existing: saved.bid, content: { ...c, laborMinutes: 10 }, newFiles: [] }, newSaveSession())
-    await rebuildIndex(store, 'root')
+    expect(saved.folderId).toBe(fA)
+    await updateBid(store, root, { folderId: fA, existing: saved.bid, content: { ...c, laborMinutes: 10 }, newFiles: [] }, newSaveSession())
+    await rebuildIndex(store, root)
     // Directly asking the store to rewrite a foreign file is refused before any write request is sent.
-    const n = rest.calls.length
-    await expect(store.updateFileContent('foreignBid', new Blob(['x']), 'application/json')).rejects.toThrow()
-    expect(rest.calls.slice(n).filter((x) => x.method !== 'GET')).toEqual([])
+    const n = world.calls.length
+    await expect(store.updateFileContent(foreignBid, new Blob(['x']), 'application/json')).rejects.toThrow()
+    expect(world.calls.slice(n).filter((x) => x.method !== 'GET')).toEqual([])
 
-    const writes = rest.calls.filter((x) => x.method !== 'GET')
+    const writes = world.driveWrites()
     expect(writes.length).toBeGreaterThan(0)
     expect(writes.some((w) => w.method === 'PATCH')).toBe(true) // the edit/index rewrite really went through PATCH
     for (const w of writes) {
@@ -566,13 +469,12 @@ describe('AC17 — scopes exactly drive.file + drive.readonly; no write/delete t
       if (w.method === 'PATCH') {
         const id = decodeURIComponent(new URL(w.url).pathname.split('/').pop() as string)
         expect(foreign.has(id), `PATCH of foreign file ${id}`).toBe(false)
-        expect(rest.nodes.get(id)?.appAuthorized).toBe(true)
+        expect(w.targetMarkedBefore, `PATCH of unmarked file ${id}`).toBe(true)
       }
     }
-    // Foreign content unchanged.
-    expect(rest.nodes.get('foreignBid')?.content).toBe('{"not":"a bid"}')
-    expect(rest.nodes.get('slicedA')?.content).toBe('zip')
-    expect(rest.nodes.get('photoA')?.content).toBe('jpg')
+    // Foreign files/folders unchanged (name, place, marker, content).
+    expect(world.snapshot(foreign)).toEqual(before)
+    expect(world.nodes.get(photoA)?.content).toEqual(bytes('jpg'))
   })
 
   it('AC17.static: src/ has no delete/trash/move operation against Drive and DriveStore exposes none', () => {
