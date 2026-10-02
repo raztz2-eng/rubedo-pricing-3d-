@@ -79,6 +79,21 @@ export function saveButton(): HTMLButtonElement {
   return screen.getByRole('button', { name: 'שמירה' }) as HTMLButtonElement
 }
 
+/** Visible label of the model page's edit button (brief v0.6 E1; was "עריכה" before v0.6). */
+export const EDIT_BID_LABEL = 'עריכת הצעה'
+
+/**
+ * The model page's "עריכת הצעה" link, found by the label the Founder SEES (decorative icons ignored).
+ * Exactly one must exist.
+ */
+export function editBidLink(): HTMLElement {
+  const links = screen
+    .queryAllByRole('link')
+    .filter((l) => (l.textContent ?? '').replace(/[✎✏]\uFE0F?/gu, '').trim() === EDIT_BID_LABEL)
+  if (links.length !== 1) throw new Error(`expected exactly one "${EDIT_BID_LABEL}" link, found ${links.length}`)
+  return links[0]
+}
+
 export function navLink(name: string): HTMLElement {
   return within(screen.getByRole('navigation')).getByRole('link', { name })
 }

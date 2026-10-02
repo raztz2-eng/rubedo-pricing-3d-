@@ -441,9 +441,16 @@ describe('AC30 — quote log written (marked) in <model>/quotes/ after a success
     expect(numbers.some((n) => n.toFixed(2) === '100.04'), "bid's 70% price").toBe(true)
 
     // Only the log was written: the quotes folder and one new file — bid.json not rewritten.
+    // v0.6 AC37 adds exactly one more write: the (new) customer saved to <models>/_rubedo-customers.json.
     const writes = services.drive.writeLog.slice(logStart)
     expect(writes.some((w) => /bid\.json/.test(w))).toBe(false)
-    expect(writes).toHaveLength(2)
+    const customerWrites = writes.filter((w) => /^(upload|update):_rubedo-customers\.json$/.test(w))
+    expect(customerWrites, 'exactly one customers-file write (AC37)').toHaveLength(1)
+    expect(writes.filter((w) => !customerWrites.includes(w))).toEqual(['folder:quotes', `upload:${files[0].name}`])
+    expect(writes).toHaveLength(3)
+    const customersFile = await services.drive.listChildren(root, { name: '_rubedo-customers.json' })
+    expect(customersFile, 'the customers file lives in the models folder').toHaveLength(1)
+    expect(customersFile[0].appCreated).toBe(true)
     expect(await services.drive.readText(m.bidFileId)).toBe(bidBefore)
   })
 

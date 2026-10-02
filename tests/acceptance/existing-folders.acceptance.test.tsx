@@ -14,6 +14,7 @@ import { computePrice, DEFAULT_PRICING_SETTINGS } from '../../src/lib/pricing'
 import { bytes, GoogleWorld } from './google-world'
 import {
   addManualPart,
+  editBidLink,
   fixtureBytes,
   nameInput,
   navLink,
@@ -369,7 +370,7 @@ describe('AC17 (scope half superseded by v0.4 D-F) — no write/delete call targ
       await screen.findByRole('heading', { level: 1, name: 'Stand A' })
 
       // Edit that bid (rewrites bid.json).
-      await user.click(screen.getByRole('link', { name: 'עריכה' }))
+      await user.click(editBidLink())
       setValue(await screen.findByLabelText('זמן עבודה'), '10')
       await user.click(saveButton())
       await screen.findByRole('heading', { level: 1, name: 'Stand A' })

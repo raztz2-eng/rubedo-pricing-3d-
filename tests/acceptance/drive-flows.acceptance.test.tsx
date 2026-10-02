@@ -5,6 +5,7 @@ import { newSaveSession, saveNewBid, type BidContent } from '../../src/lib/drive
 import { computePrice, DEFAULT_PRICING_SETTINGS } from '../../src/lib/pricing'
 import {
   addManualPart,
+  editBidLink,
   fixtureFile,
   moneyIn,
   nameInput,
@@ -379,7 +380,7 @@ describe('AC11 — Settings affect new bids only; existing bids keep their snaps
     expect(panel()).toMatchObject({ labor: '₪13.33', p70: '₪83.37' })
 
     // Edit keeps the snapshot; saving without "recalculate" keeps laborRate 80.
-    await user.click(screen.getByRole('link', { name: 'עריכה' }))
+    await user.click(editBidLink())
     await screen.findByRole('heading', { name: /עריכת Old/ })
     expect(panel()).toMatchObject({ labor: '₪13.33', p70: '₪83.37' })
     setValue(screen.getByLabelText('תיאור'), 'edited')

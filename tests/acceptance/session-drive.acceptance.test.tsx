@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { defaultAppSettings } from '../../src/lib/bid'
 import { createGoogleServices } from '../../src/state/services'
 import { Browser, bytes, FOLDER_MIME, GoogleWorld, type Recorded } from './google-world'
-import { addManualPart, fixtureBytes, nameInput, navLink, newServices, panel, pngFile, renderApp, saveButton, setValue, stubObjectUrls } from './helpers'
+import { addManualPart, editBidLink, fixtureBytes, nameInput, navLink, newServices, panel, pngFile, renderApp, saveButton, setValue, stubObjectUrls } from './helpers'
 import { sessionServices } from './session-helpers'
 
 const MODELS_FOLDER_KEY = 'rubedo.modelsFolderId'
@@ -268,7 +268,7 @@ describe('AC22 — no code path can delete/trash/move/rename, or update content 
     await user.click(saveButton())
     await screen.findByRole('heading', { level: 1, name: 'Stand A' })
 
-    await user.click(screen.getByRole('link', { name: 'עריכה' }))
+    await user.click(editBidLink())
     setValue(await screen.findByLabelText('זמן עבודה'), '10')
     await user.click(saveButton())
     await screen.findByRole('heading', { level: 1, name: 'Stand A' })

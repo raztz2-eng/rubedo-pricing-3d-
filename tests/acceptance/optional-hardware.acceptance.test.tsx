@@ -7,7 +7,7 @@ import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { computePrice, DEFAULT_PRICING_SETTINGS } from '../../src/lib/pricing'
-import { addManualPart, moneyIn, newServices, panel, renderApp, saveButton, setValue, stubObjectUrls, type MemServices } from './helpers'
+import { addManualPart, editBidLink, moneyIn, newServices, panel, renderApp, saveButton, setValue, stubObjectUrls, type MemServices } from './helpers'
 import { bidJson } from './v05-fixtures'
 
 type Drive = MemServices['drive']
@@ -100,7 +100,7 @@ describe('AC25 — unticking a hardware row removes exactly its qty×unitCost fr
     await screen.findByRole('heading', { level: 1, name: 'Edit Station' })
     const folder = (await services.drive.listChildren(root, { foldersOnly: true })).find((f) => f.name === 'Edit Station')!
 
-    await user.click(screen.getByRole('link', { name: 'עריכה' }))
+    await user.click(editBidLink())
     await waitFor(() => expect(includeBoxes()).toHaveLength(1))
     expect(includeBoxes()[0].checked).toBe(false)
     expect(panel().landed).toBe('₪25.01')
@@ -110,7 +110,7 @@ describe('AC25 — unticking a hardware row removes exactly its qty×unitCost fr
     expect(bid.hardware).toEqual([{ name: 'Plant cutting', qty: 2, unitCost: 7.5, included: false }])
     expect(bid.result.landed.toFixed(2)).toBe('25.01')
 
-    await user.click(screen.getByRole('link', { name: 'עריכה' }))
+    await user.click(editBidLink())
     await waitFor(() => expect(includeBoxes()).toHaveLength(1))
     await user.click(includeBoxes()[0])
     expect(panel().landed).toBe('₪40.01')
@@ -177,7 +177,7 @@ describe('AC26 — an old bid.json (no `included`) prices identically to before'
     expect(moneyIn('price-70')).toBe('₪146.70')
     expect(screen.queryByText('לא כלול במחיר')).toBeNull()
 
-    await user.click(screen.getByRole('link', { name: 'עריכה' }))
+    await user.click(editBidLink())
     await waitFor(() => expect(includeBoxes()).toHaveLength(2))
     expect(includeBoxes().map((b) => b.checked)).toEqual([true, true])
     expect(panel().hardware).toBe('₪19.00')
