@@ -258,3 +258,50 @@ AC28 Draft MIME is valid (multipart/mixed with multipart/alternative text+html, 
 AC29 Static test: no Gmail endpoint other than drafts.create appears in src/ or api/; no internal cost fields in the email.
 AC30 Quote log file is written (marked) in `<model>/quotes/` after a successful draft; nothing written if draft fails.
 AC31 Session without gmail.compose → quote screen shows the extra-permission prompt; rest of app works.
+
+---
+# Addendum v0.6 — Editing, model cover, description, customers list (Founder request, 2 Oct 2026)
+
+## Founder request
+"I want to be able to edit bids, add a profile picture to the model, edit the description, and have a customers
+list so I can send another quote to an existing customer quickly."
+
+## Behaviour
+E1 **Edit is obvious and complete.** Model page shows a prominent "עריכת הצעה" button. Edit covers every bid field:
+   name, description, material/price per kg, parts (add/remove/edit, replace sliced file), labor, hardware rows
+   (add/remove/edit, included flag), packaging/shipping, add photos/files. Saving rewrites the marked bid.json only.
+   Edit offers "חשב מחדש לפי ההגדרות הנוכחיות" (existing behaviour) and keeps the snapshot otherwise.
+   Pre-v0.4 (unmarked) bids: the read-only notice offers "המר להצעה ניתנת לעריכה" = the existing "create again"
+   flow, prefilled with ALL old values, writing a new marked bid.json beside the old one; afterwards it edits normally.
+E2 **Model cover ("profile picture").** On the model page every image has "קבע כתמונה ראשית". Sets `coverFileId`
+   in bid.json (marked bid) — used in library card and model page header. For folders WITHOUT bid.json
+   (needs-slicing), the choice is stored in a small marked file `<folder>/_rubedo-model.json` `{coverFileId, description}`
+   so the library shows it too. Upload-a-new-photo-as-cover also available (uploads image into the folder, then sets it).
+E3 **Description edit inline.** On the model page, the description has an edit (pencil) action → textarea → save
+   without opening the full form. Priced: writes bid.json; needs-slicing: writes `_rubedo-model.json`. Max 2000 chars.
+   When a bid is later created from a needs-slicing folder, cover + description from `_rubedo-model.json` prefill it.
+E4 **Customers list.**
+   - Store: `<models folder>/_rubedo-customers.json` (marked, app-owned):
+     `[{id, name, email, phone?, notes?, createdAt, updatedAt}]`. Email unique (case-insensitive).
+   - New page "לקוחות" (header nav): search by name/email, list with last quote date and number of quotes,
+     add/edit customer (name, email, phone, notes). No delete in v0.6 (consistent with no-delete policy); "הסתר"
+     flag instead (hidden customers excluded from pickers, shown under a toggle).
+   - Customer page: all quotes sent to them (from every model's quote logs, newest first: date, model, price shown,
+     link to the model) + button "שליחת הצעה חדשה" → choose model → quote screen prefilled with this customer.
+   - Quote screen: customer picker (type-ahead on name/email) above the name/email fields; picking fills them.
+     A new name+email typed in the quote screen is added to the customer list automatically after the draft succeeds
+     (never before). If the email exists with a different name, keep the stored name and show a small notice.
+   - Quote logs (Q4) gain `customerId`. Old logs without it are matched by email.
+   - Customer history is built by scanning `quotes/quote-*.json` across model folders (concurrency-limited), cached
+     in `_rubedo-index.json` (add a `customers` summary) and refreshed with "רענון ספרייה".
+
+## Acceptance criteria
+AC32 Editing a marked bid changes only that bid.json (marker kept); every field listed in E1 round-trips.
+AC33 Converting a pre-v0.4 bid creates a new marked bid.json with all old values; the old file is untouched.
+AC34 Setting a cover on a priced model updates coverFileId; on a needs-slicing folder writes `_rubedo-model.json`;
+     library card shows the chosen cover in both cases.
+AC35 Inline description edit persists for priced and needs-slicing models; 2000-char limit enforced.
+AC36 Customers: add/edit/hide/search; email uniqueness; nothing is ever deleted.
+AC37 Quote screen picker fills name+email; a new customer is saved only after a successful draft; failed draft saves nothing.
+AC38 Customer page lists quotes from all models (incl. old logs matched by email) newest first, and "new quote"
+     opens the quote screen prefilled.
