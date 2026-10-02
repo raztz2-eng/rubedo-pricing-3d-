@@ -5,6 +5,7 @@ import {
   FOLDER_MIME,
   INDEX_FILE_NAME,
   INDEX_MAX_AGE_MS,
+  INDEX_SCHEMA_VERSION,
   SETTINGS_FILE_NAME,
   defaultAppSettings,
   indexEntryFromBid,
@@ -16,11 +17,17 @@ import {
   type Bid,
   type BidFile,
   type BidPart,
+  type CustomerQuoteSummary,
   type FileKind,
   type IndexEntry,
   type IndexFile,
+  type QuoteSummary,
 } from '../bid'
-import { classifyFolder, isPlatePictureName, isSkippedFolderName, pickCover, preferAppFile, type FolderContents } from './folderContents'
+import { byDateDesc, summariseQuotes } from '../customers'
+import { classifyFolder, isPlatePictureName, isSkippedFolderName, pickCover, type FolderContents } from './folderContents'
+import { findFile, InvalidJsonError, JSON_MIME, jsonBlob, readJson, writeJsonFile } from './jsonFiles'
+import { assertDescriptionLength, InvalidModelMetaError, readModelMeta, writeModelMeta, type ModelMeta } from './modelMeta'
+import { findQuotesFolder, isQuoteLogName, readQuoteSummary } from './quoteLog'
 import { DriveError, type DriveFile, type DriveStore } from './types'
 
 /** How many model folders are listed in parallel when (re)building the library. */
@@ -31,7 +38,7 @@ export const FOLDER_SCAN_CONCURRENCY = 5
  * bid.json is the source of truth; _rubedo-index.json is a rebuildable cache.
  */
 
-const JSON_MIME = 'application/json'
+export { findFile, InvalidJsonError } from './jsonFiles'
 
 export interface LocalFile {
   /** Stable key within the form, used to skip already-uploaded files on retry. */
@@ -66,49 +73,8 @@ export function newSaveSession(): SaveSession {
   return { uploaded: {} }
 }
 
-function jsonBlob(value: unknown): Blob {
-  return new Blob([JSON.stringify(value, null, 2)], { type: JSON_MIME })
-}
-
 function sameName(a: string, b: string): boolean {
   return a.trim().toLocaleLowerCase() === b.trim().toLocaleLowerCase()
-}
-
-/** A file with that exact name in the folder; one with the app marker is preferred (M3). */
-export async function findFile(store: DriveStore, folderId: string, name: string): Promise<DriveFile | undefined> {
-  return preferAppFile(await store.listChildren(folderId, { name }))
-}
-
-/** The file was read fine but its content is not valid JSON (as opposed to a Drive/network failure). */
-export class InvalidJsonError extends DriveError {
-  constructor(what: string) {
-    super(`${what}: invalid JSON`, `הקובץ ${what} פגום (JSON לא תקין).`)
-    this.name = 'InvalidJsonError'
-  }
-}
-
-async function readJson(store: DriveStore, fileId: string, what: string): Promise<unknown> {
-  const text = await store.readText(fileId)
-  try {
-    return JSON.parse(text)
-  } catch {
-    throw new InvalidJsonError(what)
-  }
-}
-
-/**
- * Creates or rewrites an app JSON file. Only a file carrying the app marker is rewritten. If the only file of that
- * name is unmarked (written before v0.4, or not by the app), it is left untouched and a NEW marked file is created
- * next to it — later lookups prefer the marked one (M3).
- */
-async function writeJsonFile(store: DriveStore, folderId: string, name: string, value: unknown): Promise<string> {
-  const existing = await findFile(store, folderId, name)
-  if (existing?.appCreated === true) {
-    await store.updateFileContent(existing.id, jsonBlob(value), JSON_MIME)
-    return existing.id
-  }
-  const created = await store.uploadFile(folderId, name, jsonBlob(value), JSON_MIME)
-  return created.id
 }
 
 // ---------- Settings ----------
@@ -147,8 +113,15 @@ export async function saveSettings(store: DriveStore, modelsFolderId: string, se
 
 export interface IndexData {
   entries: IndexEntry[]
-  /** When the index was last fully rebuilt; undefined for pre-v0.3 index files (→ stale). */
+  /**
+   * When the index was last fully rebuilt; undefined (→ stale) for index files older than this version's schema
+   * (pre-v0.3 bare arrays, v2 files without the quote history).
+   */
   builtAt?: string
+  /** Quote logs of all models, newest first (v3; [] for older index files). */
+  quotes: QuoteSummary[]
+  /** Quotes per customer (v3; [] for older index files). */
+  customers: CustomerQuoteSummary[]
 }
 
 function isIndexEntry(e: unknown): e is IndexEntry {
@@ -158,9 +131,23 @@ function isIndexEntry(e: unknown): e is IndexEntry {
   return x.status === 'needs-slicing' || typeof x.price70 === 'number'
 }
 
+function isQuoteSummary(q: unknown): q is QuoteSummary {
+  if (!q || typeof q !== 'object') return false
+  const x = q as QuoteSummary
+  return (
+    typeof x.folderId === 'string' &&
+    typeof x.fileId === 'string' &&
+    typeof x.date === 'string' &&
+    typeof x.email === 'string' &&
+    typeof x.customerName === 'string' &&
+    typeof x.modelName === 'string' &&
+    typeof x.priceShown === 'number'
+  )
+}
+
 /**
  * Reads the index cache. Returns null (→ caller rebuilds) when it is missing, not valid JSON or malformed.
- * Accepts the pre-v0.3 format (bare array, no builtAt). Drive/network errors are rethrown.
+ * Accepts older formats (bare array; schemaVersion 2) as stale. Drive/network errors are rethrown.
  */
 export async function readIndex(store: DriveStore, modelsFolderId: string): Promise<IndexData | null> {
   const file = await findFile(store, modelsFolderId, INDEX_FILE_NAME)
@@ -172,20 +159,36 @@ export async function readIndex(store: DriveStore, modelsFolderId: string): Prom
     if (e instanceof InvalidJsonError) return null
     throw e
   }
-  if (Array.isArray(raw)) return { entries: raw.filter(isIndexEntry) }
+  if (Array.isArray(raw)) return { entries: raw.filter(isIndexEntry), quotes: [], customers: [] }
   if (raw && typeof raw === 'object' && Array.isArray((raw as IndexFile).entries)) {
     const f = raw as IndexFile
-    return { entries: f.entries.filter(isIndexEntry), builtAt: typeof f.builtAt === 'string' ? f.builtAt : undefined }
+    const entries = f.entries.filter(isIndexEntry)
+    if (f.schemaVersion !== INDEX_SCHEMA_VERSION) return { entries, quotes: [], customers: [] }
+    const quotes = Array.isArray(f.quotes) ? f.quotes.filter(isQuoteSummary) : []
+    return { entries, builtAt: typeof f.builtAt === 'string' ? f.builtAt : undefined, quotes, customers: summariseQuotes(quotes) }
   }
   return null
 }
 
-async function writeIndex(store: DriveStore, modelsFolderId: string, entries: IndexEntry[], builtAt: string): Promise<void> {
-  const file: IndexFile = { schemaVersion: 2, builtAt, entries: sortIndex(entries) }
+async function writeIndex(
+  store: DriveStore,
+  modelsFolderId: string,
+  entries: IndexEntry[],
+  builtAt: string,
+  quotes: QuoteSummary[],
+): Promise<void> {
+  const sortedQuotes = [...quotes].sort(byDateDesc)
+  const file: IndexFile = {
+    schemaVersion: INDEX_SCHEMA_VERSION,
+    builtAt,
+    entries: sortIndex(entries),
+    quotes: sortedQuotes,
+    customers: summariseQuotes(sortedQuotes),
+  }
   await writeJsonFile(store, modelsFolderId, INDEX_FILE_NAME, file)
 }
 
-/** True when the index was never fully rebuilt by v0.3 or is older than 10 minutes (N5). */
+/** True when the index was never fully rebuilt by this version or is older than 10 minutes (N5). */
 export function isIndexStale(builtAt: string | undefined, now: Date = new Date()): boolean {
   if (!builtAt) return true
   const t = Date.parse(builtAt)
@@ -197,60 +200,112 @@ export interface RebuildResult {
   entries: IndexEntry[]
   /** Folders whose bid.json could not be read (skipped, not shown). */
   skipped: string[]
+  /** Quote logs of all models, newest first (v0.6 E4). */
+  quotes: QuoteSummary[]
+  customers: CustomerQuoteSummary[]
+  /** Quote log files that are not valid quote logs (left out of the customer history). */
+  skippedQuotes: string[]
 }
 
-type FolderScan = { entry: IndexEntry } | { skipped: string } | null
+type FolderScan = { entry?: IndexEntry; skipped?: string; quotesFolder?: DriveFile } | null
+
+/** Cover chosen in `_rubedo-model.json`, if it is still one of the folder's pictures. A damaged file is ignored here. */
+async function metaCover(store: DriveStore, contents: FolderContents): Promise<string | undefined> {
+  if (!contents.metaFile) return undefined
+  try {
+    const meta = await readModelMeta(store, contents.metaFile)
+    return meta.coverFileId && contents.images.some((i) => i.id === meta.coverFileId) ? meta.coverFileId : undefined
+  } catch (e) {
+    // The model page shows the problem; the library falls back to the default cover rule.
+    if (e instanceof InvalidModelMetaError) return undefined
+    throw e
+  }
+}
+
+/** Library card of a folder without bid.json (N1); `chosenCover` from `_rubedo-model.json` (v0.6 E2). */
+function needsSlicingEntry(folder: DriveFile, contents: FolderContents, chosenCover?: string): IndexEntry {
+  const entry: IndexEntry = {
+    id: folder.id,
+    name: folder.name.trim(),
+    status: 'needs-slicing',
+    revision: '',
+    coverFileId: pickCover(contents.images, chosenCover),
+    updatedAt: folder.modifiedTime ?? '',
+  }
+  if (!entry.coverFileId) delete entry.coverFileId
+  if (contents.sliced[0]) entry.slicedFileId = contents.sliced[0].id
+  return entry
+}
 
 async function scanModelFolder(store: DriveStore, folder: DriveFile): Promise<FolderScan> {
-  const contents = classifyFolder(await store.listChildren(folder.id))
+  const children = await store.listChildren(folder.id)
+  const contents = classifyFolder(children)
+  const quotesFolder = findQuotesFolder(children)
+  const withQuotes = (scan: { entry?: IndexEntry; skipped?: string }): FolderScan => (quotesFolder ? { ...scan, quotesFolder } : scan)
   if (!contents.bidFile) {
     // A folder the app created but never finished (save failed before bid.json) is not a model (brief §5).
     if (folder.appCreated === true) return null
-    const entry: IndexEntry = {
-      id: folder.id,
-      name: folder.name.trim(),
-      status: 'needs-slicing',
-      revision: '',
-      coverFileId: pickCover(contents.images),
-      updatedAt: folder.modifiedTime ?? '',
-    }
-    if (!entry.coverFileId) delete entry.coverFileId
-    if (contents.sliced[0]) entry.slicedFileId = contents.sliced[0].id
-    return { entry }
+    return withQuotes({ entry: needsSlicingEntry(folder, contents, await metaCover(store, contents)) })
   }
   let raw: unknown
   try {
     raw = await readJson(store, contents.bidFile.id, BID_FILE_NAME)
   } catch (e) {
-    if (e instanceof InvalidJsonError) return { skipped: folder.name }
+    if (e instanceof InvalidJsonError) return withQuotes({ skipped: folder.name })
     throw e
   }
   const bid = parseBid(raw)
-  if (!bid) return { skipped: folder.name }
+  if (!bid) return withQuotes({ skipped: folder.name })
   const entry = indexEntryFromBid(folder.id, bid)
   entry.coverFileId = pickCover(contents.images, bid.coverFileId)
   if (!entry.coverFileId) delete entry.coverFileId
-  return { entry }
+  return withQuotes({ entry })
+}
+
+/** Reads every quote log of the given model folders (listing and reading both concurrency-limited). */
+async function scanQuoteLogs(
+  store: DriveStore,
+  folders: { folder: DriveFile; quotesFolder: DriveFile }[],
+): Promise<{ quotes: QuoteSummary[]; skipped: string[] }> {
+  const listed = await mapLimit(folders, FOLDER_SCAN_CONCURRENCY, async ({ folder, quotesFolder }) =>
+    (await store.listChildren(quotesFolder.id))
+      .filter((f) => f.mimeType !== FOLDER_MIME && isQuoteLogName(f.name))
+      .map((file) => ({ file, model: { folderId: folder.id, folderName: folder.name.trim() } })),
+  )
+  const logs = listed.flat()
+  const read = await mapLimit(logs, FOLDER_SCAN_CONCURRENCY, (l) => readQuoteSummary(store, l.file, l.model))
+  const quotes: QuoteSummary[] = []
+  const skipped: string[] = []
+  read.forEach((q, i) => {
+    if (q) quotes.push(q)
+    else skipped.push(`${logs[i].model.folderName}/${logs[i].file.name}`)
+  })
+  return { quotes: quotes.sort(byDateDesc), skipped }
 }
 
 /**
  * Rebuilds the index from every direct subfolder of the models folder (brief v0.3 N1): folders with bid.json →
  * priced; folders without → needs-slicing. Skips "_…" and "Models photo". Folders whose bid.json is corrupt are
- * reported in `skipped`. Any Drive error aborts the rebuild WITHOUT writing the index. Only reads model folders.
+ * reported in `skipped`. Also collects the quote logs of every model (v0.6 E4 customer history).
+ * Any Drive error aborts the rebuild WITHOUT writing the index. Only reads model folders.
  */
 export async function rebuildIndex(store: DriveStore, modelsFolderId: string, now: Date = new Date()): Promise<RebuildResult> {
+  quotesChanged.set(store, false)
   const folders = (await store.listChildren(modelsFolderId, { foldersOnly: true })).filter((f) => !isSkippedFolderName(f.name))
   const scans = await mapLimit(folders, FOLDER_SCAN_CONCURRENCY, (f) => scanModelFolder(store, f))
   const entries: IndexEntry[] = []
   const skipped: string[] = []
-  for (const s of scans) {
-    if (!s) continue
-    if ('entry' in s) entries.push(s.entry)
-    else skipped.push(s.skipped)
-  }
+  const withLogs: { folder: DriveFile; quotesFolder: DriveFile }[] = []
+  scans.forEach((s, i) => {
+    if (!s) return
+    if (s.entry) entries.push(s.entry)
+    if (s.skipped) skipped.push(s.skipped)
+    if (s.quotesFolder) withLogs.push({ folder: folders[i], quotesFolder: s.quotesFolder })
+  })
+  const logs = await scanQuoteLogs(store, withLogs)
   const sorted = sortIndex(entries)
-  await writeIndex(store, modelsFolderId, sorted, now.toISOString())
-  return { entries: sorted, skipped }
+  await writeIndex(store, modelsFolderId, sorted, now.toISOString(), logs.quotes)
+  return { entries: sorted, skipped, quotes: logs.quotes, customers: summariseQuotes(logs.quotes), skippedQuotes: logs.skipped }
 }
 
 /** Library entries (newest first). Rebuilds the index if it does not exist yet. */
@@ -258,18 +313,55 @@ export async function loadLibrary(store: DriveStore, modelsFolderId: string): Pr
   return (await loadLibraryState(store, modelsFolderId)).entries
 }
 
-/** Library entries plus whether the cached index is stale (→ the Library refreshes once, N5). */
+/** Library entries + quote history, plus whether the cached index is stale (→ the caller refreshes once, N5). */
 export async function loadLibraryState(
   store: DriveStore,
   modelsFolderId: string,
   now: Date = new Date(),
-): Promise<{ entries: IndexEntry[]; stale: boolean; rebuilt?: RebuildResult }> {
+): Promise<{ entries: IndexEntry[]; quotes: QuoteSummary[]; stale: boolean; rebuilt?: RebuildResult }> {
   const index = await readIndex(store, modelsFolderId)
   if (index === null) {
     const rebuilt = await rebuildIndex(store, modelsFolderId, now)
-    return { entries: rebuilt.entries, stale: false, rebuilt }
+    return { entries: rebuilt.entries, quotes: rebuilt.quotes, stale: false, rebuilt }
   }
-  return { entries: sortIndex(index.entries), stale: isIndexStale(index.builtAt, now) }
+  return { entries: sortIndex(index.entries), quotes: index.quotes, stale: isIndexStale(index.builtAt, now) }
+}
+
+/**
+ * Stores whose quote logs changed in this browser session since the last rebuild (a quote was just written).
+ * Kept in memory only — writing a quote never touches the index — so the customer pages rebuild once on open.
+ */
+const quotesChanged = new WeakMap<DriveStore, boolean>()
+
+/** Called after a quote log was written: the cached quote history is out of date. */
+export function markQuotesChanged(store: DriveStore): void {
+  quotesChanged.set(store, true)
+}
+
+export interface QuoteHistory {
+  entries: IndexEntry[]
+  quotes: QuoteSummary[]
+  /** Quote logs that could not be read (only known after a rebuild). */
+  skippedQuotes: string[]
+}
+
+/**
+ * Customer history (v0.6 E4): the quote logs of every model, from the index cache. Rebuilt when asked (`refresh`),
+ * when the cache is missing/stale/older than this version, or when a quote was written in this session.
+ */
+export async function loadQuoteHistory(
+  store: DriveStore,
+  modelsFolderId: string,
+  options: { refresh?: boolean; now?: Date } = {},
+): Promise<QuoteHistory> {
+  const now = options.now ?? new Date()
+  if (!options.refresh) {
+    const state = await loadLibraryState(store, modelsFolderId, now)
+    if (state.rebuilt) return { entries: state.entries, quotes: state.quotes, skippedQuotes: state.rebuilt.skippedQuotes }
+    if (!state.stale && quotesChanged.get(store) !== true) return { entries: state.entries, quotes: state.quotes, skippedQuotes: [] }
+  }
+  const r = await rebuildIndex(store, modelsFolderId, now)
+  return { entries: r.entries, quotes: r.quotes, skippedQuotes: r.skippedQuotes }
 }
 
 async function upsertIndexEntry(store: DriveStore, modelsFolderId: string, entry: IndexEntry): Promise<void> {
@@ -282,8 +374,8 @@ async function upsertIndexEntry(store: DriveStore, modelsFolderId: string, entry
   // Replaces any entry of the same folder (e.g. a needs-slicing card that just got its bid).
   const next = index.entries.filter((e) => e.id !== entry.id)
   next.push(entry)
-  // Keep the original build time: an upsert is not a full rebuild (legacy index → still stale → rebuilt on open).
-  await writeIndex(store, modelsFolderId, next, index.builtAt ?? new Date(0).toISOString())
+  // Keep the original build time: an upsert is not a full rebuild (older index → still stale → rebuilt on open).
+  await writeIndex(store, modelsFolderId, next, index.builtAt ?? new Date(0).toISOString(), index.quotes)
 }
 
 // ---------- Model folder (page) ----------
@@ -293,12 +385,20 @@ export interface ModelFolder {
   contents: FolderContents
   /** Present when the folder has a valid bid.json. */
   bid?: Bid
-  /** The bid.json shown has no app marker (saved before v0.4): read-only, can only be re-created (I2). */
+  /** The bid.json shown has no app marker (saved before v0.4): read-only, can only be converted (E1). */
   legacyBid?: boolean
+  /** v0.6: `_rubedo-model.json` of a folder WITHOUT bid.json (cover + description). */
+  meta?: ModelMeta
+  /** The meta file exists but could not be used (Hebrew); the page shows it, cover/description fall back. */
+  metaError?: string
 }
 
 /** Shown on bids saved before v0.4 (bid.json without the app marker). */
-export const LEGACY_BID_MESSAGE = 'הצעה זו נשמרה בגרסה ישנה — לא ניתן לערוך. אפשר ליצור הצעה חדשה מהתיקייה.'
+export const LEGACY_BID_MESSAGE =
+  'הצעה זו נשמרה בגרסה ישנה ולכן אינה ניתנת לעריכה. אפשר להמיר אותה להצעה ניתנת לעריכה — הקובץ הישן יישאר כפי שהוא.'
+
+/** E1: the action that turns a pre-v0.4 (read-only) bid into an editable one (= the "create again" flow, prefilled). */
+export const CONVERT_LEGACY_LABEL = 'המר להצעה ניתנת לעריכה'
 
 /**
  * Everything the model page shows (N3/N4): the folder, all its files and its bid (if any). Read-only.
@@ -307,10 +407,25 @@ export const LEGACY_BID_MESSAGE = 'הצעה זו נשמרה בגרסה ישנה 
 export async function loadModelFolder(store: DriveStore, folderId: string): Promise<ModelFolder> {
   const [folder, children] = await Promise.all([store.getFile(folderId), store.listChildren(folderId)])
   const contents = classifyFolder(children)
-  if (!contents.bidFile) return { folder, contents }
+  if (!contents.bidFile) {
+    if (!contents.metaFile) return { folder, contents }
+    try {
+      return { folder, contents, meta: await readModelMeta(store, contents.metaFile) }
+    } catch (e) {
+      if (e instanceof InvalidModelMetaError) return { folder, contents, metaError: e.userMessage }
+      throw e
+    }
+  }
   const bid = parseBid(await readJson(store, contents.bidFile.id, BID_FILE_NAME))
   if (!bid) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
   return { folder, contents, bid, ...(contents.bidFile.appCreated === true ? {} : { legacyBid: true }) }
+}
+
+/** The cover the model page / library show: the chosen one (bid or `_rubedo-model.json`) if still in the folder, else the default rule. */
+export function displayCover(model: Pick<ModelFolder, 'contents' | 'bid' | 'meta'>): string | undefined {
+  const chosen = model.bid?.coverFileId ?? model.meta?.coverFileId
+  if (chosen && (model.bid || model.contents.images.some((i) => i.id === chosen))) return chosen
+  return pickCover(model.contents.images)
 }
 
 // ---------- Existing model folder check (I4) ----------
@@ -406,6 +521,11 @@ export interface SaveNewParams {
   content: BidContent
   /** Files in display order; the first image becomes the cover. */
   files: LocalFile[]
+  /**
+   * Existing-folder saves only: a cover already chosen for this folder (v0.6 — `_rubedo-model.json`, or the cover of
+   * a pre-v0.4 bid being converted). Wins over the uploads.
+   */
+  coverFileId?: string
   now?: Date
 }
 
@@ -451,7 +571,9 @@ export async function saveNewBid(
     files,
     // In an existing folder a plate picture must not hide the Founder's own photos: no explicit cover then,
     // so the cover rule (first photo by name, else plate picture) applies (N3).
-    coverFileId: params.existingFolderId ? firstImage(uploadedFiles.filter((f) => !isPlatePictureName(f.name))) : firstImage(files),
+    coverFileId: params.existingFolderId
+      ? (params.coverFileId ?? firstImage(uploadedFiles.filter((f) => !isPlatePictureName(f.name))))
+      : firstImage(files),
   }
   if (!bid.coverFileId) delete bid.coverFileId
 
@@ -477,6 +599,10 @@ export interface UpdateParams {
   content: BidContent
   /** Newly added files only (existing ones stay as they are). */
   newFiles: LocalFile[]
+  /** v0.6 E2: set this picture (already in the folder) as the cover. */
+  coverFileId?: string
+  /** v0.6 E2: the new upload with this key becomes the cover ("upload a new photo as cover"). */
+  coverFromNewFileKey?: string
   now?: Date
 }
 
@@ -488,6 +614,7 @@ export async function updateBid(
   session: SaveSession,
 ): Promise<Bid> {
   const { folderId, existing } = params
+  assertDescriptionLength(params.content.description)
   // Checked before anything is written: a pre-v0.4 bid.json (no marker) is read-only (I2).
   const bidFile = await findFile(store, folderId, BID_FILE_NAME)
   if (!bidFile) throw new DriveError('bid.json missing', 'לא נמצא קובץ bid.json בתיקיית הדגם.', 404)
@@ -508,7 +635,11 @@ export async function updateBid(
     files,
     // I3: a bid without an explicit cover never gets a plate picture forced on it as its permanent cover — the cover
     // rule (folder photos first, plate picture last) keeps applying. A newly added photo does become the cover.
-    coverFileId: existing.coverFileId ?? firstImage(newUploads.filter((f) => !isPlatePictureName(f.name))),
+    coverFileId:
+      (params.coverFromNewFileKey ? session.uploaded[params.coverFromNewFileKey]?.id : undefined) ??
+      params.coverFileId ??
+      existing.coverFileId ??
+      firstImage(newUploads.filter((f) => !isPlatePictureName(f.name))),
   }
   if (!bid.coverFileId) delete bid.coverFileId
 
@@ -522,4 +653,120 @@ export async function updateBid(
   }
   await upsertIndexEntry(store, modelsFolderId, entry)
   return bid
+}
+
+// ---------- Cover & description from the model page (v0.6 E2/E3) ----------
+
+/** The bid.json fields the form controls, taken from a saved bid (nothing recalculated: result + snapshot kept). */
+export function bidContentOf(bid: Bid): BidContent {
+  return {
+    name: bid.name,
+    revision: bid.revision,
+    description: bid.description,
+    material: { ...bid.material },
+    parts: bid.parts.map((p) => ({ ...p })),
+    laborMinutes: bid.laborMinutes,
+    hardware: bid.hardware.map((h) => ({ ...h })),
+    hasShipping: bid.hasShipping,
+    packaging: bid.packaging.map((l) => ({ ...l })),
+    shippingCost: bid.shippingCost,
+    settingsSnapshot: { ...bid.settingsSnapshot },
+    result: { ...bid.result },
+  }
+}
+
+export const NOT_A_FOLDER_IMAGE_MESSAGE = 'התמונה הזו אינה נמצאת בתיקיית הדגם.'
+
+function assertNotLegacy(model: ModelFolder): void {
+  if (model.bid && model.legacyBid) throw new DriveError('legacy bid.json is read-only', LEGACY_BID_MESSAGE, 403)
+}
+
+/** After a `_rubedo-model.json` change: the folder's library card shows the chosen cover (AC34). */
+async function refreshNeedsSlicingEntry(store: DriveStore, modelsFolderId: string, model: ModelFolder, cover?: string): Promise<void> {
+  const contents = classifyFolder(await store.listChildren(model.folder.id))
+  const chosen = cover && contents.images.some((i) => i.id === cover) ? cover : undefined
+  await upsertIndexEntry(store, modelsFolderId, needsSlicingEntry(model.folder, contents, chosen))
+}
+
+/**
+ * "קבע כתמונה ראשית": priced (marked) bid → coverFileId in bid.json via updateBid (snapshot kept);
+ * folder without bid.json → `_rubedo-model.json`. Both update the library card. A pre-v0.4 bid is read-only.
+ */
+export async function setModelCover(
+  store: DriveStore,
+  modelsFolderId: string,
+  model: ModelFolder,
+  fileId: string,
+  now: Date = new Date(),
+): Promise<void> {
+  assertNotLegacy(model)
+  if (!model.contents.images.some((i) => i.id === fileId)) throw new DriveError('not an image of the folder', NOT_A_FOLDER_IMAGE_MESSAGE, 400)
+  const folderId = model.folder.id
+  if (model.bid) {
+    await updateBid(
+      store,
+      modelsFolderId,
+      { folderId, existing: model.bid, content: bidContentOf(model.bid), newFiles: [], coverFileId: fileId, now },
+      newSaveSession(),
+    )
+    return
+  }
+  await writeModelMeta(store, folderId, model.meta ?? null, { coverFileId: fileId }, now)
+  await refreshNeedsSlicingEntry(store, modelsFolderId, model, fileId)
+}
+
+/**
+ * "העלה תמונה חדשה כראשית": uploads the picture INTO the model folder (a new marked file), then sets it as the cover
+ * as setModelCover does. Keep `session` between retries: an uploaded picture is not uploaded twice.
+ */
+export async function uploadModelCover(
+  store: DriveStore,
+  modelsFolderId: string,
+  model: ModelFolder,
+  file: LocalFile,
+  session: SaveSession,
+  now: Date = new Date(),
+): Promise<string> {
+  assertNotLegacy(model)
+  const folderId = model.folder.id
+  if (model.bid) {
+    const bid = await updateBid(
+      store,
+      modelsFolderId,
+      { folderId, existing: model.bid, content: bidContentOf(model.bid), newFiles: [file], coverFromNewFileKey: file.key, now },
+      session,
+    )
+    return bid.coverFileId as string
+  }
+  await uploadMissing(store, folderId, [file], session)
+  const coverId = session.uploaded[file.key].id
+  await writeModelMeta(store, folderId, model.meta ?? null, { coverFileId: coverId }, now)
+  await refreshNeedsSlicingEntry(store, modelsFolderId, model, coverId)
+  return coverId
+}
+
+/**
+ * Inline description edit (E3), max 2000 characters: priced (marked) bid → bid.json via updateBid (snapshot kept);
+ * folder without bid.json → `_rubedo-model.json`. A pre-v0.4 bid is read-only.
+ */
+export async function setModelDescription(
+  store: DriveStore,
+  modelsFolderId: string,
+  model: ModelFolder,
+  description: string,
+  now: Date = new Date(),
+): Promise<void> {
+  assertNotLegacy(model)
+  const text = description.trim()
+  assertDescriptionLength(text)
+  if (model.bid) {
+    await updateBid(
+      store,
+      modelsFolderId,
+      { folderId: model.folder.id, existing: model.bid, content: { ...bidContentOf(model.bid), description: text }, newFiles: [], now },
+      newSaveSession(),
+    )
+    return
+  }
+  await writeModelMeta(store, model.folder.id, model.meta ?? null, { description: text }, now)
 }

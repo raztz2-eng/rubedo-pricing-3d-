@@ -1,4 +1,4 @@
-import type { Bid, BidFile, Material, PartSource } from './bid'
+import { DESCRIPTION_MAX_LENGTH, type Bid, type BidFile, type Material, type PartSource } from './bid'
 import type { BidContent, LocalFile } from './drive/bidRepository'
 import { formatNumber, isValidAmount, parseNumber } from './format'
 import type { PricingInput, PricingSettings } from './pricing'
@@ -59,6 +59,11 @@ export interface BidDraft {
   files: FileDraft[]
   /** Files already stored with the bid (edit mode). */
   existingFiles: BidFile[]
+  /**
+   * A cover already chosen for this model (v0.6): kept when a pre-v0.4 bid is converted, or taken from
+   * `_rubedo-model.json` when a bid is created from a folder without bid.json.
+   */
+  coverFileId?: string
 }
 
 let keySeq = 0
@@ -135,6 +140,7 @@ export function invalidFields(d: BidDraft): string[] {
     check(`חומרה ${i + 1} — כמות`, l.qty)
     check(`חומרה ${i + 1} — מחיר`, l.unitCost)
   })
+  if (d.description.trim().length > DESCRIPTION_MAX_LENGTH) bad.push(`תיאור (עד ${DESCRIPTION_MAX_LENGTH} תווים)`)
   if (d.hasShipping) {
     d.packaging.forEach((l, i) => {
       check(`אריזה ${i + 1} — כמות`, l.qty)
@@ -243,6 +249,7 @@ export function bidToDraft(bid: Bid): BidDraft {
     shippingCost: String(bid.shippingCost),
     files: [],
     existingFiles: bid.files,
+    ...(bid.coverFileId ? { coverFileId: bid.coverFileId } : {}),
   }
 }
 
@@ -329,8 +336,15 @@ export function draftFromFolder(
   folderName: string,
   materials: Material[],
   sliced?: { file: BidFile; info: SlicedFileInfo },
+  meta?: { description?: string; coverFileId?: string },
 ): BidDraft {
-  const d: BidDraft = { ...emptyDraft(materials), name: folderName.trim() }
+  // v0.6 E3: cover + description saved in `_rubedo-model.json` prefill the bid.
+  const d: BidDraft = {
+    ...emptyDraft(materials),
+    name: folderName.trim(),
+    description: meta?.description ?? '',
+    ...(meta?.coverFileId ? { coverFileId: meta.coverFileId } : {}),
+  }
   if (!sliced) return d
   return {
     ...d,

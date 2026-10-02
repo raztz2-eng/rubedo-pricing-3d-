@@ -47,7 +47,7 @@ interface FieldProps {
   hint?: string
   /** Text direction of the input; number fields are always LTR. */
   dir?: 'ltr' | 'rtl'
-  inputMode?: 'text' | 'email' | 'decimal'
+  inputMode?: 'text' | 'email' | 'decimal' | 'tel'
   autoComplete?: string
 }
 

@@ -1,9 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams, useSearchParams } from 'react-router-dom'
+import { CustomerPicker } from '../components/CustomerPicker'
 import { DriveImage } from '../components/DriveImage'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
 import { ErrorBox, Field, Money, Notice, Spinner } from '../components/ui'
-import { loadModelFolder, type ModelFolder } from '../lib/drive/bidRepository'
+import { newId } from '../lib/bid'
+import { findByEmail, type Customer } from '../lib/customers'
+import { loadModelFolder, markQuotesChanged, type ModelFolder } from '../lib/drive/bidRepository'
+import { ensureQuoteCustomer, loadCustomers } from '../lib/drive/customerStore'
 import { pickCover } from '../lib/drive/folderContents'
 import { writeQuoteLog } from '../lib/drive/quoteLog'
 import type { DriveFile } from '../lib/drive/types'
@@ -44,10 +48,13 @@ export const NOT_CREATED_MESSAGE = 'לא נוצרה טיוטה ולא נרשם �
 /** "שליחת הצעת מחיר" (brief v0.5 Q3): builds a Gmail DRAFT — the Founder presses Send in Gmail himself. */
 export function QuotePageRoute() {
   const { id = '' } = useParams()
-  return <RequireDrive>{(ctx) => <QuoteLoader key={id} ctx={ctx} folderId={id} />}</RequireDrive>
+  // v0.6 E4: "/model/:id/quote?customer=<id>" (from a customer page) prefills that customer.
+  const [params] = useSearchParams()
+  const customerId = params.get('customer') ?? undefined
+  return <RequireDrive>{(ctx) => <QuoteLoader key={id} ctx={ctx} folderId={id} initialCustomerId={customerId} />}</RequireDrive>
 }
 
-function QuoteLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
+function QuoteLoader({ ctx, folderId, initialCustomerId }: { ctx: DriveContext; folderId: string; initialCustomerId?: string }) {
   const [data, setData] = useState<ModelFolder | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [tick, setTick] = useState(0)
@@ -78,12 +85,32 @@ function QuoteLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string })
       </ErrorBox>
     )
   }
-  return <QuoteForm ctx={ctx} folderId={folderId} data={data as ModelFolder & { bid: NonNullable<ModelFolder['bid']> }} />
+  return (
+    <QuoteForm
+      ctx={ctx}
+      folderId={folderId}
+      data={data as ModelFolder & { bid: NonNullable<ModelFolder['bid']> }}
+      initialCustomerId={initialCustomerId}
+    />
+  )
 }
 
-type Phase = 'idle' | 'attachments' | 'draft' | 'log'
+type Phase = 'idle' | 'attachments' | 'draft' | 'log' | 'customer'
 
-function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: string; data: ModelFolder & { bid: NonNullable<ModelFolder['bid']> } }) {
+/** Result of saving the quote's customer to the customers list (after the draft; never blocks it). */
+type CustomerNotice = { tone: 'info' | 'warn'; text: string; retry?: QuoteRecord }
+
+function QuoteForm({
+  ctx,
+  folderId,
+  data,
+  initialCustomerId,
+}: {
+  ctx: DriveContext
+  folderId: string
+  data: ModelFolder & { bid: NonNullable<ModelFolder['bid']> }
+  initialCustomerId?: string
+}) {
   const { services, grantedScopes, requestExtraPermission, recheckPermissions, accountEmail, markSessionLost } = useApp()
   const { bid, contents } = data
   const images = contents.images
@@ -111,6 +138,33 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
   /** The draft exists but the quote log could not be written yet (retry writes only the log). */
   const [pendingLog, setPendingLog] = useState<QuoteRecord | null>(null)
   const [logName, setLogName] = useState<string | null>(null)
+  /** v0.6 E4: the customers list (null while loading). A failure leaves the screen fully usable. */
+  const [customers, setCustomers] = useState<Customer[] | null>(null)
+  const [customersError, setCustomersError] = useState<string | null>(null)
+  const [prefillMissing, setPrefillMissing] = useState(false)
+  const [customerNotice, setCustomerNotice] = useState<CustomerNotice | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    loadCustomers(ctx.drive, ctx.folderId)
+      .then((list) => {
+        if (cancelled) return
+        setCustomers(list)
+        if (!initialCustomerId) return
+        const c = list.find((x) => x.id === initialCustomerId)
+        if (c) {
+          setCustomerName(c.name)
+          setCustomerEmail(c.email)
+        } else setPrefillMissing(true)
+      })
+      .catch((e: unknown) => {
+        logError('load customers', e)
+        if (!cancelled) setCustomersError(errorMessage(e, 'טעינת רשימת הלקוחות נכשלה.'))
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [ctx.drive, ctx.folderId, initialCustomerId])
 
   const result = useMemo(() => quotePrice(bid, included), [bid, included])
   const autoPrice = defaultCustomerPrice(result.price70)
@@ -165,12 +219,41 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
   const busy = phase !== 'idle'
   const selectedFiles: DriveFile[] = images.filter((f) => selected.has(f.id))
 
+  /**
+   * v0.6 E4: only after the draft exists AND its log is written — a new e-mail joins the customers list; an e-mail
+   * already there keeps its stored name. A failure here is a notice only: the draft has succeeded.
+   */
+  const saveCustomer = async (record: QuoteRecord) => {
+    setPhase('customer')
+    try {
+      const r = await ensureQuoteCustomer(ctx.drive, ctx.folderId, record.customer, record.customerId)
+      if (r.created) {
+        setCustomers((list) => (list ? [...list, r.customer] : list))
+        setCustomerNotice({ tone: 'info', text: `${r.customer.name} נוסף/ה לרשימת הלקוחות.` })
+      } else if (r.storedNameDiffers) {
+        setCustomerNotice({
+          tone: 'info',
+          text: `המייל ${r.customer.email} כבר שמור ברשימת הלקוחות בשם „${r.customer.name}” — השם השמור לא שונה.`,
+        })
+      } else setCustomerNotice(null)
+    } catch (e) {
+      logError('save quote customer', e)
+      setCustomerNotice({
+        tone: 'warn',
+        text: `הטיוטה נוצרה וההצעה נרשמה, אבל שמירת הלקוח ברשימת הלקוחות נכשלה: ${errorMessage(e, 'שגיאה ב-Drive.')}`,
+        retry: record,
+      })
+    }
+  }
+
   const writeLog = async (record: QuoteRecord) => {
     setPhase('log')
     try {
       const written = await writeQuoteLog(ctx.drive, folderId, record)
       setLogName(written.name)
       setPendingLog(null)
+      markQuotesChanged(ctx.drive)
+      await saveCustomer(record)
     } catch (e) {
       logError('write quote log', e)
       setPendingLog(record)
@@ -178,6 +261,12 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
     } finally {
       setPhase('idle')
     }
+  }
+
+  const retryCustomer = async (record: QuoteRecord) => {
+    setCustomerNotice(null)
+    await saveCustomer(record)
+    setPhase('idle')
   }
 
   const onCreate = async () => {
@@ -213,6 +302,8 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
       return
     }
     setDraft(created)
+    // The log names the customer: a known e-mail → that customer; a new one → the id the customer gets after the draft.
+    const customerId = (customers ? findByEmail(customers, customerEmail)?.id : undefined) ?? newId()
     // Q4: the log is written only after the draft exists.
     await writeLog(
       buildQuoteRecord({
@@ -225,6 +316,7 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
         draftId: created.draftId,
         attachments: attachmentNames,
         now: new Date(),
+        customerId,
       }),
     )
   }
@@ -234,6 +326,7 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
     setPendingLog(null)
     setLogName(null)
     setError(null)
+    setCustomerNotice(null)
   }
 
   const toggleImage = (id: string, on: boolean) =>
@@ -308,6 +401,25 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
 
           <section className="card flex flex-col gap-3" aria-label="פרטי הלקוח">
             <h2 className="section-title">פרטי הלקוח</h2>
+            <CustomerPicker
+              customers={customers ?? []}
+              disabled={busy}
+              onPick={(c) => {
+                setCustomerName(c.name)
+                setCustomerEmail(c.email)
+                setPrefillMissing(false)
+              }}
+            />
+            {customersError && (
+              <p role="status" className="text-xs text-amber-800">
+                {customersError} אפשר להמשיך ולהזין את פרטי הלקוח ידנית.
+              </p>
+            )}
+            {prefillMissing && (
+              <p role="status" className="text-xs text-amber-800">
+                הלקוח שנבחר לא נמצא ברשימת הלקוחות — הזינו את פרטיו ידנית.
+              </p>
+            )}
             <Field label="שם הלקוח" required value={customerName} onChange={setCustomerName} />
             <Field
               label="מייל הלקוח"
@@ -446,6 +558,11 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
               <p className="font-semibold">הטיוטה נוצרה ב-Gmail.</p>
               <p>פתחו את תיקיית הטיוטות, בדקו את המייל ולחצו „שליחה” ב-Gmail.</p>
               {logName && <p className="text-xs">ההצעה נרשמה בתיקיית הדגם (quotes/{logName}).</p>}
+              {customerNotice?.tone === 'info' && (
+                <p className="text-xs" data-testid="customer-notice">
+                  {customerNotice.text}
+                </p>
+              )}
               <a className="btn btn-primary" href={GMAIL_DRAFTS_URL} target="_blank" rel="noreferrer">
                 פתיחת הטיוטות ב-Gmail
               </a>
@@ -460,7 +577,7 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
               onClick={() => void onCreate()}
               disabled={busy || !gmailGranted || !!draft || priceBlock !== null}
             >
-              {phase === 'attachments' ? 'מכין תמונות…' : phase === 'draft' ? 'יוצר טיוטה…' : phase === 'log' ? 'רושם הצעה…' : 'צור טיוטה ב-Gmail'}
+              {phase === 'attachments' ? 'מכין תמונות…' : phase === 'draft' ? 'יוצר טיוטה…' : phase === 'log' || phase === 'customer' ? 'רושם הצעה…' : 'צור טיוטה ב-Gmail'}
             </button>
           )}
           {priceBlock && !draft && (
@@ -478,6 +595,22 @@ function QuoteForm({ ctx, folderId, data }: { ctx: DriveContext; folderId: strin
             </ErrorBox>
           )}
           {error && <ErrorBox onRetry={pendingLog ? () => void writeLog(pendingLog) : undefined}>{error}</ErrorBox>}
+          {customerNotice?.tone === 'warn' && (
+            // Non-blocking: the draft and its log already succeeded.
+            <div role="status" className="flex flex-col items-start gap-2 rounded-lg bg-amber-50 p-3 text-sm text-amber-900" data-testid="customer-notice">
+              <span>{customerNotice.text}</span>
+              {customerNotice.retry && (
+                <button
+                  type="button"
+                  className="btn btn-secondary px-3 py-1"
+                  disabled={busy}
+                  onClick={() => customerNotice.retry && void retryCustomer(customerNotice.retry)}
+                >
+                  שמירת הלקוח שוב
+                </button>
+              )}
+            </div>
+          )}
         </aside>
       </div>
     </div>

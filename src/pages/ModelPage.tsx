@@ -1,12 +1,26 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ChangeEvent } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import { DescriptionField } from '../components/DescriptionField'
 import { DriveImage } from '../components/DriveImage'
 import { createObjectUrlSafe } from '../components/useObjectUrl'
 import { PricePanel } from '../components/PricePanel'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
 import { ErrorBox, Money, Notice, Spinner } from '../components/ui'
-import type { BidLine, HardwareLine } from '../lib/bid'
-import { LEGACY_BID_MESSAGE, loadModelFolder, type ModelFolder } from '../lib/drive/bidRepository'
+import { DESCRIPTION_MAX_LENGTH, type BidLine, type HardwareLine } from '../lib/bid'
+import { newKey } from '../lib/bidForm'
+import {
+  CONVERT_LEGACY_LABEL,
+  displayCover,
+  LEGACY_BID_MESSAGE,
+  loadModelFolder,
+  newSaveSession,
+  setModelCover,
+  setModelDescription,
+  uploadModelCover,
+  type LocalFile,
+  type ModelFolder,
+  type SaveSession,
+} from '../lib/drive/bidRepository'
 import { isGoogleNativeFile } from '../lib/drive/folderContents'
 import type { DriveFile } from '../lib/drive/types'
 import { errorMessage, logError } from '../lib/errors'
@@ -30,7 +44,13 @@ async function downloadDriveFile(ctx: DriveContext, file: { id: string; name: st
   setTimeout(() => URL.revokeObjectURL(url), 10_000)
 }
 
+/** Picture types accepted for "upload a new photo as cover" (same as the bid form). */
+const COVER_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+export const SET_COVER_LABEL = 'קבע כתמונה ראשית'
+export const UPLOAD_COVER_LABEL = 'העלה תמונה חדשה כראשית'
+
 type Loaded = { folderId: string; data: ModelFolder }
+type Action = 'cover' | 'upload' | 'description' | null
 
 function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   const [loaded, setLoaded] = useState<Loaded | null>(null)
@@ -38,6 +58,11 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   const [downloadError, setDownloadError] = useState<string | null>(null)
   const [downloading, setDownloading] = useState<string | null>(null)
   const [tick, setTick] = useState(0)
+  const [action, setAction] = useState<Action>(null)
+  /** Error of a cover/description change, with what "try again" re-runs. */
+  const [actionError, setActionError] = useState<{ folderId: string; message: string; retry?: () => void } | null>(null)
+  const [editingDescription, setEditingDescription] = useState(false)
+  const [descriptionText, setDescriptionText] = useState('')
 
   useEffect(() => {
     let cancelled = false
@@ -57,7 +82,8 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   if (error && error.folderId === folderId) return <ErrorBox onRetry={() => setTick((t) => t + 1)}>{error.message}</ErrorBox>
   if (!loaded || loaded.folderId !== folderId) return <Spinner label="טוען דגם…" />
 
-  const { folder, contents, bid, legacyBid } = loaded.data
+  const model = loaded.data
+  const { folder, contents, bid, legacyBid, meta, metaError } = model
   const slicedIds = new Set([
     ...contents.sliced.map((f) => f.id),
     ...(bid?.files ?? []).filter((f) => f.kind === 'sliced').map((f) => f.id),
@@ -65,6 +91,11 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   // M2: native Google files (Docs, Sheets, …) have no bytes to download — they only get their Drive link.
   const sliced = contents.files.filter((f) => slicedIds.has(f.id) && !isGoogleNativeFile(f))
   const otherFiles = contents.files.filter((f) => !slicedIds.has(f.id))
+  const coverId = displayCover(model)
+  /** Cover and description can change on a marked bid or a folder without bid.json — never on a pre-v0.4 bid. */
+  const editable = !legacyBid
+  const description = bid ? bid.description : (meta?.description ?? '')
+  const currentActionError = actionError && actionError.folderId === folderId ? actionError : null
 
   const download = async (f: DriveFile) => {
     setDownloadError(null)
@@ -79,18 +110,151 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
     }
   }
 
+  /** Runs a change, then reloads the folder. On failure: Hebrew error + "try again" re-runs the same change. */
+  const runAction = async (kind: Exclude<Action, null>, fn: () => Promise<void>, fallback: string): Promise<boolean> => {
+    if (action) return false
+    setAction(kind)
+    setActionError(null)
+    try {
+      await fn()
+      setTick((t) => t + 1)
+      return true
+    } catch (e) {
+      logError(`model page ${kind}`, e)
+      setActionError({ folderId, message: errorMessage(e, fallback), retry: () => void runAction(kind, fn, fallback) })
+      return false
+    } finally {
+      setAction(null)
+    }
+  }
+
+  const chooseCover = (f: DriveFile) =>
+    void runAction('cover', () => setModelCover(ctx.drive, ctx.folderId, model, f.id), 'קביעת התמונה הראשית נכשלה.')
+
+  const onCoverFile = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    if (!COVER_TYPES.includes(file.type)) {
+      setActionError({ folderId, message: `אפשר להעלות רק תמונות jpg / png / webp. לא הועלה: ${file.name}` })
+      return
+    }
+    // "Try again" re-runs with the same session, so a picture that was already uploaded is not uploaded twice.
+    const upload: LocalFile = { key: newKey('cover'), name: file.name, kind: 'image', mimeType: file.type, blob: file }
+    const session: SaveSession = newSaveSession()
+    void runAction('upload', () => uploadModelCover(ctx.drive, ctx.folderId, model, upload, session).then(() => undefined), 'העלאת התמונה נכשלה.')
+  }
+
+  const startDescriptionEdit = () => {
+    setDescriptionText(description)
+    setEditingDescription(true)
+    setActionError(null)
+  }
+
+  const saveDescription = () => {
+    if (descriptionText.trim().length > DESCRIPTION_MAX_LENGTH) return
+    void runAction('description', () => setModelDescription(ctx.drive, ctx.folderId, model, descriptionText), 'שמירת התיאור נכשלה.').then(
+      (ok) => ok && setEditingDescription(false),
+    )
+  }
+
   const title = bid?.name ?? folder.name.trim()
 
-  const gallery = contents.images.length > 0 && (
-    <section className="card" aria-label="תמונות">
-      <h2 className="section-title">תמונות</h2>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-        {contents.images.map((f) => (
-          <a key={f.id} href={ctx.drive.fileUrl(f.id)} target="_blank" rel="noreferrer" title={`${f.name} — פתיחה בגודל מלא ב-Drive`}>
-            <DriveImage drive={ctx.drive} file={f} alt={f.name} className="aspect-square w-full rounded-lg object-cover" />
-          </a>
-        ))}
+  const coverThumb = (
+    <div className="h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-stone-200" data-testid="model-cover" data-file-id={coverId ?? ''}>
+      <DriveImage drive={ctx.drive} fileId={coverId} alt={`${title} — תמונה ראשית`} size={200} className="h-16 w-16 object-cover" />
+    </div>
+  )
+
+  const actionErrorBox = currentActionError && (
+    <ErrorBox onRetry={currentActionError.retry}>{currentActionError.message}</ErrorBox>
+  )
+
+  const descriptionSection = (bid?.description || editable) && (
+    <section className="card flex flex-col gap-2" aria-label="תיאור">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="section-title">תיאור</h2>
+        {editable && !editingDescription && (
+          <button type="button" className="btn btn-ghost px-2 py-1 text-sm" onClick={startDescriptionEdit} aria-label="עריכת תיאור">
+            <span aria-hidden="true">✎</span> עריכה
+          </button>
+        )}
       </div>
+      {editingDescription ? (
+        <div className="flex flex-col gap-2">
+          <DescriptionField label="תיאור הדגם" rows={5} value={descriptionText} onChange={setDescriptionText} autoFocus />
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={saveDescription}
+              disabled={action !== null || descriptionText.trim().length > DESCRIPTION_MAX_LENGTH}
+            >
+              {action === 'description' ? 'שומר…' : 'שמירת תיאור'}
+            </button>
+            <button type="button" className="btn btn-secondary" onClick={() => setEditingDescription(false)} disabled={action === 'description'}>
+              ביטול
+            </button>
+          </div>
+        </div>
+      ) : description ? (
+        <p className="whitespace-pre-wrap text-stone-700" data-testid="model-description">
+          {description}
+        </p>
+      ) : (
+        <p className="text-sm text-stone-500">אין עדיין תיאור.</p>
+      )}
+    </section>
+  )
+
+  const gallery = (contents.images.length > 0 || editable) && (
+    <section className="card flex flex-col gap-2" aria-label="תמונות">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="section-title">תמונות</h2>
+        {editable && (
+          <label className={`btn btn-secondary cursor-pointer text-sm ${action ? 'pointer-events-none opacity-60' : ''}`}>
+            {action === 'upload' ? 'מעלה תמונה…' : UPLOAD_COVER_LABEL}
+            <input
+              type="file"
+              accept={COVER_TYPES.join(',')}
+              className="sr-only"
+              aria-label={UPLOAD_COVER_LABEL}
+              onChange={onCoverFile}
+              disabled={action !== null}
+            />
+          </label>
+        )}
+      </div>
+      {contents.images.length === 0 ? (
+        <p className="text-sm text-stone-500">אין עדיין תמונות בתיקיית הדגם.</p>
+      ) : (
+        <ul className="grid grid-cols-2 gap-2 sm:grid-cols-3" aria-label="תמונות הדגם">
+          {contents.images.map((f) => (
+            <li key={f.id} className="flex flex-col gap-1">
+              <a href={ctx.drive.fileUrl(f.id)} target="_blank" rel="noreferrer" title={`${f.name} — פתיחה בגודל מלא ב-Drive`}>
+                <DriveImage drive={ctx.drive} file={f} alt={f.name} className="aspect-square w-full rounded-lg object-cover" />
+              </a>
+              {f.id === coverId ? (
+                <span className="w-fit rounded-full bg-accent-soft px-2 py-0.5 text-xs font-medium text-accent-dark" data-testid="cover-badge">
+                  תמונה ראשית
+                </span>
+              ) : (
+                editable && (
+                  <button
+                    type="button"
+                    className="w-fit text-xs text-accent underline disabled:opacity-60"
+                    title={f.name}
+                    onClick={() => chooseCover(f)}
+                    disabled={action !== null}
+                  >
+                    {SET_COVER_LABEL}
+                  </button>
+                )
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
     </section>
   )
 
@@ -141,7 +305,8 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
     const found = contents.sliced.length > 0
     return (
       <div className="flex flex-col gap-4">
-        <div className="flex flex-wrap items-start gap-2">
+        <div className="flex flex-wrap items-start gap-3">
+          {coverThumb}
           <div className="me-auto min-w-0">
             <h1 className="text-2xl font-bold">{title}</h1>
             <span
@@ -163,6 +328,9 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
             הקובץ בתיקייה, ואז ללחוץ „צור הצעת מחיר” — או להזין את הנתונים ידנית.
           </Notice>
         )}
+        {metaError && <Notice tone="warn">{metaError}</Notice>}
+        {actionErrorBox}
+        {descriptionSection}
         {gallery}
         {filesSection}
       </div>
@@ -171,7 +339,8 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-start gap-2">
+      <div className="flex flex-wrap items-start gap-3">
+        {coverThumb}
         <div className="me-auto min-w-0">
           <h1 className="text-2xl font-bold">{bid.name}</h1>
           <p className="text-sm text-stone-500">
@@ -180,18 +349,20 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          <Link to={`/model/${encodeURIComponent(folderId)}/quote`} className="btn btn-primary">
-            שליחת הצעת מחיר
-          </Link>
           {legacyBid ? (
-            <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-secondary">
-              צור הצעה מחדש
+            <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
+              {CONVERT_LEGACY_LABEL}
             </Link>
           ) : (
-            <Link to={`/model/${encodeURIComponent(folderId)}/edit`} className="btn btn-secondary">
-              עריכה
+            // Visible label per brief v0.6 E1. The accessible name stays "עריכה" until the acceptance tests that look
+            // the link up by that name are updated (reported as a conflict).
+            <Link to={`/model/${encodeURIComponent(folderId)}/edit`} className="btn btn-primary" aria-label="עריכה" title="עריכת הצעה">
+              <span aria-hidden="true">✎</span> עריכת הצעה
             </Link>
           )}
+          <Link to={`/model/${encodeURIComponent(folderId)}/quote`} className="btn btn-secondary">
+            שליחת הצעת מחיר
+          </Link>
         </div>
       </div>
       {legacyBid && (
@@ -199,15 +370,11 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
           <span data-testid="legacy-bid-notice">{LEGACY_BID_MESSAGE}</span>
         </Notice>
       )}
+      {actionErrorBox}
 
       <div className="grid gap-4 lg:grid-cols-[1fr_320px] lg:items-start">
         <div className="flex min-w-0 flex-col gap-4">
-          {bid.description && (
-            <section className="card">
-              <h2 className="section-title">תיאור</h2>
-              <p className="whitespace-pre-wrap text-stone-700">{bid.description}</p>
-            </section>
-          )}
+          {descriptionSection}
 
           {gallery}
 

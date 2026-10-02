@@ -88,12 +88,47 @@ export function isPriced(e: IndexEntry): boolean {
   return e.status !== 'needs-slicing'
 }
 
-/** Index file content (v0.3). Older files are a bare IndexEntry[] (treated as stale → rebuilt). */
+/**
+ * One quote log (`<model>/quotes/quote-*.json`, v0.5 Q4) as cached in the index (v0.6 E4): enough to list a
+ * customer's quotes without reading every log again.
+ */
+export interface QuoteSummary {
+  /** Model folder ID. */
+  folderId: string
+  modelName: string
+  /** Drive ID of the log file. */
+  fileId: string
+  /** When the draft was created (ISO). */
+  date: string
+  /** v0.6 logs only; older logs are matched to a customer by e-mail. */
+  customerId?: string
+  customerName: string
+  /** Lower-case. */
+  email: string
+  priceShown: number
+}
+
+/** Quotes per customer (v0.6 E4): grouped by customerId when the log has one, else by lower-case e-mail. */
+export interface CustomerQuoteSummary {
+  customerId?: string
+  email: string
+  quoteCount: number
+  lastQuoteAt: string
+}
+
+/** Index schema written by this version. Older index files (bare array, or v2) are read but count as stale. */
+export const INDEX_SCHEMA_VERSION = 3
+
+/** Index file content. Older files: a bare IndexEntry[] (pre-v0.3) or schemaVersion 2 (no quotes) — stale → rebuilt. */
 export interface IndexFile {
-  schemaVersion: 2
+  schemaVersion: 2 | 3
   /** When the index was last fully rebuilt from Drive (ISO). */
   builtAt: string
   entries: IndexEntry[]
+  /** v3: every quote log found in the model folders, newest first. */
+  quotes?: QuoteSummary[]
+  /** v3: summary per customer, derived from `quotes`. */
+  customers?: CustomerQuoteSummary[]
 }
 
 /** The library auto-refreshes once on open when the index is older than this (brief v0.3 N5). */
@@ -122,6 +157,13 @@ export function defaultAppSettings(): AppSettings {
 export const SETTINGS_FILE_NAME = '_rubedo-settings.json'
 export const INDEX_FILE_NAME = '_rubedo-index.json'
 export const BID_FILE_NAME = 'bid.json'
+/** v0.6 E2/E3: cover + description of a model folder WITHOUT bid.json (app-owned, marked). */
+export const MODEL_META_FILE_NAME = '_rubedo-model.json'
+/** v0.6 E4: the customers list in the models folder (app-owned, marked). */
+export const CUSTOMERS_FILE_NAME = '_rubedo-customers.json'
+/** v0.6 E3: maximum length of a model description. */
+export const DESCRIPTION_MAX_LENGTH = 2000
+export const DESCRIPTION_TOO_LONG_MESSAGE = `התיאור ארוך מדי — עד ${DESCRIPTION_MAX_LENGTH} תווים.`
 export const FOLDER_MIME = 'application/vnd.google-apps.folder'
 
 /** Validates/normalises a settings file loaded from Drive. Missing fields fall back to defaults. */

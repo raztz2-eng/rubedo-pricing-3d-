@@ -1,4 +1,4 @@
-import { bidPricingInput, type Bid } from './bid'
+import { bidPricingInput, type Bid, type QuoteSummary } from './bid'
 import { formatMoney } from './format'
 import { computePrice, type PriceResult } from './pricing'
 
@@ -130,6 +130,8 @@ export interface QuoteRecord {
   date: string
   draftId: string
   model: { bidId: string; name: string; revision: string }
+  /** v0.6 E4: the customer in `_rubedo-customers.json`. Logs written before v0.6 have none (matched by e-mail). */
+  customerId?: string
   customer: { name: string; email: string }
   /** Hardware rows included in THIS quote. */
   includedHardware: { name: string; qty: number; unitCost: number }[]
@@ -155,6 +157,7 @@ export function buildQuoteRecord(p: {
   draftId: string
   attachments: string[]
   now: Date
+  customerId?: string
 }): QuoteRecord {
   const record: QuoteRecord = {
     schemaVersion: 1,
@@ -172,7 +175,36 @@ export function buildQuoteRecord(p: {
     attachments: p.attachments,
   }
   if (p.deliveryTime.trim()) record.deliveryTime = p.deliveryTime.trim()
+  if (p.customerId) record.customerId = p.customerId
   return record
+}
+
+/** Lower-case, trimmed e-mail: customers are unique by it and old logs are matched by it (v0.6 E4). */
+export function normaliseEmail(email: string): string {
+  return email.trim().toLowerCase()
+}
+
+/**
+ * The part of a quote log the customer history needs. null when the content is not a quote log (it is then left
+ * out of the history and reported). `folderId` / `fileId` say where the log was found.
+ */
+export function quoteSummaryFromLog(raw: unknown, where: { folderId: string; fileId: string; folderName: string }): QuoteSummary | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Partial<QuoteRecord>
+  if (typeof r.date !== 'string' || !Number.isFinite(Date.parse(r.date))) return null
+  if (!r.customer || typeof r.customer.email !== 'string' || typeof r.customer.name !== 'string') return null
+  if (typeof r.priceShown !== 'number' || !Number.isFinite(r.priceShown)) return null
+  const summary: QuoteSummary = {
+    folderId: where.folderId,
+    modelName: typeof r.model?.name === 'string' && r.model.name.trim() !== '' ? r.model.name : where.folderName,
+    fileId: where.fileId,
+    date: r.date,
+    customerName: r.customer.name,
+    email: normaliseEmail(r.customer.email),
+    priceShown: r.priceShown,
+  }
+  if (typeof r.customerId === 'string' && r.customerId !== '') summary.customerId = r.customerId
+  return summary
 }
 
 function pad(n: number): string {

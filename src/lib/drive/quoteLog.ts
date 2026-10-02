@@ -1,6 +1,7 @@
-import { FOLDER_MIME } from '../bid'
-import { quoteFileName, type QuoteRecord } from '../quote'
-import type { DriveStore } from './types'
+import { FOLDER_MIME, type QuoteSummary } from '../bid'
+import { quoteFileName, quoteSummaryFromLog, type QuoteRecord } from '../quote'
+import { InvalidJsonError, readJson } from './jsonFiles'
+import type { DriveFile, DriveStore } from './types'
 
 /**
  * Quote log (brief v0.5 Q4): `<model folder>/quotes/quote-YYYYMMDD-HHmm.json`, written only AFTER the Gmail draft was
@@ -38,4 +39,32 @@ export async function writeQuoteLog(
   const blob = new Blob([JSON.stringify(record, null, 2)], { type: JSON_MIME })
   const file = await store.uploadFile(folderId, name, blob, JSON_MIME)
   return { folderId, fileId: file.id, name }
+}
+
+// ---------- Reading logs back (customer history, brief v0.6 E4) ----------
+
+/** "quote-YYYYMMDD-HHmm.json", "quote-…-2.json". */
+export function isQuoteLogName(name: string): boolean {
+  return /^quote-.*\.json$/i.test(name.trim())
+}
+
+/** The app's own `quotes` subfolder in a model folder listing (a Founder folder of that name is not ours). */
+export function findQuotesFolder(children: readonly DriveFile[]): DriveFile | undefined {
+  return children.find((f) => f.mimeType === FOLDER_MIME && f.name === QUOTES_FOLDER_NAME && f.appCreated === true)
+}
+
+/** Reads one log. null when the file is not a valid quote log (reported by the caller); Drive errors are rethrown. */
+export async function readQuoteSummary(
+  store: DriveStore,
+  file: DriveFile,
+  model: { folderId: string; folderName: string },
+): Promise<QuoteSummary | null> {
+  let raw: unknown
+  try {
+    raw = await readJson(store, file.id, file.name)
+  } catch (e) {
+    if (e instanceof InvalidJsonError) return null
+    throw e
+  }
+  return quoteSummaryFromLog(raw, { folderId: model.folderId, folderName: model.folderName, fileId: file.id })
 }

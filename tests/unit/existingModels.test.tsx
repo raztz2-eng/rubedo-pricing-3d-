@@ -215,7 +215,7 @@ describe('N1/N5 — library = every model subfolder; index with status and build
     await rebuildIndex(drive, root, t0)
     const idx = (await drive.listChildren(root, { name: INDEX_FILE_NAME }))[0]
     const file = JSON.parse(await drive.readText(idx.id))
-    expect(file).toMatchObject({ schemaVersion: 2, builtAt: t0.toISOString(), entries: [] })
+    expect(file).toMatchObject({ schemaVersion: 3, builtAt: t0.toISOString(), entries: [], quotes: [], customers: [] })
 
     expect(isIndexStale(t0.toISOString(), new Date(t0.getTime() + 9 * 60_000))).toBe(false)
     expect(isIndexStale(t0.toISOString(), new Date(t0.getTime() + 11 * 60_000))).toBe(true)
@@ -230,6 +230,13 @@ describe('N1/N5 — library = every model subfolder; index with status and build
     expect(state.stale).toBe(true)
     expect(state.entries.map((e) => e.name)).toEqual(['Legacy'])
     expect((await loadLibrary(drive, root)).map((e) => e.name)).toEqual(['Legacy'])
+
+    // v0.5 index (schemaVersion 2, fresh builtAt, no quote history) is read, but stale (v0.6).
+    const v2 = { schemaVersion: 2, builtAt: new Date().toISOString(), entries: legacy }
+    await drive.updateFileContent(idx.id, new Blob([JSON.stringify(v2)]), 'application/json')
+    const v2State = await loadLibraryState(drive, root)
+    expect(v2State.stale).toBe(true)
+    expect(v2State.entries.map((e) => e.name)).toEqual(['Legacy'])
   })
 
   it(`lists at most ${FOLDER_SCAN_CONCURRENCY} model folders at a time`, async () => {

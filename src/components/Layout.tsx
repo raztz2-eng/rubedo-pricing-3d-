@@ -56,6 +56,9 @@ export function Layout() {
             <NavLink to="/new" className={navCls}>
               דגם חדש
             </NavLink>
+            <NavLink to="/customers" className={navCls}>
+              לקוחות
+            </NavLink>
             <NavLink to="/settings" className={navCls}>
               הגדרות
             </NavLink>

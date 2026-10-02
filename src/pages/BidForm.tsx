@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
+import { DescriptionField } from '../components/DescriptionField'
 import { LineItemsEditor } from '../components/LineItemsEditor'
 import { PartsEditor } from '../components/PartsEditor'
 import { PricePanel } from '../components/PricePanel'
@@ -24,6 +25,7 @@ import {
 } from '../lib/bidForm'
 import {
   checkName,
+  CONVERT_LEGACY_LABEL,
   LEGACY_BID_MESSAGE,
   loadBid,
   loadModelFolder,
@@ -77,12 +79,12 @@ function EditLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) 
   if (error) return <ErrorBox onRetry={() => setTick((t) => t + 1)}>{error}</ErrorBox>
   if (!bid) return <Spinner label="טוען דגם…" />
   if (legacy) {
-    // I2: a bid saved before v0.4 is read-only; it can only be re-created next to the old one.
+    // I2/E1: a bid saved before v0.4 is read-only; it can only be converted (a new marked bid.json next to it).
     return (
       <ErrorBox>
         {LEGACY_BID_MESSAGE}{' '}
         <Link className="underline" to={`/model/${encodeURIComponent(folderId)}/create`}>
-          צור הצעה מחדש
+          {CONVERT_LEGACY_LABEL}
         </Link>
       </ErrorBox>
     )
@@ -102,8 +104,10 @@ interface FromFolder {
   draft: BidDraft
   /** The folder's sliced file could not be read: shown as an error, the form stays empty for manual entry. */
   sliceError?: string
-  /** Re-creating a pre-v0.4 (read-only) bid of this folder. */
+  /** Converting a pre-v0.4 (read-only) bid of this folder (E1). */
   recreate?: boolean
+  /** E1 conversion: the old bid's settings snapshot (its prices stay as they were unless recalculated). */
+  snapshot?: PricingSettings
 }
 
 function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
@@ -117,20 +121,26 @@ function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }
     const run = async () => {
       // I4: only a direct, non-skipped subfolder of the models folder can receive a bid.
       await requireModelFolder(ctx.drive, ctx.folderId, folderId)
-      const { folder, contents, bid, legacyBid } = await loadModelFolder(ctx.drive, folderId)
+      const { folder, contents, bid, legacyBid, meta } = await loadModelFolder(ctx.drive, folderId)
       if (bid && !legacyBid) return { hasBid: true }
       if (bid && legacyBid) {
-        // I2 "re-create": prefilled from the old read-only bid; saving writes a NEW marked bid.json next to it.
-        return { fromFolder: { folderId, folderName: folder.name.trim(), draft: bidToDraft(bid), recreate: true } }
+        // E1 conversion: prefilled with ALL old values (parts, hardware + included flags, packaging, description,
+        // cover, files, settings snapshot); saving writes a NEW marked bid.json next to the old one.
+        return {
+          fromFolder: { folderId, folderName: folder.name.trim(), draft: bidToDraft(bid), recreate: true, snapshot: bid.settingsSnapshot },
+        }
       }
       const slicedFile = contents.sliced[0]
-      const base: FromFolder = { folderId, folderName: folder.name.trim(), draft: draftFromFolder(folder.name, ctx.settings.materials) }
+      // v0.6 E3: a cover/description saved for this folder prefills the bid.
+      const metaCoverInFolder = !!meta?.coverFileId && contents.images.some((i) => i.id === meta.coverFileId)
+      const folderMeta = meta ? { description: meta.description, coverFileId: metaCoverInFolder ? meta.coverFileId : undefined } : undefined
+      const base: FromFolder = { folderId, folderName: folder.name.trim(), draft: draftFromFolder(folder.name, ctx.settings.materials, undefined, folderMeta) }
       if (!slicedFile) return { fromFolder: base }
       try {
         // Read-only: the existing sliced file is parsed in the browser and referenced, never re-uploaded.
         const info = await parseSlicedThreeMF(await ctx.drive.readBlob(slicedFile.id))
         const file: BidFile = { id: slicedFile.id, name: slicedFile.name, kind: 'sliced', mimeType: slicedFile.mimeType || SLICED_MIME }
-        const draft = draftFromFolder(folder.name, ctx.settings.materials, { file, info })
+        const draft = draftFromFolder(folder.name, ctx.settings.materials, { file, info }, folderMeta)
         return { fromFolder: { ...base, draft } }
       } catch (e) {
         logError('parse existing sliced file', e)
@@ -177,8 +187,9 @@ function BidForm({
   const [draft, setDraft] = useState<BidDraft>(() =>
     existing ? bidToDraft(existing.bid) : fromFolder ? fromFolder.draft : emptyDraft(settings.materials),
   )
-  // New bids use current Settings; an existing bid keeps its snapshot unless the user recalculates.
-  const [snapshot, setSnapshot] = useState<PricingSettings>(() => existing?.bid.settingsSnapshot ?? settings.pricing)
+  // New bids use current Settings; an existing (or converted, E1) bid keeps its snapshot unless the user recalculates.
+  const keepsSnapshot = !!existing || !!fromFolder?.snapshot
+  const [snapshot, setSnapshot] = useState<PricingSettings>(() => existing?.bid.settingsSnapshot ?? fromFolder?.snapshot ?? settings.pricing)
   const [sliceError, setSliceError] = useState<string | null>(fromFolder?.sliceError ?? null)
   const [parsing, setParsing] = useState(false)
   const [fileError, setFileError] = useState<string | null>(null)
@@ -192,7 +203,7 @@ function BidForm({
   const [renameError, setRenameError] = useState<string | null>(null)
   const nameInputRef = useRef<HTMLInputElement>(null)
 
-  const effectiveSnapshot = existing ? snapshot : settings.pricing
+  const effectiveSnapshot = keepsSnapshot ? snapshot : settings.pricing
   const result = useMemo(() => computePrice(draftToPricingInput(draft), effectiveSnapshot), [draft, effectiveSnapshot])
   const invalid = invalidFields(draft)
   const saveAllowed = canSave(draft) && isValidResult(result)
@@ -264,7 +275,14 @@ function BidForm({
       modelsFolderId,
       fromFolder
         ? // N2: into the existing folder — no new folder; files already there are referenced, not re-uploaded.
-          { folderName, existingFolderId: fromFolder.folderId, existingFiles: d.existingFiles, content, files: filesToUpload(d) }
+          {
+            folderName,
+            existingFolderId: fromFolder.folderId,
+            existingFiles: d.existingFiles,
+            content,
+            files: filesToUpload(d),
+            coverFileId: d.coverFileId,
+          }
         : { folderName, content, files: filesToUpload(d) },
       sessionRef.current,
     )
@@ -361,7 +379,7 @@ function BidForm({
           {existing
             ? `עריכת ${existing.bid.name}`
             : fromFolder?.recreate
-              ? `הצעה חדשה ל${fromFolder.folderName}`
+              ? `${CONVERT_LEGACY_LABEL} — ${fromFolder.folderName}`
               : fromFolder
                 ? `הצעת מחיר ל${fromFolder.folderName}`
                 : 'דגם חדש'}
@@ -394,10 +412,7 @@ function BidForm({
               }
             />
             {renameError && <ErrorBox>{renameError}</ErrorBox>}
-            <div className="flex flex-col gap-1">
-              <label htmlFor="desc">תיאור</label>
-              <textarea id="desc" rows={3} value={draft.description} onChange={(e) => set('description', e.target.value)} />
-            </div>
+            <DescriptionField value={draft.description} onChange={(v) => set('description', v)} />
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               <Field label="גרסה" value={draft.revision} onChange={(v) => set('revision', v)} />
               <div className="flex min-w-0 flex-col gap-1">
@@ -584,7 +599,7 @@ function BidForm({
 
         <aside className="flex flex-col gap-3 lg:sticky lg:top-20">
           <PricePanel result={result} />
-          {existing && (
+          {keepsSnapshot && (
             <div className="card flex flex-col gap-2 text-sm">
               <p className="text-stone-600">המחיר מחושב לפי ההגדרות שנשמרו עם ההצעה.</p>
               <button

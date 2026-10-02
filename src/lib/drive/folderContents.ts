@@ -1,4 +1,4 @@
-import { BID_FILE_NAME, FOLDER_MIME } from '../bid'
+import { BID_FILE_NAME, FOLDER_MIME, MODEL_META_FILE_NAME } from '../bid'
 import type { DriveFile } from './types'
 
 /**
@@ -32,8 +32,15 @@ export function byName(a: DriveFile, b: DriveFile): number {
   return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
 }
 
+/** The app's own bookkeeping files ("_rubedo-…"): never shown as model files or pictures. */
+export function isAppInternalFileName(name: string): boolean {
+  return name.trim().startsWith('_rubedo-')
+}
+
 export interface FolderContents {
   bidFile?: DriveFile
+  /** v0.6: `_rubedo-model.json` (cover/description of a folder without bid.json); the marked one is preferred. */
+  metaFile?: DriveFile
   /** All images, sorted by name. */
   images: DriveFile[]
   /** All other files (no folders, no bid.json), sorted by name. */
@@ -58,11 +65,14 @@ export function preferAppFile(files: DriveFile[]): DriveFile | undefined {
 
 export function classifyFolder(children: DriveFile[]): FolderContents {
   const bidFile = preferAppFile(children.filter((c) => c.name === BID_FILE_NAME))
-  const plain = children.filter((c) => c.mimeType !== FOLDER_MIME && c !== bidFile)
+  const metaFile = preferAppFile(children.filter((c) => c.name === MODEL_META_FILE_NAME))
+  const plain = children.filter((c) => c.mimeType !== FOLDER_MIME && c !== bidFile && !isAppInternalFileName(c.name))
   const images = plain.filter(isImageFile).sort(byName)
   const files = plain.filter((c) => !isImageFile(c)).sort(byName)
   const sliced = files.filter((f) => isSlicedFileName(f.name))
-  return { bidFile, images, files, sliced }
+  const contents: FolderContents = { bidFile, images, files, sliced }
+  if (metaFile) contents.metaFile = metaFile
+  return contents
 }
 
 /** Cover = the bid's cover if set, else the first image by name (not a plate picture), else a plate picture. */

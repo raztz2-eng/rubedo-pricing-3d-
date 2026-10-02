@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { App } from '../../src/App'
 import { defaultAppSettings, INDEX_FILE_NAME, SETTINGS_FILE_NAME } from '../../src/lib/bid'
 import {
+  LEGACY_BID_MESSAGE,
   loadModelFolder,
   loadSettingsWithStatus,
   newSaveSession,
@@ -172,9 +173,13 @@ describe('I2 (fix round) — a bid saved before v0.4 (bid.json without marker) i
     const { services, root, d, folder, legacyId } = await legacyFolder()
     renderApp(services, `/model/${folder}`)
     await screen.findByRole('heading', { level: 1, name: 'Old stand' })
-    expect(screen.getByTestId('legacy-bid-notice').textContent).toBe('הצעה זו נשמרה בגרסה ישנה — לא ניתן לערוך. אפשר ליצור הצעה חדשה מהתיקייה.')
+    expect(screen.getByTestId('legacy-bid-notice').textContent).toBe(LEGACY_BID_MESSAGE)
     expect(screen.queryByRole('link', { name: 'עריכה' })).toBeNull()
-    expect(screen.getByRole('link', { name: 'צור הצעה מחדש' }).getAttribute('href')).toBe(`/model/${folder}/create`)
+    // E1: conversion = the "create again" flow.
+    expect(screen.getByRole('link', { name: 'המר להצעה ניתנת לעריכה' }).getAttribute('href')).toBe(`/model/${folder}/create`)
+    // Cover/description of a read-only bid cannot be changed from the page.
+    expect(screen.queryByRole('button', { name: 'קבע כתמונה ראשית' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'עריכת תיאור' })).toBeNull()
     cleanup()
 
     renderApp(services, `/model/${folder}/edit`)
@@ -189,12 +194,12 @@ describe('I2 (fix round) — a bid saved before v0.4 (bid.json without marker) i
     expect(d.writeLog.length).toBe(before) // nothing uploaded either
   })
 
-  it('"צור הצעה מחדש" → prefilled from the old bid → saving writes a NEW marked bid.json next to the old one, which stays untouched; the page is then editable', async () => {
+  it('"המר להצעה ניתנת לעריכה" → prefilled from the old bid → saving writes a NEW marked bid.json next to the old one, which stays untouched; the page is then editable', async () => {
     const user = userEvent.setup()
     const { services, d, folder, legacyId } = await legacyFolder()
     const oldBlob = await d.readBlob(legacyId)
     renderApp(services, `/model/${folder}`)
-    await user.click(await screen.findByRole('link', { name: 'צור הצעה מחדש' }))
+    await user.click(await screen.findByRole('link', { name: 'המר להצעה ניתנת לעריכה' }))
     expect(((await screen.findByLabelText(/^שם \*$/)) as HTMLInputElement).value).toBe('Old stand')
     expect((screen.getByLabelText('זמן עבודה') as HTMLInputElement).value).toBe('12')
     await user.click(screen.getByRole('button', { name: 'שמירה' }))
