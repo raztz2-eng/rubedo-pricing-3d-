@@ -673,8 +673,10 @@ describe('E4 / AC38 — customer history from every model + "new quote"', () => 
     const idx = JSON.parse(await drive.readText(await indexId(drive, root)))
     expect(idx.schemaVersion).toBe(3)
     expect(idx.customers).toEqual(summariseQuotes(r.quotes))
-    expect(idx.customers).toContainEqual({ email: 'dana@example.com', quoteCount: 1, lastQuoteAt: '2026-09-20T10:00:00.000Z' })
-    expect(idx.customers).toContainEqual({ customerId: dana.id, email: 'dana@example.com', quoteCount: 1, lastQuoteAt: '2026-10-01T10:00:00.000Z' })
+    // The old e-mail-only log joins Dana's id (minor fix): one entry with both quotes.
+    expect(idx.customers).toContainEqual({ customerId: dana.id, email: 'dana@example.com', quoteCount: 2, lastQuoteAt: '2026-10-01T10:00:00.000Z' })
+    expect(idx.customers).toContainEqual({ customerId: other.id, email: 'yossi@example.com', quoteCount: 1, lastQuoteAt: '2026-09-25T10:00:00.000Z' })
+    expect(idx.customers).toHaveLength(2)
   })
 
   it(`quote logs are read at most ${FOLDER_SCAN_CONCURRENCY} at a time`, async () => {

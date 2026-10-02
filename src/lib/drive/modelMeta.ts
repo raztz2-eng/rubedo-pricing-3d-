@@ -1,5 +1,5 @@
 import { DESCRIPTION_MAX_LENGTH, DESCRIPTION_TOO_LONG_MESSAGE, MODEL_META_FILE_NAME } from '../bid'
-import { InvalidJsonError, readJson, writeJsonFile } from './jsonFiles'
+import { findFile, InvalidJsonError, readJson, writeJsonFile } from './jsonFiles'
 import { DriveError, type DriveFile, type DriveStore } from './types'
 
 /**
@@ -56,17 +56,26 @@ export function assertDescriptionLength(description: string): void {
 }
 
 /**
- * Merges `patch` into the folder's meta file and writes it (creates it marked the first time).
- * `current`: the meta already loaded for this folder (null = none yet).
+ * The folder's meta file as it is NOW (null = none). A damaged one throws InvalidModelMetaError: it is never
+ * replaced (I3) — the Founder sees the problem instead.
+ */
+export async function readCurrentModelMeta(store: DriveStore, folderId: string): Promise<ModelMeta | null> {
+  const file = await findFile(store, folderId, MODEL_META_FILE_NAME)
+  return file ? readModelMeta(store, file) : null
+}
+
+/**
+ * Re-reads the folder's meta file, merges `patch` into it and writes it (creates it marked the first time).
+ * Only the patched fields change; a value saved meanwhile (e.g. the cover from another tab) is kept.
  */
 export async function writeModelMeta(
   store: DriveStore,
   folderId: string,
-  current: ModelMeta | null,
   patch: { coverFileId?: string; description?: string },
   now: Date = new Date(),
 ): Promise<ModelMeta> {
-  if (patch.description !== undefined) assertDescriptionLength(patch.description)
+  const current = await readCurrentModelMeta(store, folderId)
+  if (patch.description !== undefined && patch.description !== (current?.description ?? '')) assertDescriptionLength(patch.description)
   const next: ModelMeta = { ...(current ?? { schemaVersion: 1 }), ...patch, schemaVersion: 1, updatedAt: now.toISOString() }
   if (!next.coverFileId) delete next.coverFileId
   await writeJsonFile(store, folderId, MODEL_META_FILE_NAME, next)

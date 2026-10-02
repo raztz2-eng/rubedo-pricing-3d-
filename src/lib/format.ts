@@ -48,3 +48,11 @@ export function isValidAmount(text: string): boolean {
   const n = parseNumber(text)
   return !Number.isNaN(n) && n >= 0
 }
+
+/**
+ * Left-to-right isolate for an e-mail / file name inside Hebrew TEXT (U+2066 … U+2069 — the plain-text equivalent of
+ * `<bdi dir="ltr">`, for messages built as strings). In JSX use `<bdi dir="ltr">` instead.
+ */
+export function ltrIsolate(text: string): string {
+  return `\u2066${text}\u2069`
+}

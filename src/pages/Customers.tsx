@@ -22,6 +22,20 @@ export function CustomerPageRoute() {
   return <RequireDrive>{(ctx) => <CustomerPage key={id} ctx={ctx} customerId={id} />}</RequireDrive>
 }
 
+/** File names inside Hebrew text, each isolated left-to-right. */
+function FileNames({ names }: { names: readonly string[] }) {
+  return (
+    <>
+      {names.map((n, i) => (
+        <span key={n}>
+          {i > 0 && ', '}
+          <bdi dir="ltr">{n}</bdi>
+        </span>
+      ))}
+    </>
+  )
+}
+
 /** Customers + quote history of the current models folder; each loads (and fails) on its own. */
 function useCustomersData(ctx: DriveContext) {
   const { drive, folderId } = ctx
@@ -202,7 +216,9 @@ function CustomersPage({ ctx }: { ctx: DriveContext }) {
         </ErrorBox>
       )}
       {history && history.skippedQuotes.length > 0 && (
-        <Notice tone="warn">לא ניתן היה לקרוא חלק מקובצי ההצעות: {history.skippedQuotes.join(', ')} — הם לא נספרים.</Notice>
+        <Notice tone="warn">
+          לא ניתן היה לקרוא חלק מקובצי ההצעות: <FileNames names={history.skippedQuotes} /> — הם לא נספרים.
+        </Notice>
       )}
       {customers === null && !data.customersError && <Spinner label="טוען לקוחות…" />}
       {customers !== null && visible.length === 0 && (
@@ -219,8 +235,8 @@ function CustomersPage({ ctx }: { ctx: DriveContext }) {
                     {c.name}
                   </Link>
                   {c.hidden && <span className="ms-2 rounded bg-stone-100 px-1.5 text-xs text-stone-500">מוסתר</span>}
-                  <div className="truncate text-sm text-stone-600" dir="ltr">
-                    {c.email}
+                  <div className="truncate text-sm text-stone-600">
+                    <bdi dir="ltr">{c.email}</bdi>
                   </div>
                 </div>
                 <div className="flex gap-4 text-sm text-stone-600">
@@ -289,12 +305,12 @@ function CustomerPage({ ctx, customerId }: { ctx: DriveContext; customerId: stri
       <div className="flex flex-wrap items-start gap-2">
         <div className="me-auto min-w-0">
           <h1 className="text-2xl font-bold">{customer.name}</h1>
-          <p className="text-sm text-stone-600" dir="ltr">
-            {customer.email}
+          <p className="text-sm text-stone-600">
+            <bdi dir="ltr">{customer.email}</bdi>
           </p>
           {customer.phone && (
             <p className="text-sm text-stone-600">
-              טלפון: <span dir="ltr">{customer.phone}</span>
+              טלפון: <bdi dir="ltr">{customer.phone}</bdi>
             </p>
           )}
           {customer.hidden && <span className="mt-1 inline-block rounded bg-stone-100 px-1.5 text-xs text-stone-500">מוסתר</span>}
@@ -345,7 +361,9 @@ function CustomerPage({ ctx, customerId }: { ctx: DriveContext; customerId: stri
         </div>
         {data.historyError && <ErrorBox onRetry={() => void data.loadHistory(true)}>{data.historyError}</ErrorBox>}
         {history && history.skippedQuotes.length > 0 && (
-          <Notice tone="warn">לא ניתן היה לקרוא חלק מקובצי ההצעות: {history.skippedQuotes.join(', ')}</Notice>
+          <Notice tone="warn">
+            לא ניתן היה לקרוא חלק מקובצי ההצעות: <FileNames names={history.skippedQuotes} />
+          </Notice>
         )}
         {quotes === null && !data.historyError && <Spinner label="טוען הצעות…" />}
         {quotes !== null && quotes.length === 0 && <p className="text-sm text-stone-500">עדיין לא נשלחו הצעות ללקוח הזה.</p>}

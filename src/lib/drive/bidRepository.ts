@@ -24,9 +24,10 @@ import {
   type QuoteSummary,
 } from '../bid'
 import { byDateDesc, summariseQuotes } from '../customers'
-import { classifyFolder, isPlatePictureName, isSkippedFolderName, pickCover, type FolderContents } from './folderContents'
+import { logError } from '../errors'
+import { classifyFolder, isGoogleNativeFile, isPlatePictureName, isSkippedFolderName, pickCover, type FolderContents } from './folderContents'
 import { findFile, InvalidJsonError, JSON_MIME, jsonBlob, readJson, writeJsonFile } from './jsonFiles'
-import { assertDescriptionLength, InvalidModelMetaError, readModelMeta, writeModelMeta, type ModelMeta } from './modelMeta'
+import { assertDescriptionLength, InvalidModelMetaError, readCurrentModelMeta, readModelMeta, writeModelMeta, type ModelMeta } from './modelMeta'
 import { findQuotesFolder, isQuoteLogName, readQuoteSummary } from './quoteLog'
 import { DriveError, type DriveFile, type DriveStore } from './types'
 
@@ -67,6 +68,8 @@ export interface SaveSession {
   /** Bid id/createdAt fixed on the first attempt so a retry writes the same bid. */
   bidId?: string
   createdAt?: string
+  /** Edit flow: the updatedAt this session wrote into bid.json (a retry after a later failure is not "changed elsewhere"). */
+  writtenUpdatedAt?: string
 }
 
 export function newSaveSession(): SaveSession {
@@ -262,18 +265,32 @@ async function scanModelFolder(store: DriveStore, folder: DriveFile): Promise<Fo
   return withQuotes({ entry })
 }
 
-/** Reads every quote log of the given model folders (listing and reading both concurrency-limited). */
+/**
+ * Reads the quote logs of the given model folders (listing and reading both concurrency-limited). Logs already in
+ * the previous index (same file id — logs are never rewritten) are reused, so only new logs are read. A log that
+ * cannot be read or is not a quote log is reported in `skipped` and does not stop the refresh (I4).
+ */
 async function scanQuoteLogs(
   store: DriveStore,
   folders: { folder: DriveFile; quotesFolder: DriveFile }[],
+  known: ReadonlyMap<string, QuoteSummary>,
 ): Promise<{ quotes: QuoteSummary[]; skipped: string[] }> {
   const listed = await mapLimit(folders, FOLDER_SCAN_CONCURRENCY, async ({ folder, quotesFolder }) =>
     (await store.listChildren(quotesFolder.id))
-      .filter((f) => f.mimeType !== FOLDER_MIME && isQuoteLogName(f.name))
+      .filter((f) => f.mimeType !== FOLDER_MIME && !isGoogleNativeFile(f) && isQuoteLogName(f.name))
       .map((file) => ({ file, model: { folderId: folder.id, folderName: folder.name.trim() } })),
   )
   const logs = listed.flat()
-  const read = await mapLimit(logs, FOLDER_SCAN_CONCURRENCY, (l) => readQuoteSummary(store, l.file, l.model))
+  const read = await mapLimit(logs, FOLDER_SCAN_CONCURRENCY, async (l): Promise<QuoteSummary | null> => {
+    const cached = known.get(l.file.id)
+    if (cached && cached.folderId === l.model.folderId) return cached
+    try {
+      return await readQuoteSummary(store, l.file, l.model)
+    } catch (e) {
+      logError(`read quote log ${l.file.name}`, e)
+      return null
+    }
+  })
   const quotes: QuoteSummary[] = []
   const skipped: string[] = []
   read.forEach((q, i) => {
@@ -290,7 +307,9 @@ async function scanQuoteLogs(
  * Any Drive error aborts the rebuild WITHOUT writing the index. Only reads model folders.
  */
 export async function rebuildIndex(store: DriveStore, modelsFolderId: string, now: Date = new Date()): Promise<RebuildResult> {
-  quotesChanged.set(store, false)
+  const generation = quotesGeneration(store)
+  const previous = await readIndex(store, modelsFolderId)
+  const known = new Map((previous?.quotes ?? []).map((q) => [q.fileId, q]))
   const folders = (await store.listChildren(modelsFolderId, { foldersOnly: true })).filter((f) => !isSkippedFolderName(f.name))
   const scans = await mapLimit(folders, FOLDER_SCAN_CONCURRENCY, (f) => scanModelFolder(store, f))
   const entries: IndexEntry[] = []
@@ -302,9 +321,11 @@ export async function rebuildIndex(store: DriveStore, modelsFolderId: string, no
     if (s.skipped) skipped.push(s.skipped)
     if (s.quotesFolder) withLogs.push({ folder: folders[i], quotesFolder: s.quotesFolder })
   })
-  const logs = await scanQuoteLogs(store, withLogs)
+  const logs = await scanQuoteLogs(store, withLogs, known)
   const sorted = sortIndex(entries)
   await writeIndex(store, modelsFolderId, sorted, now.toISOString(), logs.quotes)
+  // Only a successful rebuild clears "quotes changed" — and only up to the quotes it could have seen.
+  quotesSeen.set(store, generation)
   return { entries: sorted, skipped, quotes: logs.quotes, customers: summariseQuotes(logs.quotes), skippedQuotes: logs.skipped }
 }
 
@@ -328,14 +349,23 @@ export async function loadLibraryState(
 }
 
 /**
- * Stores whose quote logs changed in this browser session since the last rebuild (a quote was just written).
- * Kept in memory only — writing a quote never touches the index — so the customer pages rebuild once on open.
+ * Quote logs written in this browser session (a counter per store) and how many of them the last successful rebuild
+ * covered. Kept in memory only — writing a quote never touches the index — so the customer pages rebuild once on open.
  */
-const quotesChanged = new WeakMap<DriveStore, boolean>()
+const quotesWritten = new WeakMap<DriveStore, number>()
+const quotesSeen = new WeakMap<DriveStore, number>()
+
+function quotesGeneration(store: DriveStore): number {
+  return quotesWritten.get(store) ?? 0
+}
 
 /** Called after a quote log was written: the cached quote history is out of date. */
 export function markQuotesChanged(store: DriveStore): void {
-  quotesChanged.set(store, true)
+  quotesWritten.set(store, quotesGeneration(store) + 1)
+}
+
+function quotesChangedSinceRebuild(store: DriveStore): boolean {
+  return quotesGeneration(store) > (quotesSeen.get(store) ?? 0)
 }
 
 export interface QuoteHistory {
@@ -358,7 +388,7 @@ export async function loadQuoteHistory(
   if (!options.refresh) {
     const state = await loadLibraryState(store, modelsFolderId, now)
     if (state.rebuilt) return { entries: state.entries, quotes: state.quotes, skippedQuotes: state.rebuilt.skippedQuotes }
-    if (!state.stale && quotesChanged.get(store) !== true) return { entries: state.entries, quotes: state.quotes, skippedQuotes: [] }
+    if (!state.stale && !quotesChangedSinceRebuild(store)) return { entries: state.entries, quotes: state.quotes, skippedQuotes: [] }
   }
   const r = await rebuildIndex(store, modelsFolderId, now)
   return { entries: r.entries, quotes: r.quotes, skippedQuotes: r.skippedQuotes }
@@ -526,6 +556,8 @@ export interface SaveNewParams {
    * a pre-v0.4 bid being converted). Wins over the uploads.
    */
   coverFileId?: string
+  /** E1 conversion of a pre-v0.4 bid: the new bid.json keeps the old bid's id and createdAt. */
+  keepIdentity?: { id: string; createdAt: string }
   now?: Date
 }
 
@@ -557,8 +589,8 @@ export async function saveNewBid(
   await uploadMissing(store, folderId, params.files, session)
 
   const now = (params.now ?? new Date()).toISOString()
-  session.bidId ??= newId()
-  session.createdAt ??= now
+  session.bidId ??= params.keepIdentity?.id ?? newId()
+  session.createdAt ??= params.keepIdentity?.createdAt ?? now
   const uploadedFiles = params.files.map((f) => session.uploaded[f.key])
   const files = [...uploadedFiles, ...(params.existingFiles ?? [])]
   const bid: Bid = {
@@ -607,6 +639,8 @@ export interface UpdateParams {
 }
 
 /** Edit flow: upload new files → rewrite bid.json (id/createdAt kept) → update index. */
+export const BID_CHANGED_MESSAGE = 'ההצעה שונתה בחלון אחר — טענו מחדש'
+
 export async function updateBid(
   store: DriveStore,
   modelsFolderId: string,
@@ -614,11 +648,18 @@ export async function updateBid(
   session: SaveSession,
 ): Promise<Bid> {
   const { folderId, existing } = params
-  assertDescriptionLength(params.content.description)
+  // The limit applies to a description being changed (an older, longer text can still be saved as it is).
+  if (params.content.description !== existing.description) assertDescriptionLength(params.content.description)
   // Checked before anything is written: a pre-v0.4 bid.json (no marker) is read-only (I2).
   const bidFile = await findFile(store, folderId, BID_FILE_NAME)
   if (!bidFile) throw new DriveError('bid.json missing', 'לא נמצא קובץ bid.json בתיקיית הדגם.', 404)
   if (bidFile.appCreated !== true) throw new DriveError('legacy bid.json is read-only', LEGACY_BID_MESSAGE, 403)
+  // Validator I2: never overwrite a change made meanwhile (another tab/device) — the bid must be the one we started from.
+  const fresh = parseBid(await readJson(store, bidFile.id, BID_FILE_NAME))
+  if (!fresh) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
+  if (fresh.updatedAt !== existing.updatedAt && fresh.updatedAt !== session.writtenUpdatedAt) {
+    throw new DriveError('bid.json changed meanwhile', BID_CHANGED_MESSAGE, 409)
+  }
   await uploadMissing(store, folderId, params.newFiles, session)
 
   const newUploads = params.newFiles.map((f) => session.uploaded[f.key])
@@ -644,6 +685,7 @@ export async function updateBid(
   if (!bid.coverFileId) delete bid.coverFileId
 
   await store.updateFileContent(bidFile.id, jsonBlob(bid), JSON_MIME)
+  session.writtenUpdatedAt = bid.updatedAt
 
   const entry = indexEntryFromBid(folderId, bid)
   if (!entry.coverFileId) {
@@ -681,6 +723,23 @@ function assertNotLegacy(model: ModelFolder): void {
   if (model.bid && model.legacyBid) throw new DriveError('legacy bid.json is read-only', LEGACY_BID_MESSAGE, 403)
 }
 
+/**
+ * A small change from the model page: applied to the bid.json AS IT IS NOW (read again, not the copy the page shows),
+ * changing only that one field — a change made meanwhile in another tab is kept (I2).
+ */
+async function changeBidField(
+  store: DriveStore,
+  modelsFolderId: string,
+  folderId: string,
+  apply: (fresh: Bid) => Pick<UpdateParams, 'content' | 'coverFileId' | 'coverFromNewFileKey' | 'newFiles'>,
+  session: SaveSession,
+  now?: Date,
+): Promise<Bid> {
+  const { bid: fresh, legacy } = await loadBid(store, folderId)
+  if (legacy) throw new DriveError('legacy bid.json is read-only', LEGACY_BID_MESSAGE, 403)
+  return updateBid(store, modelsFolderId, { folderId, existing: fresh, now, ...apply(fresh) }, session)
+}
+
 /** After a `_rubedo-model.json` change: the folder's library card shows the chosen cover (AC34). */
 async function refreshNeedsSlicingEntry(store: DriveStore, modelsFolderId: string, model: ModelFolder, cover?: string): Promise<void> {
   const contents = classifyFolder(await store.listChildren(model.folder.id))
@@ -703,15 +762,10 @@ export async function setModelCover(
   if (!model.contents.images.some((i) => i.id === fileId)) throw new DriveError('not an image of the folder', NOT_A_FOLDER_IMAGE_MESSAGE, 400)
   const folderId = model.folder.id
   if (model.bid) {
-    await updateBid(
-      store,
-      modelsFolderId,
-      { folderId, existing: model.bid, content: bidContentOf(model.bid), newFiles: [], coverFileId: fileId, now },
-      newSaveSession(),
-    )
+    await changeBidField(store, modelsFolderId, folderId, (fresh) => ({ content: bidContentOf(fresh), newFiles: [], coverFileId: fileId }), newSaveSession(), now)
     return
   }
-  await writeModelMeta(store, folderId, model.meta ?? null, { coverFileId: fileId }, now)
+  await writeModelMeta(store, folderId, { coverFileId: fileId }, now)
   await refreshNeedsSlicingEntry(store, modelsFolderId, model, fileId)
 }
 
@@ -730,17 +784,21 @@ export async function uploadModelCover(
   assertNotLegacy(model)
   const folderId = model.folder.id
   if (model.bid) {
-    const bid = await updateBid(
+    const bid = await changeBidField(
       store,
       modelsFolderId,
-      { folderId, existing: model.bid, content: bidContentOf(model.bid), newFiles: [file], coverFromNewFileKey: file.key, now },
+      folderId,
+      (fresh) => ({ content: bidContentOf(fresh), newFiles: [file], coverFromNewFileKey: file.key }),
       session,
+      now,
     )
     return bid.coverFileId as string
   }
+  // A damaged meta file is reported BEFORE anything is uploaded (it is never replaced, I3).
+  await readCurrentModelMeta(store, folderId)
   await uploadMissing(store, folderId, [file], session)
   const coverId = session.uploaded[file.key].id
-  await writeModelMeta(store, folderId, model.meta ?? null, { coverFileId: coverId }, now)
+  await writeModelMeta(store, folderId, { coverFileId: coverId }, now)
   await refreshNeedsSlicingEntry(store, modelsFolderId, model, coverId)
   return coverId
 }
@@ -758,15 +816,17 @@ export async function setModelDescription(
 ): Promise<void> {
   assertNotLegacy(model)
   const text = description.trim()
-  assertDescriptionLength(text)
+  // The 2000-character limit is checked by the writers, only when the description actually changes.
   if (model.bid) {
-    await updateBid(
+    await changeBidField(
       store,
       modelsFolderId,
-      { folderId: model.folder.id, existing: model.bid, content: { ...bidContentOf(model.bid), description: text }, newFiles: [], now },
+      model.folder.id,
+      (fresh) => ({ content: { ...bidContentOf(fresh), description: text }, newFiles: [] }),
       newSaveSession(),
+      now,
     )
     return
   }
-  await writeModelMeta(store, model.folder.id, model.meta ?? null, { description: text }, now)
+  await writeModelMeta(store, model.folder.id, { description: text }, now)
 }

@@ -105,9 +105,9 @@ export function CustomerPicker({
             onMouseEnter={() => setActive(i)}
           >
             <span className="font-medium">{c.name}</span>
-            <span className="text-xs text-stone-500" dir="ltr">
+            <bdi className="text-xs text-stone-500" dir="ltr">
               {c.email}
-            </span>
+            </bdi>
           </li>
         ))}
       </ul>

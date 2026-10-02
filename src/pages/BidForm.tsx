@@ -5,12 +5,13 @@ import { LineItemsEditor } from '../components/LineItemsEditor'
 import { PartsEditor } from '../components/PartsEditor'
 import { PricePanel } from '../components/PricePanel'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
-import { BlobImage, Dialog, ErrorBox, Field, Money, Spinner } from '../components/ui'
+import { BlobImage, Dialog, ErrorBox, Field, Money, Notice, Spinner } from '../components/ui'
 import type { Bid, BidFile } from '../lib/bid'
 import {
   applySlicedFile,
   bidToDraft,
   canSave,
+  descriptionTooLong,
   draftFromFolder,
   SLICED_MIME,
   draftToContent,
@@ -37,6 +38,7 @@ import {
   type SaveSession,
 } from '../lib/drive/bidRepository'
 import { errorMessage, logError } from '../lib/errors'
+import { formatMoney, round2 } from '../lib/format'
 import { computePrice, isValidResult, type PricingSettings } from '../lib/pricing'
 import { parseSlicedThreeMF } from '../lib/threemf'
 
@@ -108,6 +110,20 @@ interface FromFolder {
   recreate?: boolean
   /** E1 conversion: the old bid's settings snapshot (its prices stay as they were unless recalculated). */
   snapshot?: PricingSettings
+  /** E1 conversion: the new bid.json keeps the old bid's id and createdAt. */
+  keepIdentity?: { id: string; createdAt: string }
+  /** E1 conversion: the prices recalculated from the old values differ from those stored in the old bid (Hebrew). */
+  priceWarning?: string
+  /** A damaged `_rubedo-model.json` was ignored: its cover/description could not be used (Hebrew). */
+  metaWarning?: string
+}
+
+/** Hebrew warning when the old bid's stored prices are not what its own values give (E1 conversion). */
+function conversionPriceWarning(bid: Bid, draft: BidDraft): string | undefined {
+  const recalculated = computePrice(draftToPricingInput(draft), bid.settingsSnapshot)
+  const keys = Object.keys(bid.result) as (keyof typeof bid.result)[]
+  if (keys.every((k) => Math.abs(round2(recalculated[k]) - round2(bid.result[k])) < 0.005)) return undefined
+  return `שימו לב: המחיר שמחושב מהערכים של ההצעה הישנה (${formatMoney(recalculated.price70)} ב-70%) שונה מהמחיר שנשמר בה (${formatMoney(bid.result.price70)}). בדקו את הערכים לפני השמירה — ההצעה החדשה תישמר עם המחיר המחושב.`
 }
 
 function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
@@ -121,20 +137,34 @@ function FolderLoader({ ctx, folderId }: { ctx: DriveContext; folderId: string }
     const run = async () => {
       // I4: only a direct, non-skipped subfolder of the models folder can receive a bid.
       await requireModelFolder(ctx.drive, ctx.folderId, folderId)
-      const { folder, contents, bid, legacyBid, meta } = await loadModelFolder(ctx.drive, folderId)
+      const { folder, contents, bid, legacyBid, meta, metaError } = await loadModelFolder(ctx.drive, folderId)
       if (bid && !legacyBid) return { hasBid: true }
       if (bid && legacyBid) {
         // E1 conversion: prefilled with ALL old values (parts, hardware + included flags, packaging, description,
         // cover, files, settings snapshot); saving writes a NEW marked bid.json next to the old one.
+        const draft = bidToDraft(bid)
         return {
-          fromFolder: { folderId, folderName: folder.name.trim(), draft: bidToDraft(bid), recreate: true, snapshot: bid.settingsSnapshot },
+          fromFolder: {
+            folderId,
+            folderName: folder.name.trim(),
+            draft,
+            recreate: true,
+            snapshot: bid.settingsSnapshot,
+            keepIdentity: { id: bid.id, createdAt: bid.createdAt },
+            priceWarning: conversionPriceWarning(bid, draft),
+          },
         }
       }
       const slicedFile = contents.sliced[0]
       // v0.6 E3: a cover/description saved for this folder prefills the bid.
       const metaCoverInFolder = !!meta?.coverFileId && contents.images.some((i) => i.id === meta.coverFileId)
       const folderMeta = meta ? { description: meta.description, coverFileId: metaCoverInFolder ? meta.coverFileId : undefined } : undefined
-      const base: FromFolder = { folderId, folderName: folder.name.trim(), draft: draftFromFolder(folder.name, ctx.settings.materials, undefined, folderMeta) }
+      const base: FromFolder = {
+        folderId,
+        folderName: folder.name.trim(),
+        draft: draftFromFolder(folder.name, ctx.settings.materials, undefined, folderMeta),
+        ...(metaError ? { metaWarning: `${metaError} ההצעה נפתחת בלי התמונה הראשית והתיאור שנשמרו.` } : {}),
+      }
       if (!slicedFile) return { fromFolder: base }
       try {
         // Read-only: the existing sliced file is parsed in the browser and referenced, never re-uploaded.
@@ -206,7 +236,10 @@ function BidForm({
   const effectiveSnapshot = keepsSnapshot ? snapshot : settings.pricing
   const result = useMemo(() => computePrice(draftToPricingInput(draft), effectiveSnapshot), [draft, effectiveSnapshot])
   const invalid = invalidFields(draft)
-  const saveAllowed = canSave(draft) && isValidResult(result)
+  // E3: the limit applies only when the description was changed in this form.
+  const originalDescription = existing?.bid.description ?? fromFolder?.draft.description ?? ''
+  const descriptionBlocked = descriptionTooLong(draft, originalDescription)
+  const saveAllowed = canSave(draft) && isValidResult(result) && !descriptionBlocked
 
   const set = <K extends keyof BidDraft>(key: K, value: BidDraft[K]) => setDraft((d) => ({ ...d, [key]: value }))
 
@@ -282,6 +315,7 @@ function BidForm({
             content,
             files: filesToUpload(d),
             coverFileId: d.coverFileId,
+            keepIdentity: fromFolder.keepIdentity,
           }
         : { folderName, content, files: filesToUpload(d) },
       sessionRef.current,
@@ -391,6 +425,21 @@ function BidForm({
         )}
       </div>
 
+      {fromFolder?.metaWarning && (
+        <div className="mb-4">
+          <Notice tone="warn">
+            <span data-testid="meta-warning">{fromFolder.metaWarning}</span>
+          </Notice>
+        </div>
+      )}
+      {fromFolder?.priceWarning && (
+        <div className="mb-4">
+          <Notice tone="warn">
+            <span data-testid="conversion-price-warning">{fromFolder.priceWarning}</span>
+          </Notice>
+        </div>
+      )}
+
       <div className="grid gap-4 lg:grid-cols-[1fr_320px] lg:items-start">
         <div className="flex min-w-0 flex-col gap-4">
           <section className="card flex flex-col gap-3" aria-label="פרטי הדגם">
@@ -412,7 +461,11 @@ function BidForm({
               }
             />
             {renameError && <ErrorBox>{renameError}</ErrorBox>}
-            <DescriptionField value={draft.description} onChange={(v) => set('description', v)} />
+            <DescriptionField
+              value={draft.description}
+              onChange={(v) => set('description', v)}
+              limitApplies={draft.description.trim() !== originalDescription.trim()}
+            />
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
               <Field label="גרסה" value={draft.revision} onChange={(v) => set('revision', v)} />
               <div className="flex min-w-0 flex-col gap-1">
@@ -564,8 +617,8 @@ function BidForm({
               <ul className="flex flex-col gap-1 text-sm">
                 {otherFiles.map((f) => (
                   <li key={f.key} className="flex items-center justify-between gap-2 rounded bg-stone-50 px-2 py-1">
-                    <span className="truncate" dir="ltr">
-                      {f.name}
+                    <span className="truncate">
+                      <bdi dir="ltr">{f.name}</bdi>
                     </span>
                     <span className="flex shrink-0 items-center gap-2">
                       <span className="text-xs text-stone-500">{f.kind === 'sliced' ? 'קובץ פרוס' : 'קובץ דגם'}</span>
@@ -587,8 +640,8 @@ function BidForm({
                 <p className="mb-1 text-stone-600">{fromFolder ? 'קבצים מהתיקייה ב-Drive (לא יועלו שוב):' : 'קבצים שכבר שמורים עם הדגם:'}</p>
                 <ul className="flex flex-col gap-1">
                   {draft.existingFiles.map((f) => (
-                    <li key={f.id} className="truncate rounded bg-stone-50 px-2 py-1" dir="ltr">
-                      {f.name}
+                    <li key={f.id} className="truncate rounded bg-stone-50 px-2 py-1">
+                      <bdi dir="ltr">{f.name}</bdi>
                     </li>
                   ))}
                 </ul>

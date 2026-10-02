@@ -12,6 +12,8 @@ export interface DriveFile {
   name: string
   mimeType: string
   modifiedTime?: string
+  /** Drive's monotonically increasing version number of the file (changes on every content change). */
+  version?: string
   /** Drive-generated preview (short-lived URL). Absent if none. */
   thumbnailLink?: string
   /** Parent folder IDs (present when the store knows them). */

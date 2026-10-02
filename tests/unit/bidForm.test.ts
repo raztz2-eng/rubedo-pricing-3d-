@@ -90,7 +90,7 @@ describe('canSave / validation', () => {
 })
 
 describe('draftToContent / filesToUpload', () => {
-  it('drops packaging when shipping is off and names plate pictures after the model', () => {
+  it('keeps packaging rows (not priced) when shipping is off and names plate pictures after the model', () => {
     let d = applySlicedFile(emptyDraft(DEFAULT_MATERIALS), info, { name: 'rs.gcode.3mf', blob: new Blob() }, DEFAULT_MATERIALS)
     d = {
       ...d,
@@ -101,8 +101,10 @@ describe('draftToContent / filesToUpload', () => {
     }
     const r = computePrice(draftToPricingInput(d), DEFAULT_PRICING_SETTINGS)
     const c = draftToContent(d, DEFAULT_PRICING_SETTINGS, r)
-    expect(c.packaging).toEqual([])
-    expect(c.shippingCost).toBe(0)
+    // v0.6 fix round: the rows stay with the model; the price ignores them while the toggle is off.
+    expect(c.hasShipping).toBe(false)
+    expect(c.packaging).toEqual([{ name: 'box', qty: 1, unitCost: 3 }])
+    expect(c.shippingCost).toBe(20)
     expect(c.result.packaging).toBe(0)
     expect(filesToUpload(d).map((f) => f.name)).toEqual(['Stand-plate-1.png', 'rs.gcode.3mf'])
     const unticked = { ...d, files: d.files.map((f) => (f.origin === 'plate' ? { ...f, include: false } : f)) }

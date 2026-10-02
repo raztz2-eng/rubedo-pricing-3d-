@@ -10,6 +10,8 @@ interface MemoryNode {
   parentId: string | null
   data?: Blob
   createdSeq: number
+  /** Incremented on every content update (like Drive's `version`). */
+  version: number
   /**
    * Carries the app marker (appProperties.rubedo="1"): created through the DriveStore API (= by the app, v0.4+).
    * Foreign nodes simulate the Founder's own files; legacy nodes simulate app files from before v0.4 (no marker).
@@ -141,6 +143,7 @@ export class MemoryDrive implements DriveStore {
     n.data = data
     n.mimeType = mimeType
     n.modifiedTime = new Date().toISOString()
+    n.version += 1
     this.writeLog.push(`update:${n.name}`)
   }
 
@@ -188,6 +191,7 @@ export class MemoryDrive implements DriveStore {
       name: n.name,
       mimeType: n.mimeType,
       modifiedTime: n.modifiedTime,
+      version: String(n.version),
       parents: n.parentId ? [n.parentId] : [],
       appCreated: n.appCreated,
     }
@@ -219,6 +223,7 @@ export class MemoryDrive implements DriveStore {
     const node: MemoryNode = {
       id: `mem-${this.seq}`,
       createdSeq: this.seq,
+      version: 1,
       modifiedTime: new Date().toISOString(),
       ...init,
     }

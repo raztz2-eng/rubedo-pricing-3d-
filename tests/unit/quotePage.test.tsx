@@ -287,7 +287,7 @@ describe('AC31: session without gmail.compose', () => {
     expect(await screen.findByText('RootLab')).toBeTruthy()
     lib.unmount()
     const page = renderApp(services, `/model/${folderId}`)
-    expect(await screen.findByRole('link', { name: 'עריכה' })).toBeTruthy()
+    expect(await screen.findByRole('link', { name: 'עריכת הצעה' })).toBeTruthy()
     expect(screen.queryByText('נדרש אישור נוסף ל-Gmail')).toBeNull()
     page.unmount()
     renderApp(services, '/new')

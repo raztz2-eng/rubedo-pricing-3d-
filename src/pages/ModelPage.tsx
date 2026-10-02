@@ -92,8 +92,11 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   const sliced = contents.files.filter((f) => slicedIds.has(f.id) && !isGoogleNativeFile(f))
   const otherFiles = contents.files.filter((f) => !slicedIds.has(f.id))
   const coverId = displayCover(model)
-  /** Cover and description can change on a marked bid or a folder without bid.json — never on a pre-v0.4 bid. */
-  const editable = !legacyBid
+  /**
+   * Cover and description can change on a marked bid or a folder without bid.json — never on a pre-v0.4 bid, and never
+   * while the folder's `_rubedo-model.json` is damaged (it is not replaced; the Founder sees the problem, I3).
+   */
+  const editable = !legacyBid && !metaError
   const description = bid ? bid.description : (meta?.description ?? '')
   const currentActionError = actionError && actionError.folderId === folderId ? actionError : null
 
@@ -151,8 +154,12 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
     setActionError(null)
   }
 
+  // E3: the limit applies only to a changed description.
+  const descriptionChanged = descriptionText.trim() !== description.trim()
+  const descriptionBlocked = descriptionChanged && descriptionText.trim().length > DESCRIPTION_MAX_LENGTH
+
   const saveDescription = () => {
-    if (descriptionText.trim().length > DESCRIPTION_MAX_LENGTH) return
+    if (descriptionBlocked) return
     void runAction('description', () => setModelDescription(ctx.drive, ctx.folderId, model, descriptionText), 'שמירת התיאור נכשלה.').then(
       (ok) => ok && setEditingDescription(false),
     )
@@ -182,13 +189,20 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
       </div>
       {editingDescription ? (
         <div className="flex flex-col gap-2">
-          <DescriptionField label="תיאור הדגם" rows={5} value={descriptionText} onChange={setDescriptionText} autoFocus />
+          <DescriptionField
+            label="תיאור הדגם"
+            rows={5}
+            value={descriptionText}
+            onChange={setDescriptionText}
+            autoFocus
+            limitApplies={descriptionChanged}
+          />
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
               className="btn btn-primary"
               onClick={saveDescription}
-              disabled={action !== null || descriptionText.trim().length > DESCRIPTION_MAX_LENGTH}
+              disabled={action !== null || descriptionBlocked}
             >
               {action === 'description' ? 'שומר…' : 'שמירת תיאור'}
             </button>
@@ -285,8 +299,8 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
         <ul className="flex flex-col gap-1 text-sm" aria-label="קבצי הדגם">
           {[...sliced, ...otherFiles].map((f) => (
             <li key={f.id} className="flex items-center justify-between gap-2 rounded bg-stone-50 px-2 py-1">
-              <a className="truncate text-accent underline" dir="ltr" href={ctx.drive.fileUrl(f.id)} target="_blank" rel="noreferrer">
-                {f.name}
+              <a className="truncate text-accent underline" href={ctx.drive.fileUrl(f.id)} target="_blank" rel="noreferrer">
+                <bdi dir="ltr">{f.name}</bdi>
               </a>
               {!slicedIds.has(f.id) && !isGoogleNativeFile(f) && (
                 <button type="button" className="shrink-0 text-accent underline" onClick={() => download(f)} disabled={downloading === f.id}>
@@ -354,9 +368,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
               {CONVERT_LEGACY_LABEL}
             </Link>
           ) : (
-            // Visible label per brief v0.6 E1. The accessible name stays "עריכה" until the acceptance tests that look
-            // the link up by that name are updated (reported as a conflict).
-            <Link to={`/model/${encodeURIComponent(folderId)}/edit`} className="btn btn-primary" aria-label="עריכה" title="עריכת הצעה">
+            <Link to={`/model/${encodeURIComponent(folderId)}/edit`} className="btn btn-primary">
               <span aria-hidden="true">✎</span> עריכת הצעה
             </Link>
           )}

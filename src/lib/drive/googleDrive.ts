@@ -10,7 +10,7 @@ import { APP_PROPERTIES, assertUpdatable, hasAppMarker } from './writeGuard'
 
 const API = 'https://www.googleapis.com/drive/v3'
 const UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3'
-const FILE_FIELDS = 'id,name,mimeType,modifiedTime,thumbnailLink,parents,appProperties'
+const FILE_FIELDS = 'id,name,mimeType,modifiedTime,version,thumbnailLink,parents,appProperties'
 
 export interface TokenProvider {
   getToken(): Promise<string>
@@ -30,6 +30,7 @@ interface RawFile {
   name: string
   mimeType: string
   modifiedTime?: string
+  version?: string | number
   thumbnailLink?: string
   parents?: string[]
   appProperties?: Record<string, string>
@@ -38,6 +39,7 @@ interface RawFile {
 function toDriveFile(raw: RawFile): DriveFile {
   const f: DriveFile = { id: raw.id, name: raw.name, mimeType: raw.mimeType, appCreated: hasAppMarker(raw.appProperties) }
   if (raw.modifiedTime) f.modifiedTime = raw.modifiedTime
+  if (raw.version !== undefined && raw.version !== null) f.version = String(raw.version)
   if (raw.thumbnailLink) f.thumbnailLink = raw.thumbnailLink
   if (Array.isArray(raw.parents)) f.parents = raw.parents
   return f

@@ -14,8 +14,9 @@ export interface Customer {
   notes?: string
   /** Hidden customers are left out of pickers and shown on the customers page only under a toggle. */
   hidden?: boolean
-  createdAt: string
-  updatedAt: string
+  /** Always written by the app; absent only in entries someone else wrote without it (never written as ''). */
+  createdAt?: string
+  updatedAt?: string
 }
 
 /** What the add/edit form controls. */
@@ -28,31 +29,52 @@ export interface CustomerInput {
 
 export const DUPLICATE_EMAIL_MESSAGE = 'כבר קיים לקוח עם כתובת המייל הזו.'
 
+const optionalString = (v: unknown) => v === undefined || typeof v === 'string'
+
 function isCustomer(c: unknown): c is Customer {
-  if (!c || typeof c !== 'object') return false
-  const x = c as Customer
-  return typeof x.id === 'string' && x.id !== '' && typeof x.name === 'string' && typeof x.email === 'string'
+  if (!c || typeof c !== 'object' || Array.isArray(c)) return false
+  const x = c as Record<string, unknown>
+  return (
+    typeof x.id === 'string' &&
+    x.id !== '' &&
+    typeof x.name === 'string' &&
+    typeof x.email === 'string' &&
+    optionalString(x.phone) &&
+    optionalString(x.notes) &&
+    optionalString(x.createdAt) &&
+    optionalString(x.updatedAt) &&
+    (x.hidden === undefined || typeof x.hidden === 'boolean')
+  )
 }
 
 /**
- * Validates `_rubedo-customers.json`. The brief's format is a bare array; null when the content is not one
- * (the caller reports it — a damaged list is never silently replaced by an empty one).
+ * Validates `_rubedo-customers.json` (the brief's format: a bare array). null when the content is not one OR when ANY
+ * entry is not a valid customer (C1): the caller then reports the file as damaged and writes nothing — a list that
+ * cannot be fully understood is never rewritten. Entries are kept as they are, unknown fields included.
  */
 export function parseCustomers(raw: unknown): Customer[] | null {
   if (!Array.isArray(raw)) return null
-  return raw.filter(isCustomer).map((c) => {
-    const out: Customer = {
-      id: c.id,
-      name: c.name,
-      email: c.email,
-      createdAt: typeof c.createdAt === 'string' ? c.createdAt : '',
-      updatedAt: typeof c.updatedAt === 'string' ? c.updatedAt : '',
+  if (!raw.every(isCustomer)) return null
+  return raw.map((c) => ({ ...c }))
+}
+
+function updatedAtOf(c: Customer): string {
+  return typeof c.updatedAt === 'string' ? c.updatedAt : ''
+}
+
+/**
+ * Several customers files (e.g. two created at the same moment) are read as ONE list (I1c): merged by id, the entry
+ * with the newer updatedAt wins; order = first appearance.
+ */
+export function mergeCustomerLists(lists: readonly (readonly Customer[])[]): Customer[] {
+  const byId = new Map<string, Customer>()
+  for (const list of lists) {
+    for (const c of list) {
+      const seen = byId.get(c.id)
+      if (!seen || updatedAtOf(c) > updatedAtOf(seen)) byId.set(c.id, c)
     }
-    if (typeof c.phone === 'string' && c.phone !== '') out.phone = c.phone
-    if (typeof c.notes === 'string' && c.notes !== '') out.notes = c.notes
-    if (c.hidden === true) out.hidden = true
-    return out
-  })
+  }
+  return [...byId.values()]
 }
 
 /** Hebrew problems of a customer form (empty = OK). */
@@ -119,8 +141,10 @@ export function withUpdatedCustomer(customers: readonly Customer[], id: string, 
   const current = customers.find((c) => c.id === id)
   if (!current) throw new CustomerError('הלקוח לא נמצא ברשימה.')
   assertValid(customers, input, id)
-  const customer: Customer = { id, ...clean(input), createdAt: current.createdAt, updatedAt: now.toISOString() }
-  if (current.hidden) customer.hidden = true
+  // Every other field (createdAt, hidden, fields the app does not know) is kept as it was.
+  const customer: Customer = { ...current, ...clean(input), updatedAt: now.toISOString() }
+  if (!input.phone?.trim()) delete customer.phone
+  if (!input.notes?.trim()) delete customer.notes
   return { list: customers.map((c) => (c.id === id ? customer : c)), customer }
 }
 
@@ -149,19 +173,30 @@ export function byDateDesc(a: { date: string }, b: { date: string }): number {
   return a.date < b.date ? 1 : a.date > b.date ? -1 : 0
 }
 
-/** Index summary: quotes grouped by customerId when the log has one, else by lower-case e-mail. */
-export function summariseQuotes(quotes: readonly QuoteSummary[]): CustomerQuoteSummary[] {
+/**
+ * Index summary: quotes grouped by customerId. A log without one (written before v0.6) joins the customer with its
+ * e-mail — taken from `customers` when given, else from other logs of that e-mail that carry an id; otherwise it is
+ * grouped by lower-case e-mail.
+ */
+export function summariseQuotes(quotes: readonly QuoteSummary[], customers?: readonly Customer[]): CustomerQuoteSummary[] {
+  const idByEmail = new Map<string, string>()
+  if (customers) for (const c of customers) idByEmail.set(normaliseEmail(c.email), c.id)
+  else for (const q of quotes) if (q.customerId && !idByEmail.has(q.email)) idByEmail.set(q.email, q.customerId)
   const groups = new Map<string, CustomerQuoteSummary>()
   for (const q of quotes) {
-    const key = q.customerId ? `id:${q.customerId}` : `email:${q.email}`
+    const customerId = q.customerId ?? idByEmail.get(q.email)
+    const key = customerId ? `id:${customerId}` : `email:${q.email}`
     const g = groups.get(key)
     if (!g) {
       const entry: CustomerQuoteSummary = { email: q.email, quoteCount: 1, lastQuoteAt: q.date }
-      if (q.customerId) entry.customerId = q.customerId
+      if (customerId) entry.customerId = customerId
       groups.set(key, entry)
     } else {
       g.quoteCount += 1
-      if (q.date > g.lastQuoteAt) g.lastQuoteAt = q.date
+      if (q.date > g.lastQuoteAt) {
+        g.lastQuoteAt = q.date
+        g.email = q.email
+      }
     }
   }
   return [...groups.values()].sort(byLastQuoteDesc)

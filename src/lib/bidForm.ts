@@ -140,15 +140,21 @@ export function invalidFields(d: BidDraft): string[] {
     check(`חומרה ${i + 1} — כמות`, l.qty)
     check(`חומרה ${i + 1} — מחיר`, l.unitCost)
   })
-  if (d.description.trim().length > DESCRIPTION_MAX_LENGTH) bad.push(`תיאור (עד ${DESCRIPTION_MAX_LENGTH} תווים)`)
-  if (d.hasShipping) {
-    d.packaging.forEach((l, i) => {
-      check(`אריזה ${i + 1} — כמות`, l.qty)
-      check(`אריזה ${i + 1} — מחיר`, l.unitCost)
-    })
-    check('עלות משלוח', d.shippingCost)
-  }
+  // Packaging rows are saved even while the toggle is off (they are kept with the model), so they must be valid too.
+  d.packaging.forEach((l, i) => {
+    check(`אריזה ${i + 1} — כמות`, l.qty)
+    check(`אריזה ${i + 1} — מחיר`, l.unitCost)
+  })
+  check('עלות משלוח', d.shippingCost)
   return bad
+}
+
+/**
+ * The 2000-character limit (v0.6 E3) applies only to a description that was changed: an older, longer text can
+ * still be saved as it is. `original` = the description the form started with.
+ */
+export function descriptionTooLong(d: Pick<BidDraft, 'description'>, original: string): boolean {
+  return d.description.trim() !== original.trim() && d.description.trim().length > DESCRIPTION_MAX_LENGTH
 }
 
 /** Save is allowed when there is a name and at least one part with grams > 0 or hours > 0. */
@@ -209,9 +215,11 @@ export function draftToContent(d: BidDraft, settingsSnapshot: PricingSettings, r
     }),
     laborMinutes: pi.laborMinutes,
     hardware: hardwareToBid(d.hardware),
+    // Kept even when "includes packaging & shipping" is off: pricing ignores them then (packaging = 0), and turning the
+    // toggle back on later brings the same rows back.
     hasShipping: d.hasShipping,
-    packaging: d.hasShipping ? linesToBid(d.packaging) : [],
-    shippingCost: d.hasShipping ? pi.shippingCost : 0,
+    packaging: linesToBid(d.packaging),
+    shippingCost: pi.shippingCost,
     settingsSnapshot: { ...settingsSnapshot },
     result,
   }

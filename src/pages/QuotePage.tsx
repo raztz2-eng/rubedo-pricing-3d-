@@ -12,7 +12,7 @@ import { pickCover } from '../lib/drive/folderContents'
 import { writeQuoteLog } from '../lib/drive/quoteLog'
 import type { DriveFile } from '../lib/drive/types'
 import { errorMessage, logError } from '../lib/errors'
-import { isValidAmount, parseNumber } from '../lib/format'
+import { isValidAmount, ltrIsolate, parseNumber } from '../lib/format'
 import { AttachmentError, loadAttachments } from '../lib/mail/attachments'
 import { buildMimeMessage } from '../lib/mail/mime'
 import {
@@ -227,15 +227,17 @@ function QuoteForm({
     setPhase('customer')
     try {
       const r = await ensureQuoteCustomer(ctx.drive, ctx.folderId, record.customer, record.customerId)
+      const email = ltrIsolate(r.customer.email)
+      const notes: string[] = []
       if (r.created) {
         setCustomers((list) => (list ? [...list, r.customer] : list))
-        setCustomerNotice({ tone: 'info', text: `${r.customer.name} נוסף/ה לרשימת הלקוחות.` })
-      } else if (r.storedNameDiffers) {
-        setCustomerNotice({
-          tone: 'info',
-          text: `המייל ${r.customer.email} כבר שמור ברשימת הלקוחות בשם „${r.customer.name}” — השם השמור לא שונה.`,
-        })
-      } else setCustomerNotice(null)
+        notes.push(`${r.customer.name} נוסף/ה לרשימת הלקוחות.`)
+      }
+      if (r.storedNameDiffers) notes.push(`המייל ${email} כבר שמור ברשימת הלקוחות בשם „${r.customer.name}” — השם השמור לא שונה.`)
+      if (r.hidden) {
+        notes.push(`הלקוח/ה „${r.customer.name}” (${email}) מוסתר/ת ברשימת הלקוחות — ההצעה נרשמה עבורו/ה. אפשר להציג אותו/ה שוב בעמוד הלקוח.`)
+      }
+      setCustomerNotice(notes.length > 0 ? { tone: 'info', text: notes.join(' ') } : null)
     } catch (e) {
       logError('save quote customer', e)
       setCustomerNotice({
@@ -303,7 +305,8 @@ function QuoteForm({
     }
     setDraft(created)
     // The log names the customer: a known e-mail → that customer; a new one → the id the customer gets after the draft.
-    const customerId = (customers ? findByEmail(customers, customerEmail)?.id : undefined) ?? newId()
+    // The list failed to load → no id at all (the log is matched by e-mail later); never a made-up id.
+    const customerId = customers ? (findByEmail(customers, customerEmail)?.id ?? newId()) : undefined
     // Q4: the log is written only after the draft exists.
     await writeLog(
       buildQuoteRecord({
@@ -467,8 +470,8 @@ function QuoteForm({
                         aria-label={`צירוף ${f.name}`}
                         onChange={(e) => toggleImage(f.id, e.target.checked)}
                       />
-                      <span className="truncate" dir="ltr">
-                        {f.name}
+                      <span className="truncate">
+                        <bdi dir="ltr">{f.name}</bdi>
                       </span>
                     </span>
                   </label>

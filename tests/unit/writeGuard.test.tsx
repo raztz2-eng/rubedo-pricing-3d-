@@ -174,7 +174,7 @@ describe('I2 (fix round) — a bid saved before v0.4 (bid.json without marker) i
     renderApp(services, `/model/${folder}`)
     await screen.findByRole('heading', { level: 1, name: 'Old stand' })
     expect(screen.getByTestId('legacy-bid-notice').textContent).toBe(LEGACY_BID_MESSAGE)
-    expect(screen.queryByRole('link', { name: 'עריכה' })).toBeNull()
+    expect(screen.queryByRole('link', { name: 'עריכת הצעה' })).toBeNull()
     // E1: conversion = the "create again" flow.
     expect(screen.getByRole('link', { name: 'המר להצעה ניתנת לעריכה' }).getAttribute('href')).toBe(`/model/${folder}/create`)
     // Cover/description of a read-only bid cannot be changed from the page.
@@ -211,7 +211,7 @@ describe('I2 (fix round) — a bid saved before v0.4 (bid.json without marker) i
     expect(d.writeTargets.filter((w) => w.op === 'updateFileContent').map((w) => w.targetId)).not.toContain(legacyId)
     // The marked copy wins (M3): no legacy notice, "edit" is back.
     expect(screen.queryByTestId('legacy-bid-notice')).toBeNull()
-    expect(screen.getByRole('link', { name: 'עריכה' })).toBeTruthy()
+    expect(screen.getByRole('link', { name: 'עריכת הצעה' })).toBeTruthy()
   })
 })
 

@@ -11,16 +11,19 @@ export function DescriptionField({
   label = 'תיאור',
   rows = 3,
   autoFocus,
+  limitApplies = true,
 }: {
   value: string
   onChange: (value: string) => void
   label?: string
   rows?: number
   autoFocus?: boolean
+  /** False while the text is still the saved one: an older, longer description is not flagged until it is changed. */
+  limitApplies?: boolean
 }) {
   const id = useId()
   const length = value.trim().length
-  const tooLong = length > DESCRIPTION_MAX_LENGTH
+  const tooLong = limitApplies && length > DESCRIPTION_MAX_LENGTH
   return (
     <div className="flex flex-col gap-1">
       <label htmlFor={id}>{label}</label>
