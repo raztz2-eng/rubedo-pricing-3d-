@@ -92,3 +92,7 @@ uptime 0.5, powerW 150, kwhPrice 0.64, buffer 1.3, material price ₪85/kg for P
 - Test fixtures must never use real secret prefixes (e.g. GOCSPX-) — push protection and scanners flag them. (v0.4)
 - When a Founder decision changes an asserted rule, COO has the test-verifier update affected acceptance tests right
   after the builder; the builder reports conflicts instead of editing tests/acceptance/. (v0.3/v0.4)
+- Read–modify–write of an app JSON file must re-check the file's revision (modifiedTime + version) right before the
+  update; parsers must reject a whole file if any entry is malformed — never filter entries and write back. (v0.6)
+- When a brief adds a write to an existing success path, check acceptance tests that count writes and report the
+  conflict before implementing. (v0.6)
