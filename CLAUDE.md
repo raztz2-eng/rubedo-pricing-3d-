@@ -96,3 +96,5 @@ uptime 0.5, powerW 150, kwhPrice 0.64, buffer 1.3, material price ₪85/kg for P
   update; parsers must reject a whole file if any entry is malformed — never filter entries and write back. (v0.6)
 - When a brief adds a write to an existing success path, check acceptance tests that count writes and report the
   conflict before implementing. (v0.6)
+- Every read–modify–write of an app JSON file goes through ONE per-file pattern: per-target promise chain, revision
+  re-check right before the write (also after slow uploads), merge of duplicate marked files. Never hand-roll a second one. (v0.7)
