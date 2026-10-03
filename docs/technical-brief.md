@@ -305,3 +305,23 @@ AC36 Customers: add/edit/hide/search; email uniqueness; nothing is ever deleted.
 AC37 Quote screen picker fills name+email; a new customer is saved only after a successful draft; failed draft saves nothing.
 AC38 Customer page lists quotes from all models (incl. old logs matched by email) newest first, and "new quote"
      opens the quote screen prefilled.
+
+---
+# Addendum v0.7 — Remove model from library = archive (Founder decision, 3 Oct 2026)
+Founder asked for "delete a model from the library" and chose **remove from library only** (no Drive deletion).
+
+A1 Model page (priced and needs-slicing) gets "הסר מהספרייה" → confirm dialog ("המודל יוסתר מהספרייה. הקבצים נשארים
+   ב-Drive ואפשר לשחזר מהארכיון.") → sets `archived: true` + `archivedAt`:
+   priced (marked bid.json) → in bid.json via the existing stale-safe update path;
+   needs-slicing or pre-v0.4 bid → in `<folder>/_rubedo-model.json` (marked, create or update).
+A2 Library hides archived models by default. A toggle/link "ארכיון (N)" shows only archived models, each with
+   "שחזר לספרייה" (sets archived:false). Search works in both views.
+A3 Archived models: excluded from the customer-page model chooser; their quote history stays visible on customer pages.
+   Opening an archived model's page directly works and shows a banner "המודל בארכיון" + restore button.
+A4 Index stores `archived` per entry (index schemaVersion bump; old index = stale).
+A5 Still NO delete/trash/move/rename anywhere; static safety test unchanged.
+
+AC39 Archiving a priced model writes only its bid.json (marker kept); a needs-slicing model writes only _rubedo-model.json;
+     card disappears from the main library and appears under the archive; no other Drive change.
+AC40 Restore brings it back; data identical apart from archived/archivedAt/updatedAt.
+AC41 Archived models are absent from the "new quote" model chooser but their quotes remain on customer pages.
