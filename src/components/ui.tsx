@@ -110,23 +110,121 @@ export function BlobImage({ blob, alt, className = '' }: { blob: Blob; alt: stri
   return <img src={url} alt={alt} className={className} />
 }
 
-export function Dialog({ title, children, onClose }: { title: string; children: ReactNode; onClose: () => void }) {
+const FOCUSABLE =
+  'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+
+/**
+ * Accessible in-app modal: role="dialog" + aria-modal, labelled by its title, focus goes into it (to `initialFocus`
+ * or the dialog itself), Tab / Shift+Tab stay inside (focus trap), Escape closes, and focus returns to the element
+ * that opened it. Never use window.confirm / alert.
+ */
+export function Dialog({
+  title,
+  children,
+  onClose,
+  describedBy,
+  initialFocus,
+}: {
+  title: string
+  children: ReactNode
+  onClose: () => void
+  /** id of the element that describes the dialog (aria-describedby). */
+  describedBy?: string
+  initialFocus?: React.RefObject<HTMLElement | null>
+}) {
   const ref = useRef<HTMLDivElement>(null)
+  const titleId = useId()
+  // The latest onClose, so a new callback each render neither re-runs the effect nor steals focus.
+  const onCloseRef = useRef(onClose)
+  onCloseRef.current = onClose
   useEffect(() => {
-    ref.current?.focus()
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    ;(initialFocus?.current ?? ref.current)?.focus()
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        onCloseRef.current()
+        return
+      }
+      if (e.key !== 'Tab' || !ref.current) return
+      const items = Array.from(ref.current.querySelectorAll<HTMLElement>(FOCUSABLE))
+      if (items.length === 0) {
+        e.preventDefault()
+        ref.current.focus()
+        return
+      }
+      const first = items[0]
+      const last = items[items.length - 1]
+      const active = document.activeElement
+      const inside = active instanceof Node && ref.current.contains(active)
+      if (e.shiftKey && (active === first || active === ref.current || !inside)) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && (active === last || !inside)) {
+        e.preventDefault()
+        first.focus()
+      }
     }
     window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose])
+    return () => {
+      window.removeEventListener('keydown', onKey)
+      if (opener && opener.isConnected) opener.focus()
+    }
+    // Runs once per opening; initialFocus is a ref.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-4 sm:items-center">
-      <div ref={ref} tabIndex={-1} role="dialog" aria-modal="true" aria-label={title} className="card w-full max-w-md outline-none">
-        <h2 className="mb-3 text-lg font-bold">{title}</h2>
+      <div
+        ref={ref}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={describedBy}
+        className="card w-full max-w-md outline-none"
+      >
+        <h2 id={titleId} className="mb-3 text-lg font-bold">
+          {title}
+        </h2>
         {children}
       </div>
     </div>
+  )
+}
+
+/** Yes/no question in an accessible modal (Escape or "ביטול" = cancel). Focus starts on cancel (the safe choice). */
+export function ConfirmDialog({
+  title,
+  message,
+  confirmLabel,
+  cancelLabel = 'ביטול',
+  onConfirm,
+  onCancel,
+}: {
+  title: string
+  message: ReactNode
+  confirmLabel: string
+  cancelLabel?: string
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const messageId = useId()
+  const cancelRef = useRef<HTMLButtonElement>(null)
+  return (
+    <Dialog title={title} onClose={onCancel} describedBy={messageId} initialFocus={cancelRef}>
+      <p id={messageId} className="mb-4 text-stone-700">
+        {message}
+      </p>
+      <div className="flex flex-wrap gap-2">
+        <button type="button" className="btn btn-primary" onClick={onConfirm}>
+          {confirmLabel}
+        </button>
+        <button ref={cancelRef} type="button" className="btn btn-secondary" onClick={onCancel}>
+          {cancelLabel}
+        </button>
+      </div>
+    </Dialog>
   )
 }
 

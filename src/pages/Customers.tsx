@@ -3,7 +3,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { DriveImage } from '../components/DriveImage'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
 import { Dialog, ErrorBox, Field, Money, Notice, Spinner } from '../components/ui'
-import { isPriced, type IndexEntry, type QuoteSummary } from '../lib/bid'
+import { isArchived, isPriced, type IndexEntry, type QuoteSummary } from '../lib/bid'
 import { customerProblems, matchesCustomer, quotesForCustomer, type Customer, type CustomerInput } from '../lib/customers'
 import { loadQuoteHistory, type QuoteHistory } from '../lib/drive/bidRepository'
 import { addCustomer, loadCustomers, setCustomerHidden, updateCustomer } from '../lib/drive/customerStore'
@@ -432,7 +432,8 @@ function ModelChooser({
   const [query, setQuery] = useState('')
   const priced = useMemo(() => {
     const q = query.trim().toLocaleLowerCase()
-    return (entries ?? []).filter((e) => isPriced(e) && (q === '' || e.name.toLocaleLowerCase().includes(q)))
+    // v0.7 A3: archived models are not offered for a new quote (their past quotes stay on the customer page).
+    return (entries ?? []).filter((e) => isPriced(e) && !isArchived(e) && (q === '' || e.name.toLocaleLowerCase().includes(q)))
   }, [entries, query])
 
   return (

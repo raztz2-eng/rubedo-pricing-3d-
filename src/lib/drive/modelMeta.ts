@@ -12,16 +12,31 @@ export interface ModelMeta {
   schemaVersion: 1
   coverFileId?: string
   description?: string
+  /**
+   * v0.7 A1: removed from the library. Used for folders without a marked bid.json (needs-slicing, or a pre-v0.4 bid
+   * whose old bid.json is never touched).
+   */
+  archived?: boolean
+  archivedAt?: string
   updatedAt: string
 }
 
-/** Validates the content of a `_rubedo-model.json`; null when it is not one. Unknown fields are dropped. */
+export type ModelMetaPatch = { coverFileId?: string; description?: string; archived?: boolean; archivedAt?: string }
+
+/**
+ * Validates the content of a `_rubedo-model.json`; null when it is not one. Unknown fields are dropped.
+ * An `archived` / `archivedAt` of the wrong type makes the whole file invalid (never dropped and written back).
+ */
 export function parseModelMeta(raw: unknown): ModelMeta | null {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-  const r = raw as Partial<ModelMeta>
+  const r = raw as Record<string, unknown>
+  if (r.archived !== undefined && typeof r.archived !== 'boolean') return null
+  if (r.archivedAt !== undefined && typeof r.archivedAt !== 'string') return null
   const meta: ModelMeta = { schemaVersion: 1, updatedAt: typeof r.updatedAt === 'string' ? r.updatedAt : '' }
   if (typeof r.coverFileId === 'string' && r.coverFileId !== '') meta.coverFileId = r.coverFileId
   if (typeof r.description === 'string') meta.description = r.description
+  if (typeof r.archived === 'boolean') meta.archived = r.archived
+  if (typeof r.archivedAt === 'string') meta.archivedAt = r.archivedAt
   return meta
 }
 
@@ -71,13 +86,15 @@ export async function readCurrentModelMeta(store: DriveStore, folderId: string):
 export async function writeModelMeta(
   store: DriveStore,
   folderId: string,
-  patch: { coverFileId?: string; description?: string },
+  patch: ModelMetaPatch,
   now: Date = new Date(),
 ): Promise<ModelMeta> {
   const current = await readCurrentModelMeta(store, folderId)
   if (patch.description !== undefined && patch.description !== (current?.description ?? '')) assertDescriptionLength(patch.description)
   const next: ModelMeta = { ...(current ?? { schemaVersion: 1 }), ...patch, schemaVersion: 1, updatedAt: now.toISOString() }
   if (!next.coverFileId) delete next.coverFileId
+  // A restore clears the archive time (archived:false is kept, so the file says it was restored).
+  if (next.archivedAt === undefined || next.archived !== true) delete next.archivedAt
   await writeJsonFile(store, folderId, MODEL_META_FILE_NAME, next)
   return next
 }

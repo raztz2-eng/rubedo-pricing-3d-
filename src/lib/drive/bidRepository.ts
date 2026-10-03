@@ -118,7 +118,7 @@ export interface IndexData {
   entries: IndexEntry[]
   /**
    * When the index was last fully rebuilt; undefined (→ stale) for index files older than this version's schema
-   * (pre-v0.3 bare arrays, v2 files without the quote history).
+   * (pre-v0.3 bare arrays, v2 files without the quote history, v3 files without the archived flag).
    */
   builtAt?: string
   /** Quote logs of all models, newest first (v3; [] for older index files). */
@@ -131,6 +131,7 @@ function isIndexEntry(e: unknown): e is IndexEntry {
   if (!e || typeof e !== 'object') return false
   const x = e as IndexEntry
   if (typeof x.id !== 'string' || typeof x.name !== 'string') return false
+  if (x.archived !== undefined && typeof x.archived !== 'boolean') return false
   return x.status === 'needs-slicing' || typeof x.price70 === 'number'
 }
 
@@ -150,7 +151,7 @@ function isQuoteSummary(q: unknown): q is QuoteSummary {
 
 /**
  * Reads the index cache. Returns null (→ caller rebuilds) when it is missing, not valid JSON or malformed.
- * Accepts older formats (bare array; schemaVersion 2) as stale. Drive/network errors are rethrown.
+ * Accepts older formats (bare array; schemaVersion 2 and 3) as stale. Drive/network errors are rethrown.
  */
 export async function readIndex(store: DriveStore, modelsFolderId: string): Promise<IndexData | null> {
   const file = await findFile(store, modelsFolderId, INDEX_FILE_NAME)
@@ -212,28 +213,40 @@ export interface RebuildResult {
 
 type FolderScan = { entry?: IndexEntry; skipped?: string; quotesFolder?: DriveFile } | null
 
-/** Cover chosen in `_rubedo-model.json`, if it is still one of the folder's pictures. A damaged file is ignored here. */
-async function metaCover(store: DriveStore, contents: FolderContents): Promise<string | undefined> {
-  if (!contents.metaFile) return undefined
+/** What the library takes from a folder's `_rubedo-model.json`: the chosen cover (v0.6 E2) and the archive flag (v0.7). */
+interface MetaInfo {
+  /** Only if it is still one of the folder's pictures. */
+  cover?: string
+  archived: boolean
+}
+
+function metaInfoOf(meta: ModelMeta | null | undefined, contents: FolderContents): MetaInfo {
+  const cover = meta?.coverFileId && contents.images.some((i) => i.id === meta.coverFileId) ? meta.coverFileId : undefined
+  return { ...(cover ? { cover } : {}), archived: meta?.archived === true }
+}
+
+/** Reads `_rubedo-model.json` for the library. A damaged file is ignored here (not archived, default cover). */
+async function readMetaInfo(store: DriveStore, contents: FolderContents): Promise<MetaInfo> {
+  if (!contents.metaFile) return { archived: false }
   try {
-    const meta = await readModelMeta(store, contents.metaFile)
-    return meta.coverFileId && contents.images.some((i) => i.id === meta.coverFileId) ? meta.coverFileId : undefined
+    return metaInfoOf(await readModelMeta(store, contents.metaFile), contents)
   } catch (e) {
     // The model page shows the problem; the library falls back to the default cover rule.
-    if (e instanceof InvalidModelMetaError) return undefined
+    if (e instanceof InvalidModelMetaError) return { archived: false }
     throw e
   }
 }
 
-/** Library card of a folder without bid.json (N1); `chosenCover` from `_rubedo-model.json` (v0.6 E2). */
-function needsSlicingEntry(folder: DriveFile, contents: FolderContents, chosenCover?: string): IndexEntry {
+/** Library card of a folder without bid.json (N1); cover/archived from `_rubedo-model.json` (v0.6 E2, v0.7 A1). */
+function needsSlicingEntry(folder: DriveFile, contents: FolderContents, meta: MetaInfo = { archived: false }): IndexEntry {
   const entry: IndexEntry = {
     id: folder.id,
     name: folder.name.trim(),
     status: 'needs-slicing',
     revision: '',
-    coverFileId: pickCover(contents.images, chosenCover),
+    coverFileId: pickCover(contents.images, meta.cover),
     updatedAt: folder.modifiedTime ?? '',
+    archived: meta.archived,
   }
   if (!entry.coverFileId) delete entry.coverFileId
   if (contents.sliced[0]) entry.slicedFileId = contents.sliced[0].id
@@ -248,7 +261,7 @@ async function scanModelFolder(store: DriveStore, folder: DriveFile): Promise<Fo
   if (!contents.bidFile) {
     // A folder the app created but never finished (save failed before bid.json) is not a model (brief §5).
     if (folder.appCreated === true) return null
-    return withQuotes({ entry: needsSlicingEntry(folder, contents, await metaCover(store, contents)) })
+    return withQuotes({ entry: needsSlicingEntry(folder, contents, await readMetaInfo(store, contents)) })
   }
   let raw: unknown
   try {
@@ -262,6 +275,8 @@ async function scanModelFolder(store: DriveStore, folder: DriveFile): Promise<Fo
   const entry = indexEntryFromBid(folder.id, bid)
   entry.coverFileId = pickCover(contents.images, bid.coverFileId)
   if (!entry.coverFileId) delete entry.coverFileId
+  // A pre-v0.4 (unmarked) bid.json is never written: its archive flag lives in `_rubedo-model.json` (v0.7 A1).
+  if (contents.bidFile.appCreated !== true) entry.archived = (await readMetaInfo(store, contents)).archived
   return withQuotes({ entry })
 }
 
@@ -417,7 +432,10 @@ export interface ModelFolder {
   bid?: Bid
   /** The bid.json shown has no app marker (saved before v0.4): read-only, can only be converted (E1). */
   legacyBid?: boolean
-  /** v0.6: `_rubedo-model.json` of a folder WITHOUT bid.json (cover + description). */
+  /**
+   * v0.6: `_rubedo-model.json` of a folder WITHOUT bid.json (cover + description + archived), or — v0.7 — of a folder
+   * with a pre-v0.4 bid (only its archived flag is used then).
+   */
   meta?: ModelMeta
   /** The meta file exists but could not be used (Hebrew); the page shows it, cover/description fall back. */
   metaError?: string
@@ -448,12 +466,26 @@ export async function loadModelFolder(store: DriveStore, folderId: string): Prom
   }
   const bid = parseBid(await readJson(store, contents.bidFile.id, BID_FILE_NAME))
   if (!bid) throw new DriveError('bid.json invalid', 'קובץ bid.json פגום או בגרסה לא נתמכת.')
-  return { folder, contents, bid, ...(contents.bidFile.appCreated === true ? {} : { legacyBid: true }) }
+  if (contents.bidFile.appCreated === true) return { folder, contents, bid }
+  // Pre-v0.4 bid: its archive flag (v0.7) is in `_rubedo-model.json`.
+  if (!contents.metaFile) return { folder, contents, bid, legacyBid: true }
+  try {
+    return { folder, contents, bid, legacyBid: true, meta: await readModelMeta(store, contents.metaFile) }
+  } catch (e) {
+    if (e instanceof InvalidModelMetaError) return { folder, contents, bid, legacyBid: true, metaError: e.userMessage }
+    throw e
+  }
+}
+
+/** v0.7: is the model archived? A marked bid keeps the flag in bid.json; anything else in `_rubedo-model.json`. */
+export function isModelArchived(model: Pick<ModelFolder, 'bid' | 'legacyBid' | 'meta'>): boolean {
+  if (model.bid && !model.legacyBid) return model.bid.archived === true
+  return model.meta?.archived === true
 }
 
 /** The cover the model page / library show: the chosen one (bid or `_rubedo-model.json`) if still in the folder, else the default rule. */
 export function displayCover(model: Pick<ModelFolder, 'contents' | 'bid' | 'meta'>): string | undefined {
-  const chosen = model.bid?.coverFileId ?? model.meta?.coverFileId
+  const chosen = model.bid ? model.bid.coverFileId : model.meta?.coverFileId
   if (chosen && (model.bid || model.contents.images.some((i) => i.id === chosen))) return chosen
   return pickCover(model.contents.images)
 }
@@ -683,6 +715,7 @@ export async function updateBid(
       firstImage(newUploads.filter((f) => !isPlatePictureName(f.name))),
   }
   if (!bid.coverFileId) delete bid.coverFileId
+  if (bid.archived !== true) delete bid.archivedAt
 
   await store.updateFileContent(bidFile.id, jsonBlob(bid), JSON_MIME)
   session.writtenUpdatedAt = bid.updatedAt
@@ -740,11 +773,13 @@ async function changeBidField(
   return updateBid(store, modelsFolderId, { folderId, existing: fresh, now, ...apply(fresh) }, session)
 }
 
-/** After a `_rubedo-model.json` change: the folder's library card shows the chosen cover (AC34). */
-async function refreshNeedsSlicingEntry(store: DriveStore, modelsFolderId: string, model: ModelFolder, cover?: string): Promise<void> {
+/**
+ * After a `_rubedo-model.json` change (`meta` = what was written): the folder's library card shows the chosen cover
+ * (AC34) and keeps / gets its archive flag (v0.7).
+ */
+async function refreshNeedsSlicingEntry(store: DriveStore, modelsFolderId: string, model: ModelFolder, meta: ModelMeta): Promise<void> {
   const contents = classifyFolder(await store.listChildren(model.folder.id))
-  const chosen = cover && contents.images.some((i) => i.id === cover) ? cover : undefined
-  await upsertIndexEntry(store, modelsFolderId, needsSlicingEntry(model.folder, contents, chosen))
+  await upsertIndexEntry(store, modelsFolderId, needsSlicingEntry(model.folder, contents, metaInfoOf(meta, contents)))
 }
 
 /**
@@ -765,8 +800,8 @@ export async function setModelCover(
     await changeBidField(store, modelsFolderId, folderId, (fresh) => ({ content: bidContentOf(fresh), newFiles: [], coverFileId: fileId }), newSaveSession(), now)
     return
   }
-  await writeModelMeta(store, folderId, { coverFileId: fileId }, now)
-  await refreshNeedsSlicingEntry(store, modelsFolderId, model, fileId)
+  const meta = await writeModelMeta(store, folderId, { coverFileId: fileId }, now)
+  await refreshNeedsSlicingEntry(store, modelsFolderId, model, meta)
 }
 
 /**
@@ -798,8 +833,8 @@ export async function uploadModelCover(
   await readCurrentModelMeta(store, folderId)
   await uploadMissing(store, folderId, [file], session)
   const coverId = session.uploaded[file.key].id
-  await writeModelMeta(store, folderId, { coverFileId: coverId }, now)
-  await refreshNeedsSlicingEntry(store, modelsFolderId, model, coverId)
+  const meta = await writeModelMeta(store, folderId, { coverFileId: coverId }, now)
+  await refreshNeedsSlicingEntry(store, modelsFolderId, model, meta)
   return coverId
 }
 
@@ -829,4 +864,54 @@ export async function setModelDescription(
     return
   }
   await writeModelMeta(store, model.folder.id, { description: text }, now)
+}
+
+// ---------- Remove from library = archive (v0.7) ----------
+
+/** Text of the confirm dialog before archiving (A1). */
+export const ARCHIVE_CONFIRM_MESSAGE = 'המודל יוסתר מהספרייה. הקבצים נשארים ב-Drive ואפשר לשחזר מהארכיון.'
+export const ARCHIVE_LABEL = 'הסר מהספרייה'
+export const RESTORE_LABEL = 'שחזר לספרייה'
+export const ARCHIVED_BANNER = 'המודל בארכיון'
+
+/**
+ * "הסר מהספרייה" / "שחזר לספרייה" (v0.7 A1/A2). Only one app file changes, nothing else in Drive:
+ * - marked bid.json → `archived` / `archivedAt` via the stale-safe single-field update (re-read, only that field changes);
+ * - folder without bid.json, or with a pre-v0.4 bid.json (never touched) → `<folder>/_rubedo-model.json` (created
+ *   marked, or merged after a re-read; a damaged one is refused, never replaced).
+ * Then the library index entry is updated. The folder is read again here, so the call works from the library too.
+ */
+export async function setModelArchived(
+  store: DriveStore,
+  modelsFolderId: string,
+  folderId: string,
+  archived: boolean,
+  now: Date = new Date(),
+): Promise<void> {
+  await requireModelFolder(store, modelsFolderId, folderId)
+  const model = await loadModelFolder(store, folderId)
+  const fields = archived ? { archived: true, archivedAt: now.toISOString() } : { archived: false, archivedAt: undefined }
+  if (model.bid && !model.legacyBid) {
+    await changeBidField(
+      store,
+      modelsFolderId,
+      folderId,
+      (fresh) => ({ content: { ...bidContentOf(fresh), ...fields }, newFiles: [] }),
+      newSaveSession(),
+      now,
+    )
+    return
+  }
+  const meta = await writeModelMeta(store, folderId, fields, now)
+  if (!model.bid) {
+    await refreshNeedsSlicingEntry(store, modelsFolderId, model, meta)
+    return
+  }
+  // Pre-v0.4 bid: same card as before, with the new flag.
+  const contents = classifyFolder(await store.listChildren(folderId))
+  const entry = indexEntryFromBid(folderId, model.bid)
+  entry.coverFileId = pickCover(contents.images, model.bid.coverFileId)
+  if (!entry.coverFileId) delete entry.coverFileId
+  entry.archived = meta.archived === true
+  await upsertIndexEntry(store, modelsFolderId, entry)
 }

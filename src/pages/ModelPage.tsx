@@ -5,15 +5,21 @@ import { DriveImage } from '../components/DriveImage'
 import { createObjectUrlSafe } from '../components/useObjectUrl'
 import { PricePanel } from '../components/PricePanel'
 import { RequireDrive, type DriveContext } from '../components/RequireDrive'
-import { ErrorBox, Money, Notice, Spinner } from '../components/ui'
+import { ConfirmDialog, ErrorBox, Money, Notice, Spinner } from '../components/ui'
 import { DESCRIPTION_MAX_LENGTH, type BidLine, type HardwareLine } from '../lib/bid'
 import { newKey } from '../lib/bidForm'
 import {
+  ARCHIVE_CONFIRM_MESSAGE,
+  ARCHIVE_LABEL,
+  ARCHIVED_BANNER,
   CONVERT_LEGACY_LABEL,
   displayCover,
+  isModelArchived,
   LEGACY_BID_MESSAGE,
   loadModelFolder,
   newSaveSession,
+  RESTORE_LABEL,
+  setModelArchived,
   setModelCover,
   setModelDescription,
   uploadModelCover,
@@ -50,7 +56,7 @@ export const SET_COVER_LABEL = 'קבע כתמונה ראשית'
 export const UPLOAD_COVER_LABEL = 'העלה תמונה חדשה כראשית'
 
 type Loaded = { folderId: string; data: ModelFolder }
-type Action = 'cover' | 'upload' | 'description' | null
+type Action = 'cover' | 'upload' | 'description' | 'archive' | null
 
 function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   const [loaded, setLoaded] = useState<Loaded | null>(null)
@@ -63,6 +69,8 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   const [actionError, setActionError] = useState<{ folderId: string; message: string; retry?: () => void } | null>(null)
   const [editingDescription, setEditingDescription] = useState(false)
   const [descriptionText, setDescriptionText] = useState('')
+  /** v0.7: the "remove from library" confirm dialog is open (for this folder). */
+  const [confirmArchiveFor, setConfirmArchiveFor] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -166,6 +174,47 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   }
 
   const title = bid?.name ?? folder.name.trim()
+  const archived = isModelArchived(model)
+
+  // v0.7 A1/A3: archive / restore (the folder is re-read by setModelArchived; nothing in Drive is removed).
+  const changeArchived = (value: boolean) =>
+    void runAction(
+      'archive',
+      () => setModelArchived(ctx.drive, ctx.folderId, folderId, value),
+      value ? 'ההסרה מהספרייה נכשלה.' : 'השחזור לספרייה נכשל.',
+    )
+
+  const archiveButton = !archived && (
+    <button type="button" className="btn btn-ghost" onClick={() => setConfirmArchiveFor(folderId)} disabled={action !== null}>
+      {action === 'archive' ? 'מסיר…' : ARCHIVE_LABEL}
+    </button>
+  )
+
+  const archivedBanner = archived && (
+    <div
+      role="status"
+      className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
+      data-testid="archived-banner"
+    >
+      <span className="flex-1 font-medium">{ARCHIVED_BANNER}</span>
+      <button type="button" className="btn btn-secondary" onClick={() => changeArchived(false)} disabled={action !== null}>
+        {action === 'archive' ? 'משחזר…' : RESTORE_LABEL}
+      </button>
+    </div>
+  )
+
+  const confirmArchive = confirmArchiveFor === folderId && (
+    <ConfirmDialog
+      title={`${ARCHIVE_LABEL}?`}
+      message={ARCHIVE_CONFIRM_MESSAGE}
+      confirmLabel={ARCHIVE_LABEL}
+      onCancel={() => setConfirmArchiveFor(null)}
+      onConfirm={() => {
+        setConfirmArchiveFor(null)
+        changeArchived(true)
+      }}
+    />
+  )
 
   const coverThumb = (
     <div className="h-16 w-16 shrink-0 overflow-hidden rounded-lg border border-stone-200" data-testid="model-cover" data-file-id={coverId ?? ''}>
@@ -332,10 +381,14 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
               {found ? 'נמצא קובץ סלייס — צור הצעה' : 'דורש סלייס'}
             </span>
           </div>
-          <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
-            צור הצעת מחיר
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
+              צור הצעת מחיר
+            </Link>
+            {archiveButton}
+          </div>
         </div>
+        {archivedBanner}
         {!found && (
           <Notice>
             אין עדיין הצעת מחיר לדגם הזה. אפשר לפרוס אותו ב-Bambu Studio (File → Export → Export plate sliced file), לשמור את
@@ -347,6 +400,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
         {descriptionSection}
         {gallery}
         {filesSection}
+        {confirmArchive}
       </div>
     )
   }
@@ -375,13 +429,16 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
           <Link to={`/model/${encodeURIComponent(folderId)}/quote`} className="btn btn-secondary">
             שליחת הצעת מחיר
           </Link>
+          {archiveButton}
         </div>
       </div>
+      {archivedBanner}
       {legacyBid && (
         <Notice tone="warn">
           <span data-testid="legacy-bid-notice">{LEGACY_BID_MESSAGE}</span>
         </Notice>
       )}
+      {legacyBid && metaError && <Notice tone="warn">{metaError}</Notice>}
       {actionErrorBox}
 
       <div className="grid gap-4 lg:grid-cols-[1fr_320px] lg:items-start">
@@ -434,6 +491,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
           <PricePanel result={bid.result} title="פירוט עלות ומחיר" />
         </aside>
       </div>
+      {confirmArchive}
     </div>
   )
 }

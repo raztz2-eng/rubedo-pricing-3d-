@@ -660,7 +660,7 @@ describe('E4 / AC38 — customer history from every model + "new quote"', () => 
     return { ...x, a, b, dana, other }
   }
 
-  it('lib: rebuild collects every quote log (index v3 with a customer summary); matching by id, else by e-mail', async () => {
+  it('lib: rebuild collects every quote log (index v4 with a customer summary); matching by id, else by e-mail', async () => {
     const { drive, root, dana, other } = await history()
     const r = await rebuildIndex(drive, root)
     expect(r.quotes.map((q) => q.priceShown)).toEqual([120, 99, 80])
@@ -671,7 +671,7 @@ describe('E4 / AC38 — customer history from every model + "new quote"', () => 
     ])
     expect(quotesForCustomer(r.quotes, other, customers).map((q) => q.priceShown)).toEqual([99])
     const idx = JSON.parse(await drive.readText(await indexId(drive, root)))
-    expect(idx.schemaVersion).toBe(3)
+    expect(idx.schemaVersion).toBe(4)
     expect(idx.customers).toEqual(summariseQuotes(r.quotes))
     // The old e-mail-only log joins Dana's id (minor fix): one entry with both quotes.
     expect(idx.customers).toContainEqual({ customerId: dana.id, email: 'dana@example.com', quoteCount: 2, lastQuoteAt: '2026-10-01T10:00:00.000Z' })

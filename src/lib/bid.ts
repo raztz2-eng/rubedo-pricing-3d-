@@ -60,6 +60,10 @@ export interface Bid {
   result: PriceResult
   files: BidFile[]
   coverFileId?: string
+  /** v0.7 A1: removed from the library (files stay in Drive). Missing = not archived. */
+  archived?: boolean
+  /** v0.7 A1: when it was archived (ISO); absent after a restore. */
+  archivedAt?: string
 }
 
 export type EntryStatus = 'priced' | 'needs-slicing'
@@ -82,10 +86,16 @@ export interface IndexEntry {
   /** needs-slicing only: a sliced .gcode.3mf found in the folder. */
   slicedFileId?: string
   updatedAt: string
+  /** v0.7 A4: hidden from the main library, shown under "ארכיון". Index files before v4 have no flag (stale). */
+  archived?: boolean
 }
 
 export function isPriced(e: IndexEntry): boolean {
   return e.status !== 'needs-slicing'
+}
+
+export function isArchived(e: Pick<IndexEntry, 'archived'>): boolean {
+  return e.archived === true
 }
 
 /**
@@ -116,12 +126,15 @@ export interface CustomerQuoteSummary {
   lastQuoteAt: string
 }
 
-/** Index schema written by this version. Older index files (bare array, or v2) are read but count as stale. */
-export const INDEX_SCHEMA_VERSION = 3
+/**
+ * Index schema written by this version (v4 = v0.7: `archived` per entry). Older index files (bare array, v2, v3) are
+ * read but count as stale.
+ */
+export const INDEX_SCHEMA_VERSION = 4
 
-/** Index file content. Older files: a bare IndexEntry[] (pre-v0.3) or schemaVersion 2 (no quotes) — stale → rebuilt. */
+/** Index file content. Older files: a bare IndexEntry[] (pre-v0.3), v2 (no quotes), v3 (no archived) — stale → rebuilt. */
 export interface IndexFile {
-  schemaVersion: 2 | 3
+  schemaVersion: 2 | 3 | 4
   /** When the index was last fully rebuilt from Drive (ISO). */
   builtAt: string
   entries: IndexEntry[]
@@ -245,6 +258,7 @@ export function indexEntryFromBid(folderId: string, bid: Bid): IndexEntry {
     landed: bid.result.landed,
     coverFileId: bid.coverFileId,
     updatedAt: bid.updatedAt,
+    archived: bid.archived === true,
   }
 }
 
