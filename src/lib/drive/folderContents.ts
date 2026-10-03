@@ -41,6 +41,8 @@ export interface FolderContents {
   bidFile?: DriveFile
   /** v0.6: `_rubedo-model.json` (cover/description of a folder without bid.json); the marked one is preferred. */
   metaFile?: DriveFile
+  /** v0.7 I2: every `_rubedo-model.json` in the folder (creation order) — several marked ones are read merged. */
+  metaFiles: DriveFile[]
   /** All images, sorted by name. */
   images: DriveFile[]
   /** All other files (no folders, no bid.json), sorted by name. */
@@ -70,7 +72,8 @@ export function classifyFolder(children: DriveFile[]): FolderContents {
   const images = plain.filter(isImageFile).sort(byName)
   const files = plain.filter((c) => !isImageFile(c)).sort(byName)
   const sliced = files.filter((f) => isSlicedFileName(f.name))
-  const contents: FolderContents = { bidFile, images, files, sliced }
+  const metaFiles = children.filter((c) => c.name === MODEL_META_FILE_NAME && c.mimeType !== FOLDER_MIME)
+  const contents: FolderContents = { bidFile, images, files, sliced, metaFiles }
   if (metaFile) contents.metaFile = metaFile
   return contents
 }

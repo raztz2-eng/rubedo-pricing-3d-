@@ -17,6 +17,8 @@ function Library({ ctx }: { ctx: DriveContext }) {
   // M4: the error remembers which action failed, so "try again" re-runs that action (refresh → refresh).
   const [error, setError] = useState<{ message: string; retry: 'load' | 'refresh' } | null>(null)
   const [skipped, setSkipped] = useState<string[]>([])
+  /** M2: folders whose `_rubedo-model.json` is damaged (known after a rebuild). */
+  const [damagedMeta, setDamagedMeta] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
   const [query, setQuery] = useState('')
   // v0.7 A2: the archive view lives in the URL (?view=archive) so back and refresh keep it.
@@ -36,6 +38,7 @@ function Library({ ctx }: { ctx: DriveContext }) {
       const r = await rebuildIndex(drive, folderId)
       setEntries(r.entries)
       setSkipped(r.skipped)
+      setDamagedMeta(r.damagedMeta)
     } catch (e) {
       logError('rebuild index', e)
       setError({ message: errorMessage(e, 'רענון הספרייה נכשל.'), retry: 'refresh' })
@@ -51,7 +54,10 @@ function Library({ ctx }: { ctx: DriveContext }) {
     try {
       const state = await loadLibraryState(drive, folderId)
       setEntries(state.entries)
-      if (state.rebuilt) setSkipped(state.rebuilt.skipped)
+      if (state.rebuilt) {
+        setSkipped(state.rebuilt.skipped)
+        setDamagedMeta(state.rebuilt.damagedMeta)
+      }
       stale = state.stale
     } catch (e) {
       logError('load library', e)
@@ -127,11 +133,25 @@ function Library({ ctx }: { ctx: DriveContext }) {
           const e = (entries ?? []).find((x) => x.id === restoreError.id)
           if (e) void restore(e)
         }}>
-          {restoreError.name}: {restoreError.message}
+          <bdi>{restoreError.name}</bdi>: {restoreError.message}
         </ErrorBox>
       )}
       {skipped.length > 0 && (
         <Notice tone="warn">לא ניתן היה לקרוא את bid.json בתיקיות: {skipped.join(', ')} — הן לא מוצגות.</Notice>
+      )}
+      {damagedMeta.length > 0 && (
+        <Notice tone="warn">
+          <span data-testid="damaged-meta-warning">
+            הקובץ _rubedo-model.json פגום בתיקיות:{' '}
+            {damagedMeta.map((n, i) => (
+              <span key={n}>
+                {i > 0 && ', '}
+                <bdi>{n}</bdi>
+              </span>
+            ))}{' '}
+            — הן מוצגות בספרייה הראשית (לא בארכיון) עם תמונת ברירת מחדל. פתחו את הדגם לפרטים.
+          </span>
+        </Notice>
       )}
       {entries === null && busy && <Spinner label="טוען ספרייה…" />}
       {entries !== null && filtered.length === 0 && (

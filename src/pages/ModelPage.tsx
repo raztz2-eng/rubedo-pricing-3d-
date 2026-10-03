@@ -1,4 +1,4 @@
-import { useEffect, useState, type ChangeEvent } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { DescriptionField } from '../components/DescriptionField'
 import { DriveImage } from '../components/DriveImage'
@@ -10,8 +10,10 @@ import { DESCRIPTION_MAX_LENGTH, type BidLine, type HardwareLine } from '../lib/
 import { newKey } from '../lib/bidForm'
 import {
   ARCHIVE_CONFIRM_MESSAGE,
+  ARCHIVE_BLOCKED_MESSAGE,
   ARCHIVE_LABEL,
   ARCHIVED_BANNER,
+  ARCHIVED_RESTORE_FIRST,
   CONVERT_LEGACY_LABEL,
   displayCover,
   isModelArchived,
@@ -71,6 +73,15 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   const [descriptionText, setDescriptionText] = useState('')
   /** v0.7: the "remove from library" confirm dialog is open (for this folder). */
   const [confirmArchiveFor, setConfirmArchiveFor] = useState<string | null>(null)
+  /** M1: after a successful archive, focus goes to the banner's restore button (once it is rendered). */
+  const restoreButtonRef = useRef<HTMLButtonElement>(null)
+  const [focusRestoreFor, setFocusRestoreFor] = useState<string | null>(null)
+  useEffect(() => {
+    if (focusRestoreFor !== folderId || !restoreButtonRef.current) return
+    restoreButtonRef.current.focus()
+    setFocusRestoreFor(null)
+    // `loaded`: the banner (and its button) appears when the reloaded folder is rendered.
+  }, [focusRestoreFor, folderId, loaded])
 
   useEffect(() => {
     let cancelled = false
@@ -177,14 +188,25 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
   const archived = isModelArchived(model)
 
   // v0.7 A1/A3: archive / restore (the folder is re-read by setModelArchived; nothing in Drive is removed).
-  const changeArchived = (value: boolean) =>
-    void runAction(
-      'archive',
-      () => setModelArchived(ctx.drive, ctx.folderId, folderId, value),
-      value ? 'ההסרה מהספרייה נכשלה.' : 'השחזור לספרייה נכשל.',
-    )
+  const changeArchived = (value: boolean): void => {
+    const fn = () => setModelArchived(ctx.drive, ctx.folderId, folderId, value).then(() => {
+      if (value) setFocusRestoreFor(folderId)
+    })
+    void runAction('archive', fn, value ? 'ההסרה מהספרייה נכשלה.' : 'השחזור לספרייה נכשל.')
+  }
 
-  const archiveButton = !archived && (
+  /**
+   * M6: a needs-slicing / pre-v0.4 model keeps its archive flag in `_rubedo-model.json`; while that file is damaged it
+   * cannot be archived (the file is never replaced) — the page shows why instead of the button.
+   */
+  const archiveBlocked = !!metaError && (!bid || !!legacyBid)
+  const archiveBlockedNotice = !archived && archiveBlocked && (
+    <Notice tone="warn">
+      <span data-testid="archive-blocked">{ARCHIVE_BLOCKED_MESSAGE}</span>
+    </Notice>
+  )
+
+  const archiveButton = !archived && !archiveBlocked && (
     <button type="button" className="btn btn-ghost" onClick={() => setConfirmArchiveFor(folderId)} disabled={action !== null}>
       {action === 'archive' ? 'מסיר…' : ARCHIVE_LABEL}
     </button>
@@ -196,8 +218,17 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
       className="flex flex-wrap items-center gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"
       data-testid="archived-banner"
     >
-      <span className="flex-1 font-medium">{ARCHIVED_BANNER}</span>
-      <button type="button" className="btn btn-secondary" onClick={() => changeArchived(false)} disabled={action !== null}>
+      <span className="flex-1">
+        <span className="font-medium">{ARCHIVED_BANNER}</span>
+        <span className="block text-xs">{ARCHIVED_RESTORE_FIRST}</span>
+      </span>
+      <button
+        ref={restoreButtonRef}
+        type="button"
+        className="btn btn-secondary"
+        onClick={() => changeArchived(false)}
+        disabled={action !== null}
+      >
         {action === 'archive' ? 'משחזר…' : RESTORE_LABEL}
       </button>
     </div>
@@ -382,14 +413,17 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
             </span>
           </div>
           <div className="flex flex-wrap gap-2">
-            <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
-              צור הצעת מחיר
-            </Link>
+            {!archived && (
+              <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
+                צור הצעת מחיר
+              </Link>
+            )}
             {archiveButton}
           </div>
         </div>
         {archivedBanner}
-        {!found && (
+        {archiveBlockedNotice}
+        {!found && !archived && (
           <Notice>
             אין עדיין הצעת מחיר לדגם הזה. אפשר לפרוס אותו ב-Bambu Studio (File → Export → Export plate sliced file), לשמור את
             הקובץ בתיקייה, ואז ללחוץ „צור הצעת מחיר” — או להזין את הנתונים ידנית.
@@ -417,7 +451,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
-          {legacyBid ? (
+          {archived ? null : legacyBid ? (
             <Link to={`/model/${encodeURIComponent(folderId)}/create`} className="btn btn-primary">
               {CONVERT_LEGACY_LABEL}
             </Link>
@@ -433,6 +467,7 @@ function ModelPage({ ctx, folderId }: { ctx: DriveContext; folderId: string }) {
         </div>
       </div>
       {archivedBanner}
+      {archiveBlockedNotice}
       {legacyBid && (
         <Notice tone="warn">
           <span data-testid="legacy-bid-notice">{LEGACY_BID_MESSAGE}</span>

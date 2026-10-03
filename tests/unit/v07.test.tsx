@@ -6,8 +6,14 @@ import { App } from '../../src/App'
 import { BID_FILE_NAME, INDEX_FILE_NAME, MODEL_META_FILE_NAME, bidPricingInput, type Bid } from '../../src/lib/bid'
 import { addCustomer } from '../../src/lib/drive/customerStore'
 import {
+  ARCHIVE_BLOCKED_MESSAGE,
   ARCHIVE_CONFIRM_MESSAGE,
+  ARCHIVED_RESTORE_FIRST,
+  BID_CHANGED_MESSAGE,
   loadLibrary,
+  loadLibraryState,
+  readIndex,
+  requireModelFolder,
   loadModelFolder,
   markQuotesChanged,
   newSaveSession,
@@ -20,7 +26,7 @@ import {
   type BidContent,
 } from '../../src/lib/drive/bidRepository'
 import { MemoryDrive } from '../../src/lib/drive/memoryDrive'
-import { parseModelMeta } from '../../src/lib/drive/modelMeta'
+import { mergeModelMetas, MODEL_META_BUSY_MESSAGE, parseModelMeta, writeModelMeta } from '../../src/lib/drive/modelMeta'
 import { writeQuoteLog } from '../../src/lib/drive/quoteLog'
 import { computePrice, DEFAULT_PRICING_SETTINGS } from '../../src/lib/pricing'
 import type { QuoteRecord } from '../../src/lib/quote'
@@ -400,5 +406,217 @@ describe('A3 / AC41 — customers', () => {
     const dialog = within(await screen.findByRole('dialog', { name: 'בחירת דגם להצעה' }))
     await waitFor(() => expect(dialog.getByRole('button', { name: /Beta/ })).toBeTruthy())
     expect(dialog.queryByRole('button', { name: /Alpha/ })).toBeNull()
+  })
+})
+
+// =============================================================================================
+// v0.7 fix round
+// =============================================================================================
+describe('I1 — updateBid re-checks bid.json right before writing', () => {
+  it('an archive saved during a slow upload is not lost; the edit gets a 409', async () => {
+    const { drive, root } = services()
+    const { folderId, bid } = await priced(drive, root, 'Vase')
+    const realUpload = drive.uploadFile.bind(drive)
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    let started!: () => void
+    const uploading = new Promise<void>((r) => (started = r))
+    drive.uploadFile = async (...args: Parameters<MemoryDrive['uploadFile']>) => {
+      if (args[1] === 'slow.jpg') {
+        started()
+        await gate
+      }
+      return realUpload(...args)
+    }
+    const photo = { key: 'p', name: 'slow.jpg', kind: 'image' as const, mimeType: 'image/jpeg', blob: jpeg() }
+    const edit = updateBid(drive, root, { folderId, existing: bid, content: { ...bidContentOf(bid), laborMinutes: 99 }, newFiles: [photo] }, newSaveSession())
+    await uploading
+    await setModelArchived(drive, root, folderId, true, T1)
+    release()
+    await expect(edit).rejects.toMatchObject({ status: 409, userMessage: BID_CHANGED_MESSAGE })
+    const after = (await readBid(drive, folderId)).bid
+    expect(after).toMatchObject({ archived: true, archivedAt: T1.toISOString(), laborMinutes: bid.laborMinutes })
+  })
+})
+
+describe('I2 — _rubedo-model.json writes never lose a change', () => {
+  it('concurrent cover change and archive in one tab: both kept, one file', async () => {
+    const { drive, root } = services()
+    const folder = drive.addForeignFolder(root, 'Old vase')
+    const pic = drive.addForeignFile(folder, 'b.jpg', jpeg(2), 'image/jpeg')
+    const model = await loadModelFolder(drive, folder)
+    await Promise.all([setModelCover(drive, root, model, pic), setModelArchived(drive, root, folder, true, T1)])
+    const meta = await readMeta(drive, folder)
+    expect(meta.files).toHaveLength(1)
+    expect(meta.json).toMatchObject({ coverFileId: pic, archived: true })
+    expect((await rebuildIndex(drive, root)).entries.find((e) => e.id === folder)).toMatchObject({ coverFileId: pic, archived: true })
+  })
+
+  it('another tab writing between read and write → re-read, re-merged, retried; both values kept', async () => {
+    const { drive, root } = services()
+    const folder = drive.addForeignFolder(root, 'Old vase')
+    await writeModelMeta(drive, folder, { description: 'ישן' }, T1)
+    const metaId = (await readMeta(drive, folder)).files[0].id
+    const realRead = drive.readText.bind(drive)
+    let interfered = false
+    drive.readText = async (id: string) => {
+      const text = await realRead(id)
+      if (id === metaId && !interfered) {
+        interfered = true
+        const other = { ...JSON.parse(text), description: 'מטאב אחר', updatedAt: T1.toISOString() }
+        await drive.updateFileContent(metaId, new Blob([JSON.stringify(other)]), 'application/json')
+      }
+      return text
+    }
+    await writeModelMeta(drive, folder, { archived: true, archivedAt: T2.toISOString() }, T2)
+    expect((await readMeta(drive, folder)).json).toMatchObject({ description: 'מטאב אחר', archived: true })
+  })
+
+  it('a file that keeps changing → Hebrew error after 3 attempts, nothing written by us', async () => {
+    const { drive, root } = services()
+    const folder = drive.addForeignFolder(root, 'Busy')
+    await writeModelMeta(drive, folder, { description: 'x' }, T1)
+    const metaId = (await readMeta(drive, folder)).files[0].id
+    const realRead = drive.readText.bind(drive)
+    drive.readText = async (id: string) => {
+      const text = await realRead(id)
+      if (id === metaId) await drive.updateFileContent(metaId, new Blob([text]), 'application/json')
+      return text
+    }
+    void root
+    await expect(writeModelMeta(drive, folder, { archived: true }, T2)).rejects.toMatchObject({ status: 409, userMessage: MODEL_META_BUSY_MESSAGE })
+    expect(MODEL_META_BUSY_MESSAGE).toMatch(/[א-ת]/)
+  })
+
+  it('duplicate marked meta files (two tabs) are read merged (newer wins per field) and written to the oldest; none removed', async () => {
+    const { drive, root } = services()
+    const folder = drive.addForeignFolder(root, 'Twin')
+    const a = drive.addForeignFile(folder, 'a.jpg', jpeg(1), 'image/jpeg')
+    const b = drive.addForeignFile(folder, 'b.jpg', jpeg(2), 'image/jpeg')
+    const json = (v: unknown) => new Blob([JSON.stringify(v)], { type: 'application/json' })
+    const first = await drive.uploadFile(folder, MODEL_META_FILE_NAME, json({ schemaVersion: 1, coverFileId: a, description: 'ישן', updatedAt: '2026-10-01T00:00:00.000Z' }), 'application/json')
+    const second = await drive.uploadFile(
+      folder,
+      MODEL_META_FILE_NAME,
+      json({ schemaVersion: 1, coverFileId: b, archived: true, archivedAt: '2026-10-02T00:00:00.000Z', updatedAt: '2026-10-02T00:00:00.000Z' }),
+      'application/json',
+    )
+    const model = await loadModelFolder(drive, folder)
+    expect(model.meta).toMatchObject({ coverFileId: b, description: 'ישן', archived: true })
+    expect((await rebuildIndex(drive, root)).entries.find((e) => e.id === folder)).toMatchObject({ coverFileId: b, archived: true })
+
+    const log0 = drive.writeTargets.length
+    await setModelArchived(drive, root, folder, false, T2)
+    const metaWrites = drive.writeTargets.slice(log0).filter((w) => w.targetId === first.id || w.targetId === second.id)
+    expect(metaWrites).toEqual([{ op: 'updateFileContent', targetId: first.id }])
+    expect((await readMeta(drive, folder)).files.map((f) => f.id)).toEqual([first.id, second.id])
+    expect((await loadModelFolder(drive, folder)).meta).toMatchObject({ coverFileId: b, description: 'ישן', archived: false })
+    expect((await rebuildIndex(drive, root)).entries.find((e) => e.id === folder)?.archived).toBe(false)
+  })
+
+  it('mergeModelMetas: a restore after an archive wins, an older archive does not override a newer restore', () => {
+    const archivedOld = { schemaVersion: 1 as const, archived: true, archivedAt: '2026-10-01', updatedAt: '2026-10-05' }
+    const restored = { schemaVersion: 1 as const, archived: false, updatedAt: '2026-10-03' }
+    expect(mergeModelMetas([archivedOld, restored])?.archived).toBe(false)
+    expect(mergeModelMetas([restored, { ...archivedOld, archivedAt: '2026-10-04' }])).toMatchObject({ archived: true, archivedAt: '2026-10-04' })
+  })
+})
+
+describe('fix round minors', () => {
+  it('M1: after archiving, focus is on the banner restore button', async () => {
+    const user = userEvent.setup()
+    const { s, drive, root } = services()
+    const { folderId } = await priced(drive, root, 'Vase')
+    renderApp(s, `/model/${folderId}`)
+    await user.click(await screen.findByRole('button', { name: 'הסר מהספרייה' }))
+    await user.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'הסר מהספרייה' }))
+    const banner = await screen.findByTestId('archived-banner')
+    const restore = within(banner).getByRole('button', { name: 'שחזר לספרייה' })
+    await waitFor(() => expect(document.activeElement).toBe(restore))
+  })
+
+  it('M2: a damaged meta file is listed in the library warning (card shown, not archived)', async () => {
+    const { s, drive, root } = services()
+    const folder = drive.addForeignFolder(root, 'Broken')
+    await drive.uploadFile(folder, MODEL_META_FILE_NAME, new Blob(['{nope']), 'application/json')
+    const r = await rebuildIndex(drive, root)
+    expect(r.damagedMeta).toEqual(['Broken'])
+    expect(r.entries.find((e) => e.id === folder)?.archived).toBe(false)
+    // Like the unreadable-bid.json warning, it is known after a rebuild ("רענון ספרייה" or the automatic refresh).
+    const user = userEvent.setup()
+    renderApp(s, '/library')
+    await user.click(await screen.findByRole('button', { name: 'רענון ספרייה' }))
+    expect((await screen.findByTestId('damaged-meta-warning')).textContent).toContain('Broken')
+  })
+
+  it('M3: an index with any malformed entry is treated as missing and rebuilt (never filtered and written back)', async () => {
+    const { drive, root } = services()
+    await priced(drive, root, 'Vase')
+    await rebuildIndex(drive, root)
+    const idx = (await drive.listChildren(root, { name: INDEX_FILE_NAME }))[0]
+    const file = JSON.parse(await drive.readText(idx.id))
+    file.entries.push({ id: 5, name: 'bad' })
+    await drive.updateFileContent(idx.id, new Blob([JSON.stringify(file)]), 'application/json')
+    expect(await readIndex(drive, root)).toBeNull()
+    const bad2 = { ...file, entries: [{ ...file.entries[0], archived: 'no' }] }
+    await drive.updateFileContent(idx.id, new Blob([JSON.stringify(bad2)]), 'application/json')
+    expect(await readIndex(drive, root)).toBeNull()
+    const state = await loadLibraryState(drive, root)
+    expect(state.rebuilt).toBeTruthy()
+    expect(state.entries.map((e) => e.name)).toEqual(['Vase'])
+  })
+
+  it('M4: while archived, "עריכת הצעה" / "צור הצעת מחיר" / "המר להצעה ניתנת לעריכה" are hidden and the banner says to restore first', async () => {
+    const { s, drive, root } = services()
+    const { folderId, bid } = await priced(drive, root, 'Vase')
+    const folder = drive.addForeignFolder(root, 'Old vase')
+    const legacyFolder = drive.addForeignFolder(root, 'Old lamp')
+    drive.addLegacyAppFile(legacyFolder, BID_FILE_NAME, new Blob([JSON.stringify({ ...bid, name: 'Old lamp' })]), 'application/json')
+    for (const id of [folderId, folder, legacyFolder]) await setModelArchived(drive, root, id, true)
+
+    const r1 = renderApp(s, `/model/${folderId}`)
+    expect((await screen.findByTestId('archived-banner')).textContent).toContain(ARCHIVED_RESTORE_FIRST)
+    expect(screen.queryByRole('link', { name: /עריכת הצעה/ })).toBeNull()
+    r1.unmount()
+    const r2 = renderApp(s, `/model/${folder}`)
+    await screen.findByTestId('archived-banner')
+    expect(screen.queryByRole('link', { name: 'צור הצעת מחיר' })).toBeNull()
+    r2.unmount()
+    renderApp(s, `/model/${legacyFolder}`)
+    await screen.findByTestId('archived-banner')
+    expect(screen.queryByRole('link', { name: 'המר להצעה ניתנת לעריכה' })).toBeNull()
+  })
+
+  it('M6: with a damaged meta file a needs-slicing model shows why it cannot be archived instead of the button', async () => {
+    const { s, drive, root } = services()
+    const folder = drive.addForeignFolder(root, 'Broken')
+    await drive.uploadFile(folder, MODEL_META_FILE_NAME, new Blob(['{nope']), 'application/json')
+    renderApp(s, `/model/${folder}`)
+    expect((await screen.findByTestId('archive-blocked')).textContent).toBe(ARCHIVE_BLOCKED_MESSAGE)
+    expect(screen.queryByRole('button', { name: 'הסר מהספרייה' })).toBeNull()
+  })
+
+  it('M7: requireModelFolder refuses an app-created folder without bid.json (unfinished save); archive writes nothing there', async () => {
+    const { drive, root } = services()
+    const unfinished = await drive.createFolder(root, 'Half saved')
+    await expect(requireModelFolder(drive, root, unfinished.id)).rejects.toMatchObject({ status: 400 })
+    const w0 = drive.writeLog.length
+    await expect(setModelArchived(drive, root, unfinished.id, true)).rejects.toMatchObject({ status: 400 })
+    expect(drive.writeLog.length).toBe(w0)
+    const { folderId } = await priced(drive, root, 'Done')
+    expect((await requireModelFolder(drive, root, folderId)).id).toBe(folderId)
+  })
+
+  it('M8: the model name in a restore error is isolated in <bdi>', async () => {
+    const user = userEvent.setup()
+    const { s, drive, root } = services()
+    const { folderId } = await priced(drive, root, 'Vase 2.0')
+    await setModelArchived(drive, root, folderId, true)
+    renderApp(s, '/library?view=archive')
+    const btn = await screen.findByRole('button', { name: 'שחזר לספרייה: Vase 2.0' })
+    drive.failNext('updateFileContent')
+    await user.click(btn)
+    const alert = await screen.findByRole('alert')
+    expect(alert.querySelector('bdi')?.textContent).toBe('Vase 2.0')
   })
 })
